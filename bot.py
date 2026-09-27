@@ -28,7 +28,7 @@ Ejecución local:
 import logging
 import os
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -43,6 +43,17 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# Comandos que se registran en el botón "Menú" de Telegram (setMyCommands).
+# El texto de cada 'description' es lo que Telegram muestra en esa lista.
+BOT_COMMANDS = [
+    BotCommand("start", "Ver ayuda y todos los comandos"),
+    BotCommand("price", "Precio de monedas (/price BTCUSDT)"),
+    BotCommand("balance", "Balance de tu cuenta de futuros (/balance USDT)"),
+    BotCommand("positions", "Ver posiciones abiertas (/positions BTCUSDT)"),
+    BotCommand("open", "Abrir posición (/open BTCUSDT BUY 0.01)"),
+    BotCommand("close", "Cerrar posición (/close POSITION_ID)"),
+]
 
 # Instancia compartida del cliente de Bitunix
 bitunix = BitunixClient(
@@ -322,6 +333,12 @@ async def handle_close_confirmation(update: Update, context: ContextTypes.DEFAUL
     await query.edit_message_text(f"✅ Posición `{position_id}` cerrada correctamente.", parse_mode="Markdown")
 
 
+async def _post_init(application: Application) -> None:
+    """Registra los comandos en Telegram (botón 'Menú' / lista al escribir '/')."""
+    await application.bot.set_my_commands(BOT_COMMANDS)
+    logger.info("Comandos registrados en el menú de Telegram.")
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -337,7 +354,7 @@ def main() -> None:
             "Configúralo antes de usar comandos privados en producción."
         )
 
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(token).post_init(_post_init).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("price", price))
