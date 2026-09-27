@@ -141,7 +141,11 @@ class BitunixClient:
     def get_account(self, margin_coin: str = "USDT") -> dict | None:
         """Balance y estado de la cuenta de futuros para una moneda de margen."""
         data = self._private_get(ACCOUNT_ENDPOINT, {"marginCoin": margin_coin})
-        return data[0] if data else None
+        if not data:
+            return None
+        if isinstance(data, list):
+            return data[0] if data else None
+        return data  # la API a veces devuelve el objeto directo, sin envolver en lista
 
     def get_pending_positions(self, symbol: str | None = None, position_id: str | None = None) -> list[dict]:
         """Posiciones abiertas actualmente, opcionalmente filtradas por símbolo o ID."""
@@ -149,7 +153,9 @@ class BitunixClient:
             PENDING_POSITIONS_ENDPOINT,
             {"symbol": symbol, "positionId": position_id},
         )
-        return data or []
+        if not data:
+            return []
+        return data if isinstance(data, list) else [data]
 
     def place_order(
         self,
