@@ -25,6 +25,7 @@ Ejecución local:
     python bot.py
 """
 
+import json
 import logging
 import os
 
@@ -36,7 +37,8 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from bitunix_client import BitunixAPIError, BitunixClient
+from bitunix_client import DEFAULT_WATCHLIST, BitunixAPIError, BitunixClient
+from indicators import bollinger_bands, stochastic_oscillator
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -49,6 +51,8 @@ logger = logging.getLogger(__name__)
 BOT_COMMANDS = [
     BotCommand("start", "Ver ayuda y todos los comandos"),
     BotCommand("price", "Precio de monedas (/price BTCUSDT)"),
+    BotCommand("watchlist", "Ver o editar la watchlist de /price"),
+    BotCommand("indicators", "Estocástico y Bandas de Bollinger (/indicators BTCUSDT 1h)"),
     BotCommand("balance", "Balance de tu cuenta de futuros (/balance USDT)"),
     BotCommand("positions", "Ver posiciones abiertas (/positions BTCUSDT)"),
     BotCommand("open", "Abrir posición (/open BTCUSDT BUY 0.01)"),
@@ -81,6 +85,52 @@ async def _reject_unauthorized(update: Update) -> None:
     )
 
 
+# --- Watchlist personalizable (usada por /price sin argumentos) ---
+#
+# Se guarda en un archivo JSON junto al bot. En Render (plan free) el
+# disco es efectivo mientras la instancia sigue viva (sobrevive al
+# "sleep"), pero se pierde en cada redeploy — si eso te molesta, la
+# alternativa es moverla a una tabla en una base de datos.
+WATCHLIST_FILE = os.environ.get("WATCHLIST_FILE", "watchlist.json")
+
+
+def _load_watchlist() -> list[str]:
+    try:
+        with open(WATCHLIST_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list) and all(isinstance(s, str) for s in data):
+                return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return list(DEFAULT_WATCHLIST)
+
+
+def _save_watchlist(symbols: list[str]) -> None:
+    try:
+        with open(WATCHLIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(symbols, f)
+    except OSError:
+        logger.exception("No se pudo guardar la watchlist en disco")
+
+
+def _normalize_symbol(raw: str) -> str:
+    symbol = raw.upper().strip()
+    if not symbol.endswith("USDT"):
+        symbol += "USDT"
+    return symbol
+
+
+# Estado en memoria, cargado al arrancar el bot.
+watchlist: list[str] = _load_watchlist()
+
+
+def _to_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def format_ticker(ticker: dict) -> str:
     symbol = ticker.get("symbol", "?")
     last_price = ticker.get("lastPrice", "N/A")
@@ -90,12 +140,27 @@ def format_ticker(ticker: dict) -> str:
 
 
 def format_position(position: dict) -> str:
+    symbol = position.get("symbol", "?")
+    side = position.get("side", "?")
+    unrealized_pnl = position.get("unrealizedPNL")
+    margin = position.get("margin")
+
+    pnl_value = _to_float(unrealized_pnl)
+    margin_value = _to_float(margin)
+
+    pnl_pct_str = ""
+    if pnl_value is not None and margin_value:
+        pnl_pct_str = f" ({pnl_value / margin_value * 100:+.2f}%)"
+
+    pnl_emoji = "🟢" if (pnl_value is not None and pnl_value >= 0) else "🔴" if pnl_value is not None else "⚪"
+    side_label = "⬆️ LONG" if side == "BUY" else "⬇️ SHORT" if side == "SELL" else side
+
     return (
-        f"*{position.get('symbol', '?')}* ({position.get('side', '?')})\n"
+        f"{pnl_emoji} *{symbol}* — {side_label}\n"
         f"  ID: `{position.get('positionId', '?')}`\n"
         f"  Cantidad: `{position.get('qty', '?')}`  Apalancamiento: `{position.get('leverage', '?')}x`\n"
         f"  Precio entrada: `{position.get('avgOpenPrice', '?')}`\n"
-        f"  PnL no realizado: `{position.get('unrealizedPNL', '?')}`\n"
+        f"  PnL no realizado: `{unrealized_pnl}`{pnl_pct_str}\n"
         f"  Liquidación: `{position.get('liqPrice', '?')}`"
     )
 
@@ -106,8 +171,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 Bienvenido al bot de Bitunix.\n\n"
         "Consulta de precios:\n"
-        "/price - watchlist por defecto\n"
-        "/price BTCUSDT - un par específico\n\n"
+        "/price - tu watchlist\n"
+        "/price BTCUSDT - un par específico\n"
+        "/watchlist - ver o editar tu watchlist (add/remove/reset)\n"
+        "/indicators SIMBOLO [INTERVALO] - estocástico y Bandas de Bollinger\n\n"
         "Cuenta (requieren autorización):\n"
         "/balance [MONEDA] - balance de futuros (default USDT)\n"
         "/positions [SIMBOLO] - posiciones abiertas\n"
@@ -118,10 +185,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args
-    symbols = [s.upper() for s in args] if args else None
+    symbols = [_normalize_symbol(s) for s in args] if args else watchlist
 
     try:
-        tickers = bitunix.get_watchlist(symbols)
+        tickers = bitunix.get_tickers(symbols)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Error consultando Bitunix")
         await update.message.reply_text(f"⚠️ Error consultando la API de Bitunix: {exc}")
@@ -134,6 +201,137 @@ async def price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     message = "\n\n".join(format_ticker(t) for t in tickers)
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+
+async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _reject_unauthorized(update)
+        return
+
+    args = context.args
+
+    if not args:
+        message = "*Watchlist actual:*\n" + "\n".join(f"• `{s}`" for s in watchlist)
+        message += (
+            "\n\nUso:\n"
+            "/watchlist add SIMBOLO\n"
+            "/watchlist remove SIMBOLO\n"
+            "/watchlist reset — vuelve a la watchlist por defecto"
+        )
+        await update.message.reply_text(message, parse_mode="Markdown")
+        return
+
+    action = args[0].lower()
+
+    if action == "reset":
+        watchlist[:] = DEFAULT_WATCHLIST
+        _save_watchlist(watchlist)
+        await update.message.reply_text("Watchlist restaurada a los valores por defecto.")
+        return
+
+    if action in ("add", "remove", "del") and len(args) < 2:
+        await update.message.reply_text(f"Uso: /watchlist {action} SIMBOLO")
+        return
+
+    if action == "add":
+        symbol = _normalize_symbol(args[1])
+        if symbol in watchlist:
+            await update.message.reply_text(f"`{symbol}` ya está en la watchlist.", parse_mode="Markdown")
+            return
+        watchlist.append(symbol)
+        _save_watchlist(watchlist)
+        await update.message.reply_text(f"✅ `{symbol}` añadido a la watchlist.", parse_mode="Markdown")
+        return
+
+    if action in ("remove", "del"):
+        symbol = _normalize_symbol(args[1])
+        if symbol not in watchlist:
+            await update.message.reply_text(f"`{symbol}` no está en la watchlist.", parse_mode="Markdown")
+            return
+        watchlist.remove(symbol)
+        _save_watchlist(watchlist)
+        await update.message.reply_text(f"🗑 `{symbol}` eliminado de la watchlist.", parse_mode="Markdown")
+        return
+
+    await update.message.reply_text(
+        "Subcomando no reconocido. Usa: /watchlist [add|remove|reset] [SIMBOLO]"
+    )
+
+
+# --- Indicadores técnicos (calculados a partir del histórico de velas) ---
+
+VALID_INTERVALS = {"1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w", "1M"}
+
+
+async def indicators_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Uso: /indicators SIMBOLO [INTERVALO]\n"
+            "Ejemplo: /indicators BTCUSDT 1h\n"
+            f"Intervalos válidos: {' '.join(sorted(VALID_INTERVALS, key=len))} (default 1h)"
+        )
+        return
+
+    symbol = _normalize_symbol(args[0])
+    interval = args[1] if len(args) > 1 else "1h"
+
+    if interval not in VALID_INTERVALS:
+        await update.message.reply_text(
+            f"Intervalo `{interval}` no válido. Usa uno de: "
+            f"{' '.join(sorted(VALID_INTERVALS, key=len))}",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        # Bitunix no expone indicadores calculados por su API, solo el
+        # histórico de velas — el estocástico y las Bandas de Bollinger se
+        # calculan aquí a partir de ese histórico (ver indicators.py).
+        klines = bitunix.get_kline(symbol, interval=interval, limit=100)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error consultando velas de Bitunix")
+        await update.message.reply_text(f"⚠️ Error consultando velas de Bitunix: {exc}")
+        return
+
+    if len(klines) < 30:
+        await update.message.reply_text(
+            f"No hay suficientes velas de `{symbol}` en `{interval}` para calcular los indicadores.",
+            parse_mode="Markdown",
+        )
+        return
+
+    closes = [float(k["close"]) for k in klines]
+    highs = [float(k["high"]) for k in klines]
+    lows = [float(k["low"]) for k in klines]
+
+    try:
+        k_value, d_value = stochastic_oscillator(closes, highs, lows)
+        lower, middle, upper = bollinger_bands(closes)
+    except ValueError as exc:
+        await update.message.reply_text(f"⚠️ {exc}")
+        return
+
+    last_close = closes[-1]
+    stoch_emoji = "🟢" if k_value < 20 else "🔴" if k_value > 80 else "⚪"
+    if last_close > upper:
+        bb_position = "por encima de la banda superior 📈"
+    elif last_close < lower:
+        bb_position = "por debajo de la banda inferior 📉"
+    else:
+        bb_position = "dentro de las bandas"
+
+    message = (
+        f"*{symbol}* — {interval}\n\n"
+        f"*Estocástico (14, 3, 3)*\n"
+        f"  %K: `{k_value:.2f}`  %D: `{d_value:.2f}` {stoch_emoji}\n\n"
+        f"*Bandas de Bollinger (20, 2σ)*\n"
+        f"  Superior: `{upper:.4f}`\n"
+        f"  Media: `{middle:.4f}`\n"
+        f"  Inferior: `{lower:.4f}`\n"
+        f"  Precio actual: `{last_close:.4f}` — {bb_position}"
+    )
     await update.message.reply_text(message, parse_mode="Markdown")
 
 
@@ -167,6 +365,7 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"PnL no realizado (isolation): `{account.get('isolationUnrealizedPNL')}`\n"
         f"Modo de posición: `{account.get('positionMode')}`"
     )
+    print(account)
     await update.message.reply_text(message, parse_mode="Markdown")
 
 
@@ -358,6 +557,8 @@ def main() -> None:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("price", price))
+    application.add_handler(CommandHandler("watchlist", watchlist_command))
+    application.add_handler(CommandHandler("indicators", indicators_command))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("positions", positions))
     application.add_handler(CommandHandler("open", open_position))

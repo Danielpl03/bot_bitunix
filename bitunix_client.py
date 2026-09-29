@@ -21,6 +21,7 @@ import requests
 
 BITUNIX_BASE_URL = "https://fapi.bitunix.com"
 TICKERS_ENDPOINT = f"{BITUNIX_BASE_URL}/api/v1/futures/market/tickers"
+KLINE_ENDPOINT = f"{BITUNIX_BASE_URL}/api/v1/futures/market/kline"
 ACCOUNT_ENDPOINT = f"{BITUNIX_BASE_URL}/api/v1/futures/account"
 PENDING_POSITIONS_ENDPOINT = f"{BITUNIX_BASE_URL}/api/v1/futures/position/get_pending_positions"
 PLACE_ORDER_ENDPOINT = f"{BITUNIX_BASE_URL}/api/v1/futures/trade/place_order"
@@ -135,6 +136,42 @@ class BitunixClient:
 
     def get_watchlist(self, symbols: list[str] | None = None) -> list[dict]:
         return self.get_tickers(symbols or DEFAULT_WATCHLIST)
+
+    def get_kline(
+        self,
+        symbol: str,
+        interval: str = "1h",
+        limit: int = 100,
+        start_time: int | None = None,
+        end_time: int | None = None,
+        kline_type: str = "LAST_PRICE",
+    ) -> list[dict]:
+        """
+        Histórico de velas (OHLC) de un símbolo. Endpoint público, no requiere
+        api_key/secret_key. `interval` acepta: 1m 5m 15m 30m 1h 2h 4h 6h 8h
+        12h 1d 3d 1w 1M. `limit` por defecto 100, máximo 200 (límite de la API).
+        Devuelve las velas ordenadas de más antigua a más reciente, que es el
+        orden que necesitan los cálculos de indicadores.
+        """
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+            "startTime": start_time,
+            "endTime": end_time,
+            "type": kline_type,
+        }
+        params = {k: v for k, v in params.items() if v is not None}
+
+        response = self.session.get(KLINE_ENDPOINT, params=params, timeout=self.timeout)
+        response.raise_for_status()
+        payload = response.json()
+
+        if payload.get("code") != 0:
+            raise BitunixAPIError(f"Bitunix API error: {payload.get('msg')}")
+
+        data = payload.get("data", [])
+        return sorted(data, key=lambda k: k.get("time", 0))
 
     # --- Endpoints privados (requieren api_key/secret_key) ---
 
