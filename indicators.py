@@ -18,21 +18,21 @@ def _sma(values: list[float], period: int) -> float:
     return sum(values[-period:]) / period
 
 
-def stochastic_oscillator(
+def stochastic_series(
     closes: list[float],
     highs: list[float],
     lows: list[float],
     k_period: int = 14,
     smooth_k: int = 3,
     d_period: int = 3,
-) -> tuple[float, float]:
+) -> tuple[list[float], list[float]]:
     """
-    Oscilador estocástico "lento" (el que usan por defecto la mayoría de
-    plataformas, incluida la app de Bitunix): %K crudo suavizado con una
-    media móvil de `smooth_k` periodos, y %D como media móvil de `d_period`
-    periodos sobre ese %K ya suavizado.
-
-    Devuelve (%K, %D), ambos en el rango 0-100.
+    Igual que `stochastic_oscillator`, pero devuelve la serie completa de
+    %K y %D (ya suavizados) en vez de solo el último valor. Las series
+    quedan alineadas en el tiempo entre sí (mismo largo; el último
+    elemento de cada una corresponde a la misma vela) — la necesita
+    cualquier cálculo que mire hacia atrás, como detectar cruces
+    (ver strategy.py).
     """
     min_len = k_period + smooth_k + d_period - 2
     if len(closes) < min_len or len(highs) < min_len or len(lows) < min_len:
@@ -52,8 +52,30 @@ def stochastic_oscillator(
 
     smoothed_k = [_sma(raw_k[: i + 1], smooth_k) for i in range(smooth_k - 1, len(raw_k))]
     d_values = [_sma(smoothed_k[: i + 1], d_period) for i in range(d_period - 1, len(smoothed_k))]
+    k_aligned = smoothed_k[d_period - 1 :]  # recorta %K para que coincida en el tiempo con %D
 
-    return smoothed_k[-1], d_values[-1]
+    return k_aligned, d_values
+
+
+def stochastic_oscillator(
+    closes: list[float],
+    highs: list[float],
+    lows: list[float],
+    k_period: int = 14,
+    smooth_k: int = 3,
+    d_period: int = 3,
+) -> tuple[float, float]:
+    """
+    Oscilador estocástico "lento" (el que usan por defecto la mayoría de
+    plataformas, incluida la app de Bitunix): %K crudo suavizado con una
+    media móvil de `smooth_k` periodos, y %D como media móvil de `d_period`
+    periodos sobre ese %K ya suavizado.
+
+    Devuelve solo el último (%K, %D). Para la serie completa usa
+    `stochastic_series`.
+    """
+    k_series, d_series = stochastic_series(closes, highs, lows, k_period, smooth_k, d_period)
+    return k_series[-1], d_series[-1]
 
 
 def bollinger_bands(

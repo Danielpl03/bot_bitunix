@@ -28,6 +28,7 @@ Ejecución local:
 import json
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -37,8 +38,10 @@ from telegram.ext import (
     ContextTypes,
 )
 
+from backtest import run_backtest, summarize
 from bitunix_client import DEFAULT_WATCHLIST, BitunixAPIError, BitunixClient
 from indicators import bollinger_bands, stochastic_oscillator
+from strategy import detect_signal
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -53,6 +56,8 @@ BOT_COMMANDS = [
     BotCommand("price", "Precio de monedas (/price BTCUSDT)"),
     BotCommand("watchlist", "Ver o editar la watchlist de /price"),
     BotCommand("indicators", "Estocástico y Bandas de Bollinger (/indicators BTCUSDT 1h)"),
+    BotCommand("alerts", "Monedas vigiladas por la estrategia de 4h (add/remove/list)"),
+    BotCommand("backtest", "Backtest de la estrategia (/backtest BTCUSDT 4h 500)"),
     BotCommand("balance", "Balance de tu cuenta de futuros (/balance USDT)"),
     BotCommand("positions", "Ver posiciones abiertas (/positions BTCUSDT)"),
     BotCommand("open", "Abrir posición (/open BTCUSDT BUY 0.01)"),
@@ -124,6 +129,36 @@ def _normalize_symbol(raw: str) -> str:
 watchlist: list[str] = _load_watchlist()
 
 
+# --- Watchlist de la estrategia de alertas (distinta de la de /price) ---
+#
+# Vacía por defecto: es una lista de "quiero que vigiles esta moneda con
+# la estrategia", así que hay que darla de alta explícitamente con
+# /alerts add, no reutiliza la watchlist de precios.
+ALERTS_FILE = os.environ.get("ALERTS_FILE", "alerts_watchlist.json")
+
+
+def _load_alerts_watchlist() -> list[str]:
+    try:
+        with open(ALERTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list) and all(isinstance(s, str) for s in data):
+                return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return []
+
+
+def _save_alerts_watchlist(symbols: list[str]) -> None:
+    try:
+        with open(ALERTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(symbols, f)
+    except OSError:
+        logger.exception("No se pudo guardar la watchlist de alertas en disco")
+
+
+alerts_watchlist: list[str] = _load_alerts_watchlist()
+
+
 def _to_float(value) -> float | None:
     try:
         return float(value)
@@ -174,7 +209,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/price - tu watchlist\n"
         "/price BTCUSDT - un par específico\n"
         "/watchlist - ver o editar tu watchlist (add/remove/reset)\n"
-        "/indicators SIMBOLO [INTERVALO] - estocástico y Bandas de Bollinger\n\n"
+        "/indicators SIMBOLO [INTERVALO] - estocástico y Bandas de Bollinger\n"
+        "/alerts - monedas vigiladas por la estrategia de 4h (add/remove)\n"
+        "/backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE] - backtest de la estrategia\n\n"
         "Cuenta (requieren autorización):\n"
         "/balance [MONEDA] - balance de futuros (default USDT)\n"
         "/positions [SIMBOLO] - posiciones abiertas\n"
@@ -257,6 +294,283 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(
         "Subcomando no reconocido. Usa: /watchlist [add|remove|reset] [SIMBOLO]"
     )
+
+
+# --- Backtest de la estrategia sobre histórico ---
+
+BACKTEST_MAX_CANDLES = 1500  # tope para que la respuesta no tarde demasiado
+
+
+def _format_backtest_stats(label: str, stats: dict) -> str:
+    if stats["total"] == 0:
+        return f"*{label}*: sin señales"
+    win_rate = f"{stats['win_rate']:.1f}%" if stats["win_rate"] is not None else "N/D"
+    avg = f"{stats['cambio_medio_pct']:+.2f}%" if stats["cambio_medio_pct"] is not None else "N/D"
+    return (
+        f"*{label}*: {stats['total']} señales ({stats['con_resultado']} con resultado)\n"
+        f"  Acierto: {win_rate}  ·  Cambio medio: {avg}"
+    )
+
+
+async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Uso: /backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE]\n"
+            "Ejemplo: /backtest BTCUSDT 4h 500 5\n\n"
+            "INTERVALO por defecto `4h` (el de la estrategia).\n"
+            f"N_VELAS por defecto 500, máximo {BACKTEST_MAX_CANDLES} — cuánto histórico traer.\n"
+            "HORIZONTE por defecto 5 — a cuántas velas después de cada señal se mide "
+            "si el precio se movió a favor.",
+            parse_mode="Markdown",
+        )
+        return
+
+    symbol = _normalize_symbol(args[0])
+    interval = args[1] if len(args) > 1 else "4h"
+
+    if interval not in VALID_INTERVALS:
+        await update.message.reply_text(
+            f"Intervalo `{interval}` no válido. Usa uno de: {' '.join(sorted(VALID_INTERVALS, key=len))}",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        n_velas = int(args[2]) if len(args) > 2 else 500
+        horizon = int(args[3]) if len(args) > 3 else 5
+    except ValueError:
+        await update.message.reply_text("N_VELAS y HORIZONTE deben ser números enteros.")
+        return
+
+    n_velas = max(50, min(n_velas, BACKTEST_MAX_CANDLES))
+    horizon = max(1, horizon)
+
+    await update.message.reply_text(
+        f"Descargando histórico de `{symbol}` ({interval}, hasta {n_velas} velas) y corriendo el backtest…",
+        parse_mode="Markdown",
+    )
+
+    try:
+        klines = bitunix.get_kline_history(symbol, interval=interval, total=n_velas)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error consultando histórico de Bitunix")
+        await update.message.reply_text(f"⚠️ Error consultando histórico de Bitunix: {exc}")
+        return
+
+    if len(klines) < 40:
+        await update.message.reply_text(
+            f"Solo hay {len(klines)} velas de histórico para `{symbol}` en `{interval}` — "
+            "no es suficiente para un backtest útil.",
+            parse_mode="Markdown",
+        )
+        return
+
+    closes = [float(k["close"]) for k in klines]
+    highs = [float(k["high"]) for k in klines]
+    lows = [float(k["low"]) for k in klines]
+    times = [k["time"] for k in klines]
+
+    results = run_backtest(closes, highs, lows, times, horizon=horizon)
+    stats = summarize(results)
+
+    first_date = datetime.fromtimestamp(times[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    last_date = datetime.fromtimestamp(times[-1] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    header = (
+        f"*Backtest {symbol} — {interval}*\n"
+        f"{len(klines)} velas ({first_date} → {last_date}), horizonte {horizon} velas\n\n"
+    )
+
+    if not results:
+        await update.message.reply_text(
+            header + "No se dio ninguna señal en ese período con los parámetros actuales.",
+            parse_mode="Markdown",
+        )
+        return
+
+    summary_text = "\n\n".join(
+        _format_backtest_stats(label, stats[key])
+        for label, key in (("Total", "total"), ("LONG", "long"), ("SHORT", "short"))
+    )
+
+    recent = results[-8:]
+    recent_lines = []
+    for r in recent:
+        date = datetime.fromtimestamp(r.time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        side_emoji = "🟢" if r.side == "LONG" else "🔴"
+        change = f"{r.pct_change:+.2f}%" if r.pct_change is not None else "pendiente"
+        recent_lines.append(f"{side_emoji} `{date}` {r.side} @ `{r.close:.4f}` → {change}")
+
+    detail_header = (
+        f"_Últimas {len(recent)} de {len(results)} señales:_"
+        if len(results) > len(recent)
+        else "_Señales:_"
+    )
+    detail_text = detail_header + "\n" + "\n".join(recent_lines)
+
+    await update.message.reply_text(header + summary_text + "\n\n" + detail_text, parse_mode="Markdown")
+
+
+# --- Watchlist de alertas: monedas vigiladas por la estrategia de 4h ---
+
+async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await _reject_unauthorized(update)
+        return
+
+    args = context.args
+
+    if not args:
+        if not alerts_watchlist:
+            message = (
+                "No estás vigilando ninguna moneda con la estrategia de 4h todavía.\n\n"
+                "Uso:\n/alerts add SIMBOLO\n/alerts remove SIMBOLO"
+            )
+        else:
+            message = "*Monedas vigiladas (estrategia de 4h):*\n" + "\n".join(
+                f"• `{s}`" for s in alerts_watchlist
+            )
+            message += "\n\nUso:\n/alerts add SIMBOLO\n/alerts remove SIMBOLO\n/alerts reset — vacía la lista"
+        await update.message.reply_text(message, parse_mode="Markdown")
+        return
+
+    action = args[0].lower()
+
+    if action == "reset":
+        alerts_watchlist.clear()
+        _save_alerts_watchlist(alerts_watchlist)
+        await update.message.reply_text("Watchlist de alertas vaciada.")
+        return
+
+    if action == "check":
+        symbols = [_normalize_symbol(args[1])] if len(args) > 1 else alerts_watchlist
+        if not symbols:
+            await update.message.reply_text(
+                "No hay ninguna moneda en la watchlist de alertas. Usa /alerts add SIMBOLO primero, "
+                "o /alerts check SIMBOLO para probar uno suelto."
+            )
+            return
+
+        lines = []
+        for symbol in symbols:
+            try:
+                signal, values = _evaluate_alert_symbol(symbol)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Error en /alerts check para %s", symbol)
+                lines.append(f"⚠️ *{symbol}*: error consultando velas de 4h ({exc})")
+                continue
+
+            if signal is not None:
+                lines.append(_format_signal_message(symbol, signal))
+            else:
+                lines.append(
+                    f"⚪ *{symbol}* — sin señal ahora mismo\n"
+                    f"  %K `{values['k']:.2f}`  %D `{values['d']:.2f}`  "
+                    f"Precio `{values['close']:.4f}`\n"
+                    f"  Bollinger: inf `{values['lower']:.4f}`  media `{values['middle']:.4f}`  "
+                    f"sup `{values['upper']:.4f}`"
+                )
+
+        await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+        return
+
+    if action in ("add", "remove", "del") and len(args) < 2:
+        await update.message.reply_text(f"Uso: /alerts {action} SIMBOLO")
+        return
+
+    if action == "add":
+        symbol = _normalize_symbol(args[1])
+        if symbol in alerts_watchlist:
+            await update.message.reply_text(f"`{symbol}` ya se está vigilando.", parse_mode="Markdown")
+            return
+        alerts_watchlist.append(symbol)
+        _save_alerts_watchlist(alerts_watchlist)
+        await update.message.reply_text(
+            f"✅ Empezaré a vigilar `{symbol}` cada 4h con la estrategia.", parse_mode="Markdown"
+        )
+        return
+
+    if action in ("remove", "del"):
+        symbol = _normalize_symbol(args[1])
+        if symbol not in alerts_watchlist:
+            await update.message.reply_text(f"`{symbol}` no estaba en la lista.", parse_mode="Markdown")
+            return
+        alerts_watchlist.remove(symbol)
+        _save_alerts_watchlist(alerts_watchlist)
+        await update.message.reply_text(f"🗑 Dejo de vigilar `{symbol}`.", parse_mode="Markdown")
+        return
+
+    await update.message.reply_text("Subcomando no reconocido. Usa: /alerts [add|remove|reset] [SIMBOLO]")
+
+
+def _format_signal_message(symbol: str, signal) -> str:
+    side_label = "🟢 LONG" if signal.side == "LONG" else "🔴 SHORT"
+    return (
+        f"🔔 *Señal de entrada — {symbol}* ({side_label})\n\n"
+        f"Vela de 4h recién cerrada.\n"
+        f"Estocástico: %K `{signal.k:.2f}`  %D `{signal.d:.2f}`\n"
+        f"Bandas de Bollinger: inf `{signal.lower:.4f}`  media `{signal.middle:.4f}`  "
+        f"sup `{signal.upper:.4f}`\n"
+        f"Precio de cierre: `{signal.close:.4f}`"
+    )
+
+
+def _evaluate_alert_symbol(symbol: str) -> tuple[object | None, dict]:
+    """
+    Trae las últimas velas de 4h de `symbol` y evalúa la estrategia sobre
+    la última vela cerrada. Devuelve (Signal o None, valores_actuales) —
+    los valores_actuales se devuelven siempre (haya señal o no) para poder
+    mostrarlos en /alerts check aunque no se haya disparado nada todavía.
+    """
+    klines = bitunix.get_kline(symbol, interval="4h", limit=100)
+    closes = [float(k["close"]) for k in klines]
+    highs = [float(k["high"]) for k in klines]
+    lows = [float(k["low"]) for k in klines]
+
+    signal = detect_signal(closes, highs, lows)
+    k, d = stochastic_oscillator(closes, highs, lows)
+    lower, middle, upper = bollinger_bands(closes)
+
+    values = {"k": k, "d": d, "lower": lower, "middle": middle, "upper": upper, "close": closes[-1]}
+    return signal, values
+
+
+async def check_alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Se ejecuta cada 4h (al cierre de vela). Revisa cada símbolo de
+    alerts_watchlist y avisa a ALLOWED_USER_ID si la estrategia da señal."""
+    if not alerts_watchlist:
+        return
+    if ALLOWED_USER_ID is None:
+        logger.warning("check_alerts_job: TELEGRAM_ALLOWED_USER_ID no está definido, no se puede avisar a nadie.")
+        return
+
+    for symbol in alerts_watchlist:
+        try:
+            signal, _ = _evaluate_alert_symbol(symbol)
+        except Exception:  # noqa: BLE001
+            logger.exception("Error evaluando la estrategia para %s", symbol)
+            continue
+
+        if signal is not None:
+            try:
+                await context.bot.send_message(
+                    chat_id=ALLOWED_USER_ID,
+                    text=_format_signal_message(symbol, signal),
+                    parse_mode="Markdown",
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Error enviando la alerta de %s", symbol)
+
+
+def _next_4h_boundary_utc() -> datetime:
+    """Próximo cierre de vela de 4h en UTC (00, 04, 08, 12, 16, 20h), con
+    30s de margen para que Bitunix ya haya publicado la vela cerrada."""
+    now = datetime.now(timezone.utc)
+    next_hour = (now.hour // 4 + 1) * 4
+    days_ahead = next_hour // 24
+    hour = next_hour % 24
+    boundary = (now + timedelta(days=days_ahead)).replace(hour=hour, minute=0, second=30, microsecond=0)
+    return boundary
 
 
 # --- Indicadores técnicos (calculados a partir del histórico de velas) ---
@@ -559,12 +873,29 @@ def main() -> None:
     application.add_handler(CommandHandler("price", price))
     application.add_handler(CommandHandler("watchlist", watchlist_command))
     application.add_handler(CommandHandler("indicators", indicators_command))
+    application.add_handler(CommandHandler("alerts", alerts_command))
+    application.add_handler(CommandHandler("backtest", backtest_command))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("positions", positions))
     application.add_handler(CommandHandler("open", open_position))
     application.add_handler(CommandHandler("close", close_position))
     application.add_handler(CallbackQueryHandler(handle_open_confirmation, pattern="^(confirm|cancel)_open$"))
     application.add_handler(CallbackQueryHandler(handle_close_confirmation, pattern="^(confirm|cancel)_close$"))
+
+    if application.job_queue is not None:
+        first_run = _next_4h_boundary_utc()
+        application.job_queue.run_repeating(
+            check_alerts_job,
+            interval=timedelta(hours=4),
+            first=first_run,
+            name="check_alerts",
+        )
+        logger.info("Estrategia de alertas programada. Primera revisión: %s (UTC)", first_run.isoformat())
+    else:
+        logger.warning(
+            "JobQueue no disponible: instala 'python-telegram-bot[job-queue]' para que "
+            "/alerts funcione. Sin esto, la estrategia de 4h nunca se evaluará sola."
+        )
 
     port = int(os.environ.get("PORT", 8443))
     render_url = os.environ.get("RENDER_EXTERNAL_URL")

@@ -1,12 +1,17 @@
 # Bot de Telegram para Bitunix
 
-Bot que consulta precios y gestiona tu cuenta de futuros en Bitunix:
-saldo, posiciones abiertas, apertura y cierre de posiciones.
+Bot que consulta precios y gestiona tu cuenta de futuros en Bitunix: saldo,
+posiciones abiertas, apertura y cierre de posiciones. Además incluye una
+estrategia de entrada basada en estocástico + Bandas de Bollinger en velas
+de 4h, con alertas automáticas y backtest sobre histórico.
 
 ## Estructura del proyecto
 
 ```
 bitunix_client.py   # Lógica de conexión a la API de Bitunix (sin Telegram)
+indicators.py        # Cálculo de indicadores técnicos (estocástico, Bollinger)
+strategy.py           # Reglas de entrada de la estrategia (usa indicators.py)
+backtest.py           # Backtest de la estrategia sobre histórico (usa strategy.py)
 bot.py               # Lógica de Telegram: comandos, confirmaciones y formato
 requirements.txt
 ```
@@ -23,19 +28,36 @@ client = BitunixClient(api_key="...", secret_key="...")
 account = client.get_account("USDT")
 ```
 
+`indicators.py`, `strategy.py` y `backtest.py` siguen la misma idea: son
+módulos puros, sin ningún import de Telegram ni de Bitunix, que solo
+reciben listas de precios ya extraídas de las velas. Se pueden reutilizar
+o testear por separado de todo lo demás.
+
 ## Comandos disponibles
 
 | Comando | Descripción |
 |---|---|
-| `/price [SIMBOLO...]` | Precios (watchlist por defecto o símbolos dados) |
+| `/price [SIMBOLO...]` | Precios (tu watchlist guardada o símbolos dados) |
+| `/watchlist` | Ver la watchlist actual |
+| `/watchlist add SIMBOLO` | Añadir un símbolo a la watchlist |
+| `/watchlist remove SIMBOLO` | Quitar un símbolo de la watchlist |
+| `/watchlist reset` | Volver a la watchlist por defecto (BTC, ETH, SOL, BNB, XRP) |
+| `/indicators SIMBOLO [INTERVALO]` | Estocástico (14,3,3) y Bandas de Bollinger (20, 2σ). Intervalo por defecto `1h` |
+| `/alerts` | Ver las monedas vigiladas por la estrategia de 4h |
+| `/alerts add SIMBOLO` | Vigilar un símbolo (recibirás alerta cuando dé señal) |
+| `/alerts remove SIMBOLO` | Dejar de vigilar un símbolo |
+| `/alerts reset` | Vaciar la lista de vigilancia |
+| `/alerts check [SIMBOLO]` | Evaluar la estrategia *ahora mismo* (sin esperar el cierre de vela), sobre un símbolo o sobre toda la lista |
+| `/backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE]` | Backtest de la estrategia sobre histórico |
 | `/balance [MONEDA]` | Balance de la cuenta de futuros (default `USDT`) |
 | `/positions [SIMBOLO]` | Posiciones abiertas |
 | `/open SIMBOLO BUY\|SELL CANTIDAD [PRECIO]` | Abrir posición (pide confirmación) |
 | `/close POSITION_ID` | Cerrar posición a mercado (pide confirmación) |
 
-`/balance`, `/positions`, `/open` y `/close` requieren `BITUNIX_API_KEY`
-y `BITUNIX_API_SECRET` configurados, y (muy recomendado)
-`TELEGRAM_ALLOWED_USER_ID` para restringir quién puede usarlos.
+`/balance`, `/positions`, `/open`, `/close`, `/watchlist` y `/alerts`
+requieren `TELEGRAM_ALLOWED_USER_ID` configurado para restringir quién
+puede usarlos; `/balance`, `/positions`, `/open` y `/close` además
+necesitan `BITUNIX_API_KEY` y `BITUNIX_API_SECRET`.
 
 ## ⚠️ Seguridad — leer antes de desplegar
 
@@ -71,6 +93,18 @@ source venv/bin/activate  # en Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+`requirements.txt` debe incluir el extra `job-queue` de
+`python-telegram-bot` (además de `webhooks`, que ya usas para Render):
+
+```
+python-telegram-bot[webhooks,job-queue]==21.4
+requests==2.32.3
+```
+
+Sin el extra `job-queue` el bot arranca igual, pero las alertas
+automáticas de `/alerts` nunca se disparan solas (verás un aviso en los
+logs); `/alerts check` sí funciona siempre porque es manual.
+
 ## 3. Configurar el token
 
 ```bash
@@ -91,6 +125,9 @@ Busca tu bot por su username y envía:
 - `/price` — precios de una watchlist por defecto (BTC, ETH, SOL, BNB, XRP)
 - `/price BTCUSDT` — precio de un par específico
 - `/price BTCUSDT ETHUSDT` — varios pares a la vez
+- `/indicators BTCUSDT` — estocástico y Bandas de Bollinger
+- `/alerts check BTCUSDT` — evaluar la estrategia ahora mismo
+- `/backtest BTCUSDT` — backtest rápido con los valores por defecto
 
 ### ⚠️ Si el deploy falla con `RuntimeError: There is no current event loop`
 
@@ -148,23 +185,118 @@ Los Web Services gratis de Render se suspenden tras ~15 min sin
 recibir ninguna petición HTTP, y tardan uno o dos minutos en
 despertar cuando llega la siguiente. Para un bot esto significa que
 el primer mensaje después de un rato de inactividad puede tardar en
-responder.
+responder — y que el job de `/alerts` (cada 4h) **no se ejecutará si
+la instancia está dormida en ese momento**, así que te puedes perder
+una revisión.
 
 **Solución simple:** usa un servicio gratuito de monitoreo (por
 ejemplo [UptimeRobot](https://uptimerobot.com)) para hacer un `GET`
 a la URL pública de tu servicio (`https://tu-bot.onrender.com`) cada
 5-10 minutos. Cualquier petición HTTP cuenta como actividad y evita
-que se duerma — no hace falta que sea al endpoint del webhook.
+que se duerma — no hace falta que sea al endpoint del webhook. Esto
+es especialmente importante ahora que usas `/alerts`, para que el bot
+esté despierto en los cierres de vela de 4h (00:00, 04:00, 08:00,
+12:00, 16:00, 20:00 UTC).
 
-Si más adelante el "sleep" se vuelve un problema serio (por ejemplo,
-si agregas alertas de precio en tiempo real que necesitan estar
-siempre corriendo), la alternativa es pasar a un plan pago de Render
-o a una VM propia.
+Si el "sleep" se vuelve un problema serio, la alternativa es pasar a
+un plan pago de Render o a una VM propia.
+
+## Watchlist de `/price`
+
+La watchlist se guarda en `watchlist.json` (junto al bot) y se edita con
+`/watchlist add|remove|reset`. En Render (plan free) ese archivo sobrevive
+mientras la instancia siga "despierta" o duerma por inactividad, pero
+**se pierde en cada redeploy** (el disco no es persistente entre builds).
+Si quieres que sobreviva a los redeploys, la alternativa es guardarla en
+una base de datos pequeña (por ejemplo SQLite en un disco persistente de
+pago, o un servicio como Supabase/Upstash). Lo mismo aplica a
+`alerts_watchlist.json` (ver más abajo).
+
+## Indicadores técnicos (`/indicators`)
+
+La API de Bitunix no expone indicadores ya calculados (estocástico,
+Bollinger, RSI, etc.), solo el histórico de velas
+(`GET /api/v1/futures/market/kline`, endpoint público). Por eso
+`bitunix_client.py` solo añade `get_kline(...)` para traer esas velas, y
+todo el cálculo vive en `indicators.py`:
+
+- **Estocástico lento (14, 3, 3)** — el mismo ajuste por defecto que usa
+  la mayoría de plataformas de gráficos, incluida la app de Bitunix.
+- **Bandas de Bollinger (20, 2σ)** — media móvil simple de 20 velas ±2
+  desviaciones típicas.
+
+`/indicators BTCUSDT` usa el intervalo `1h` por defecto;
+`/indicators BTCUSDT 15m` usa velas de 15 minutos. Intervalos válidos:
+`1m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d 3d 1w 1M`.
+
+## Estrategia de 4h y alertas (`/alerts`)
+
+`strategy.py` implementa la estrategia de entrada en velas de 4h
+(estocástico + Bollinger). Reglas, evaluadas al cierre de cada vela:
+
+- **LONG**: la línea rápida del estocástico (%K) cruza hacia arriba a la
+  lenta (%D), y en las velas recientes anteriores al cruce %K estuvo en
+  zona de sobreventa (no hace falta que el cruce en sí ocurra dentro de
+  la zona). Además, el precio de cierre debe estar por debajo de la
+  banda media de Bollinger y más cerca de la banda inferior que de la
+  media.
+- **SHORT**: exactamente lo contrario (cruce hacia abajo, sobrecompra
+  reciente, precio por encima de la media y más cerca de la banda
+  superior).
+
+Parámetros ajustables en `detect_signal()` (`strategy.py`): `oversold`/
+`overbought` (25/75 por defecto — una aproximación a "cerca de la zona";
+cámbialos a 20/80 si prefieres el umbral clásico) y `lookback` (10 velas,
+cuánto mirar hacia atrás buscando la sobreventa/sobrecompra previa).
+
+**Por ahora solo envía alertas — no abre operaciones.** Las condiciones
+de salida (stop-loss / take-profit) todavía no están definidas.
+
+Cómo usarlo:
+
+1. `/alerts add BTCUSDT` — añade símbolos a vigilar (se guardan en
+   `alerts_watchlist.json`, lista separada de la watchlist de `/price`).
+2. El bot revisa automáticamente cada símbolo vigilado al cierre de
+   cada vela de 4h (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC) y te
+   manda un mensaje a tu `TELEGRAM_ALLOWED_USER_ID` si hay señal. Esto
+   requiere el extra `job-queue` instalado (ver sección 2) y
+   `TELEGRAM_ALLOWED_USER_ID` configurado — sin esto el job no puede
+   avisarte a nadie.
+3. `/alerts check [SIMBOLO]` — evalúa la estrategia *ahora mismo*, sin
+   esperar al cierre real de la vela. Si no hay señal, te muestra los
+   valores actuales (%K, %D, precio, bandas) para que puedas verificar
+   que el cálculo tiene sentido mientras pruebas la estrategia.
+
+## Backtest (`/backtest`)
+
+`/backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE]` — por ejemplo
+`/backtest BTCUSDT 4h 500 5` — recorre el histórico vela a vela aplicando
+`detect_signal()` en cada paso (solo con lo que "se sabría" hasta ese
+momento) y te devuelve un resumen: total de señales, tasa de acierto y
+cambio medio, separado por LONG/SHORT, más el detalle de las últimas
+señales encontradas.
+
+Valores por defecto: intervalo `4h`, 500 velas (~83 días), horizonte 5
+velas (a cuántas velas después de cada señal se mide el resultado). Tope
+de 1500 velas por consulta para que no se dispare el tiempo de respuesta.
+
+**Limitación importante:** como todavía no hay reglas de salida
+definidas, esto *no* simula una operación completa con entrada y salida
+(stop/take-profit) — solo mide si el precio se movió a favor de la señal
+`horizon` velas después. Es una forma rápida de validar si la *dirección*
+de las señales suele acertar, no la rentabilidad real que habría tenido
+una operación. Cuando definamos las salidas, se puede reemplazar por una
+simulación más realista.
+
+`get_kline_history()` en `bitunix_client.py` es quien trae el histórico:
+pagina hacia atrás en el tiempo en bloques de 200 velas (el máximo por
+request de la API) hasta reunir las que se pidan.
 
 ## Próximos pasos sugeridos
 
+- **Condiciones de salida** (stop-loss / take-profit) para la estrategia
+  de `/alerts` — y, una vez definidas, un backtest que simule la
+  operación completa en vez de solo medir la dirección del precio.
+- Pasar de "solo alerta" a abrir la operación automáticamente cuando hay
+  señal (reutilizando `place_order`, ya soportado por `bitunix_client.py`).
 - Historial de órdenes/trades (`get_history_orders`, `get_history_trades`).
-- Alertas de precio (requiere que el bot esté siempre corriendo, no solo
-  reaccionando a webhooks — revisa la limitación de "sleep" de Render arriba).
-- Take-profit / stop-loss al abrir posición (`tpPrice`, `slPrice` en
-  `place_order` — ya soportado por la API, falta exponerlo como comando).

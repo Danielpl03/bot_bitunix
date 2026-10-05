@@ -173,6 +173,60 @@ class BitunixClient:
         data = payload.get("data", [])
         return sorted(data, key=lambda k: k.get("time", 0))
 
+    def get_kline_history(
+        self,
+        symbol: str,
+        interval: str = "4h",
+        total: int = 500,
+        kline_type: str = "LAST_PRICE",
+        end_time: int | None = None,
+    ) -> list[dict]:
+        """
+        Igual que `get_kline`, pero sin el límite de 200 velas por request:
+        pagina hacia atrás en el tiempo (pidiendo trozos de 200 con `endTime`
+        decreciente) hasta reunir `total` velas o hasta que la API deje de
+        devolver histórico más antiguo para ese símbolo. Pensado para
+        backtests, donde 200 velas suelen quedarse cortas.
+
+        `end_time` opcional fija el punto más reciente desde el que mirar
+        hacia atrás (ms, timestamp Unix); si no se da, parte de "ahora".
+
+        Devuelve las velas ordenadas de más antigua a más reciente, sin
+        duplicados, recortadas a como mucho `total`.
+        """
+        all_candles: dict[int, dict] = {}
+        cursor_end_time = end_time
+
+        while len(all_candles) < total:
+            page = self.get_kline(
+                symbol,
+                interval=interval,
+                limit=200,
+                end_time=cursor_end_time,
+                kline_type=kline_type,
+            )
+            if not page:
+                break  # no hay más histórico disponible para este símbolo
+
+            new_candles = 0
+            for candle in page:
+                t = candle.get("time")
+                if t is not None and t not in all_candles:
+                    all_candles[t] = candle
+                    new_candles += 1
+
+            if new_candles == 0:
+                break  # ya no llegan velas nuevas: cortamos para no entrar en bucle
+
+            oldest_time = min(c["time"] for c in page if c.get("time") is not None)
+            cursor_end_time = oldest_time - 1
+
+            if len(page) < 200:
+                break  # la API devolvió menos del máximo: no queda más historial atrás
+
+        candles = sorted(all_candles.values(), key=lambda c: c.get("time", 0))
+        return candles[-total:] if len(candles) > total else candles
+
     # --- Endpoints privados (requieren api_key/secret_key) ---
 
     def get_account(self, margin_coin: str = "USDT") -> dict | None:
