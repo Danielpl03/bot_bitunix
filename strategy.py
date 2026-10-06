@@ -16,9 +16,15 @@ Reglas (tal como las describiste):
     3) El precio de cierre está por debajo de la banda media de Bollinger
        y más cerca de la banda inferior que de la media.
 
+    4) La vela de la señal es alcista (cierre > apertura): va en la
+       dirección de la operación.
+    5) El objetivo de ratio 0.5:1 (ver `take_profit_level`) queda por
+       debajo de la banda media de Bollinger del momento de la señal, es
+       decir, el primer objetivo se alcanza antes de llegar a la media.
+
   SHORT: exactamente lo contrario (cruce hacia abajo, sobrecompra reciente,
   precio por encima de la media y más cerca de la banda superior que de
-  la media).
+  la media, vela bajista, y objetivo 0.5:1 por encima de la banda media).
 
 Los umbrales de sobreventa/sobrecompra y la ventana de "reciente" son
 parámetros ajustables (`oversold`, `overbought`, `lookback`). Los valores
@@ -75,16 +81,21 @@ def detect_signal(
     closes: list[float],
     highs: list[float],
     lows: list[float],
+    opens: list[float],
     oversold: float = 25.0,
     overbought: float = 75.0,
     lookback: int = 10,
     sl_lookback: int = 10,
+    band_ratio: float = 0.5,
 ) -> Signal | None:
     """
-    Evalúa la última vela cerrada (closes[-1] / highs[-1] / lows[-1]) y
-    devuelve un Signal si se cumplen las condiciones de LONG o SHORT, o
-    None si no hay señal (incluido el caso de no tener aún velas
+    Evalúa la última vela cerrada (closes[-1] / highs[-1] / lows[-1] /
+    opens[-1]) y devuelve un Signal si se cumplen las condiciones de LONG o
+    SHORT, o None si no hay señal (incluido el caso de no tener aún velas
     suficientes para calcular los indicadores).
+
+    `band_ratio` es el ratio del objetivo que debe quedar antes de la banda
+    media de Bollinger (0.5 por defecto, el del primer escenario de TP).
     """
     try:
         k_series, d_series = stochastic_series(closes, highs, lows)
@@ -109,26 +120,33 @@ def detect_signal(
     # Ventana de %K justo antes del cruce (sin incluir el valor del cruce).
     recent_k = k_series[-(lookback + 1) : -1]
 
-    if len(lows) < sl_lookback or len(highs) < sl_lookback:
+    if len(lows) < sl_lookback or len(highs) < sl_lookback or not opens:
         return None  # no hay suficientes velas todavía para ubicar el mínimo/máximo local
+
+    open_ = opens[-1]
 
     if (
         crossed_up
         and min(recent_k) <= oversold
         and close < middle
         and close < (lower + middle) / 2
+        and close > open_  # vela alcista: va en la dirección del LONG
     ):
         stop_loss = min(lows[-sl_lookback:])
-        return Signal("LONG", k_now, d_now, close, lower, middle, upper, stop_loss)
+        # El objetivo 0.5:1 debe quedar antes de llegar a la banda media.
+        if take_profit_level("LONG", close, stop_loss, band_ratio) < middle:
+            return Signal("LONG", k_now, d_now, close, lower, middle, upper, stop_loss)
 
     if (
         crossed_down
         and max(recent_k) >= overbought
         and close > middle
         and close > (middle + upper) / 2
+        and close < open_  # vela bajista: va en la dirección del SHORT
     ):
         stop_loss = max(highs[-sl_lookback:])
-        return Signal("SHORT", k_now, d_now, close, lower, middle, upper, stop_loss)
+        if take_profit_level("SHORT", close, stop_loss, band_ratio) > middle:
+            return Signal("SHORT", k_now, d_now, close, lower, middle, upper, stop_loss)
 
     return None
 

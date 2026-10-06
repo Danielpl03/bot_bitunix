@@ -19,9 +19,13 @@ Cómo se simula cada operación
   mismas señales (ver `TP_RATIOS`):
     * 0.5:1 → objetivo a 0.5 veces la distancia entrada → stop.
     * 1:1   → objetivo a 1 vez esa distancia.
-- Si pasan `horizon` velas sin tocar ni stop ni objetivo, la operación se
-  cierra al cierre de esa vela (el resultado puede ser positivo o negativo).
-  Si todavía no existen esas velas y no se ha tocado nada, queda "pendiente".
+- El límite de velas (`horizon`) es OPCIONAL. Sin límite (`horizon=None`,
+  el valor por defecto), cada operación solo termina cuando toca su
+  objetivo o el stop; si el histórico se acaba antes de que ocurra
+  cualquiera de los dos, queda "pendiente" (operación todavía abierta).
+  Con límite, si pasan `horizon` velas sin tocar ni stop ni objetivo, la
+  operación se cierra al cierre de esa vela (resultado positivo o negativo);
+  si todavía no existen esas velas y no se ha tocado nada, queda "pendiente".
 
 Limitación conocida (velas OHLC): si en una misma vela el precio toca el stop
 Y el objetivo, no hay forma de saber cuál fue primero con datos de vela. Se
@@ -43,8 +47,8 @@ TP_RATIOS: tuple[float, ...] = (0.5, 1.0)
 # Cómo terminó una operación simulada.
 OUTCOME_TP = "TP"  # llegó al objetivo antes que al stop
 OUTCOME_SL = "SL"  # tocó el stop (primero, o en la misma vela que el objetivo)
-OUTCOME_HORIZON = "HORIZONTE"  # no tocó ninguno; se cerró al cierre de la vela `horizon`
-OUTCOME_PENDING = "PENDIENTE"  # no tocó ninguno y aún no existen las `horizon` velas
+OUTCOME_HORIZON = "HORIZONTE"  # (solo con límite) no tocó ninguno; se cerró al cierre de la vela `horizon`
+OUTCOME_PENDING = "PENDIENTE"  # no tocó ninguno y el histórico se acabó (o aún no existen las `horizon` velas)
 OUTCOME_NA = "N/D"  # no simulable (stop igual al precio de entrada → riesgo 0)
 
 RESOLVED_OUTCOMES = (OUTCOME_TP, OUTCOME_SL, OUTCOME_HORIZON)
@@ -93,14 +97,15 @@ def _simulate_trade(
     highs: list[float],
     lows: list[float],
     signal_index: int,
-    horizon: int,
+    horizon: int | None,
 ) -> tuple[str, float | None]:
     """
     Recorre las velas posteriores a la señal y devuelve (outcome, precio de
-    salida). Ver el docstring del módulo para las reglas.
+    salida). Ver el docstring del módulo para las reglas. `horizon=None` =
+    sin límite de velas.
     """
     last_index = len(closes) - 1
-    end = min(signal_index + horizon, last_index)
+    end = last_index if horizon is None else min(signal_index + horizon, last_index)
 
     for j in range(signal_index + 1, end + 1):
         if side == "LONG":
@@ -115,7 +120,7 @@ def _simulate_trade(
         if hit_target:
             return OUTCOME_TP, target
 
-    if signal_index + horizon <= last_index:
+    if horizon is not None and signal_index + horizon <= last_index:
         return OUTCOME_HORIZON, closes[signal_index + horizon]
     return OUTCOME_PENDING, None
 
@@ -130,7 +135,7 @@ def _evaluate_scenario(
     highs: list[float],
     lows: list[float],
     signal_index: int,
-    horizon: int,
+    horizon: int | None,
 ) -> ScenarioResult:
     if risk_pct <= 0:
         return ScenarioResult(ratio, None, OUTCOME_NA, None, None, None)
@@ -152,8 +157,9 @@ def run_backtest(
     closes: list[float],
     highs: list[float],
     lows: list[float],
+    opens: list[float],
     times: list[int],
-    horizon: int = 5,
+    horizon: int | None = None,
     oversold: float = 25.0,
     overbought: float = 75.0,
     lookback: int = 10,
@@ -166,8 +172,10 @@ def run_backtest(
     hacia delante (stop + cada ratio de `tp_ratios`) y devuelve la lista de
     señales con el resultado de cada escenario.
 
-    `horizon` es el máximo de velas que se mantiene una operación sin tocar
-    stop ni objetivo; pasado ese punto se cierra al cierre de esa vela.
+    `horizon` (opcional) es el máximo de velas que se mantiene una operación
+    sin tocar stop ni objetivo; pasado ese punto se cierra al cierre de esa
+    vela. Con `None` (por defecto) no hay límite: la operación solo termina
+    al tocar el objetivo o el stop.
 
     Nota de rendimiento: cada paso recalcula los indicadores desde cero
     sobre el tramo de velas hasta ese punto, así que el costo crece
@@ -183,6 +191,7 @@ def run_backtest(
             closes[: i + 1],
             highs[: i + 1],
             lows[: i + 1],
+            opens[: i + 1],
             oversold=oversold,
             overbought=overbought,
             lookback=lookback,

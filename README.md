@@ -245,6 +245,17 @@ todo el cálculo vive en `indicators.py`:
   reciente, precio por encima de la media y más cerca de la banda
   superior).
 
+Filtros adicionales (aplican a LONG y SHORT, en alertas y en `/backtest`):
+
+- **Vela a favor:** la vela que da la señal debe ir en la dirección de la
+  operación — alcista (cierre > apertura) para LONG, bajista para SHORT.
+- **Objetivo 0.5:1 antes de la banda media:** el nivel del TP de ratio 0.5:1
+  (ver `take_profit_level`) debe quedar por debajo de la banda media de
+  Bollinger del momento de la señal en un LONG, o por encima en un SHORT.
+  Si el 0.5:1 ya cruzaría la media, no se entra.
+
+`detect_signal()` ahora recibe también las aperturas (`opens`) para evaluar la vela.
+
 Parámetros ajustables en `detect_signal()` (`strategy.py`): `oversold`/
 `overbought` (25/75 por defecto — una aproximación a "cerca de la zona";
 cámbialos a 20/80 si prefieres el umbral clásico) y `lookback` (10 velas,
@@ -319,8 +330,8 @@ conecten las órdenes reales a Bitunix.
 momento) y **simula cada operación completa**: entrada al cierre de la vela
 de la señal y, desde la vela siguiente, stop loss y objetivo.
 
-Valores por defecto: intervalo `4h`, 500 velas (~83 días), horizonte 5
-velas. Tope de 1500 velas por consulta para que no se dispare el tiempo de
+Valores por defecto: intervalo `4h`, 500 velas (~83 días), **sin límite de
+velas por operación** (el HORIZONTE es opcional). Tope de 1500 velas por consulta para que no se dispare el tiempo de
 respuesta.
 
 ### Cómo se simula cada operación
@@ -336,10 +347,12 @@ respuesta.
   vela, no solo el cierre. Si el objetivo se toca antes que el stop, la
   operación gana el ratio completo. Si el stop va primero (o en la misma
   vela que el objetivo), cuenta como stop.
-- **Horizonte:** es el máximo de velas que se mantiene la operación. Si
-  pasan sin tocar ni stop ni objetivo, se cierra al cierre de esa vela
-  (puede salir en positivo o negativo). Si todavía no existen esas velas y
-  no se ha tocado nada, queda como *pendiente*.
+- **Horizonte (opcional):** sin él, cada operación dura hasta tocar su
+  objetivo o el stop; si el histórico se acaba antes, queda *pendiente*
+  (aún abierta). Con él (`/backtest BTCUSDT 4h 500 5`) es el máximo de
+  velas que se mantiene la operación: si pasan sin tocar ni stop ni
+  objetivo, se cierra al cierre de esa vela (puede salir en positivo o
+  negativo).
 - **Misma vela, stop y objetivo:** con velas OHLC no se puede saber cuál fue
   primero; se asume el caso conservador (stop).
 - No incluye comisiones ni slippage.

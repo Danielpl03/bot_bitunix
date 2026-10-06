@@ -60,7 +60,7 @@ def _write_summary_sheet(
     ws,
     symbol: str,
     interval: str,
-    horizon: int,
+    horizon: int | None,
     n_candles: int,
     first_date: datetime,
     last_date: datetime,
@@ -75,7 +75,7 @@ def _write_summary_sheet(
     meta = [
         ("Símbolo", symbol),
         ("Intervalo", interval),
-        ("Horizonte máx. (velas)", horizon),
+        ("Límite de velas por operación", horizon if horizon is not None else "Sin límite"),
         ("Velas analizadas", n_candles),
         ("Desde", first_date.strftime("%Y-%m-%d %H:%M")),
         ("Hasta", last_date.strftime("%Y-%m-%d %H:%M")),
@@ -163,7 +163,12 @@ def _write_summary_sheet(
         "• Si el precio toca el stop, la operación se corta ahí: pérdida = distancia entrada → stop (-1R).",
         "• Objetivo 0.5:1 = 0.5 × la distancia entrada → stop; 1:1 = 1 × esa distancia. Cada escenario se simula por separado.",
         "• Si en una misma vela se tocan stop y objetivo, se cuenta como stop (no se puede saber el orden con velas).",
-        f"• Si pasan {horizon} velas sin tocar stop ni objetivo, se cierra al cierre de esa vela.",
+        (
+            f"• Si pasan {horizon} velas sin tocar stop ni objetivo, se cierra al cierre de esa vela."
+            if horizon is not None
+            else "• Sin límite de velas: cada operación termina solo al tocar su objetivo o el stop; "
+            "si el histórico se acaba antes, queda pendiente (aún abierta)."
+        ),
         "• No incluye comisiones ni slippage.",
     ]
     for i, text in enumerate(notes):
@@ -295,7 +300,7 @@ def _write_candles_sheet(ws, klines: list[dict]) -> None:
 def build_backtest_workbook(
     symbol: str,
     interval: str,
-    horizon: int,
+    horizon: int | None,
     klines: list[dict],
     results: list[BacktestSignal],
     stats: dict,

@@ -325,9 +325,14 @@ def _format_backtest_stats(label: str, stats: dict) -> str:
             lines.append(f"  Objetivo {ratio_label(ratio)}: sin operaciones resueltas")
             continue
         win_rate = f"{sc['win_rate']:.1f}%" if sc["win_rate"] is not None else "N/D"
+        extras = ""
+        if sc["horizonte"]:
+            extras += f" · {sc['horizonte']} al horizonte"
+        if sc["pendientes"]:
+            extras += f" · {sc['pendientes']} abiertas"
         lines.append(
-            f"  Objetivo {ratio_label(ratio)}: {sc['tp']} TP · {sc['sl']} SL · "
-            f"{sc['horizonte']} horizonte · acierto {win_rate}\n"
+            f"  Objetivo {ratio_label(ratio)}: {sc['tp']} TP · {sc['sl']} SL{extras} · "
+            f"acierto {win_rate}\n"
             f"    R total {sc['r_total']:+.2f}R · R medio {sc['r_medio']:+.2f}R "
             f"· cambio total {sc['cambio_total_pct']:+.2f}%"
         )
@@ -351,11 +356,12 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not args:
         await update.message.reply_text(
             "Uso: /backtest SIMBOLO (INTERVALO) (N_VELAS) (HORIZONTE)\n"
-            "Ejemplo: /backtest BTCUSDT 4h 500 5\n\n"
+            "Ejemplo: /backtest BTCUSDT 4h 500 (o con límite: /backtest BTCUSDT 4h 500 5)\n\n"
             "INTERVALO por defecto `4h` (el de la estrategia).\n"
             f"N_VELAS por defecto 500, máximo {BACKTEST_MAX_CANDLES} — cuánto histórico traer.\n"
-            "HORIZONTE por defecto 5 — máximo de velas que se mantiene cada operación; "
-            "si no toca ni el stop ni el objetivo, se cierra al cierre de esa vela.\n"
+            "HORIZONTE es opcional — máximo de velas que se mantiene cada operación; "
+            "si no lo pones, la operación dura hasta tocar el objetivo o el stop. "
+            "Con horizonte, si no toca ninguno, se cierra al cierre de esa vela.\n"
             "Se simulan dos objetivos (0.5:1 y 1:1 respecto a la distancia al stop) y se "
             "comparan; el stop corta la operación si el precio lo toca.",
             parse_mode="Markdown",
@@ -374,13 +380,14 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     try:
         n_velas = int(args[2]) if len(args) > 2 else 500
-        horizon = int(args[3]) if len(args) > 3 else 5
+        horizon = int(args[3]) if len(args) > 3 else None
     except ValueError:
         await update.message.reply_text("N_VELAS y HORIZONTE deben ser números enteros.")
         return
 
     n_velas = max(50, min(n_velas, BACKTEST_MAX_CANDLES))
-    horizon = max(1, horizon)
+    if horizon is not None:
+        horizon = max(1, horizon)
 
     await update.message.reply_text(
         f"Descargando histórico de `{symbol}` ({interval}, hasta {n_velas} velas) y corriendo el backtest…",
@@ -405,16 +412,19 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     closes = [float(k["close"]) for k in klines]
     highs = [float(k["high"]) for k in klines]
     lows = [float(k["low"]) for k in klines]
+    opens = [float(k["open"]) for k in klines]
     times = [k["time"] for k in klines]
 
-    results = run_backtest(closes, highs, lows, times, horizon=horizon)
+    results = run_backtest(closes, highs, lows, opens, times, horizon=horizon)
     stats = summarize(results)
 
     first_date = datetime.fromtimestamp(times[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
     last_date = datetime.fromtimestamp(times[-1] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
     header = (
         f"*Backtest {symbol} — {interval}*\n"
-        f"{len(klines)} velas ({first_date} → {last_date}), horizonte {horizon} velas\n\n"
+        f"{len(klines)} velas ({first_date} → {last_date}), "
+        + (f"horizonte {horizon} velas" if horizon is not None else "sin límite de velas por operación")
+        + "\n\n"
     )
 
     if not results:
@@ -448,7 +458,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         else "_Señales:_"
     )
     detail_text = detail_header + "\n" + "\n".join(recent_lines)
-    detail_text += "\n_✅ objetivo · ❌ stop · ➖ cerrada al horizonte · ⏳ pendiente_"
+    detail_text += "\n_✅ objetivo · ❌ stop · ➖ cerrada al horizonte · ⏳ aún abierta_"
 
     await update.message.reply_text(header + summary_text + "\n\n" + detail_text, parse_mode="Markdown")
 
@@ -587,8 +597,9 @@ def _evaluate_alert_symbol(symbol: str) -> tuple[object | None, dict]:
     closes = [float(k["close"]) for k in klines]
     highs = [float(k["high"]) for k in klines]
     lows = [float(k["low"]) for k in klines]
+    opens = [float(k["open"]) for k in klines]
 
-    signal = detect_signal(closes, highs, lows)
+    signal = detect_signal(closes, highs, lows, opens)
     k, d = stochastic_oscillator(closes, highs, lows)
     lower, middle, upper = bollinger_bands(closes)
 
