@@ -194,7 +194,9 @@ una revisión.
 ejemplo [UptimeRobot](https://uptimerobot.com)) para hacer un `GET`
 a la URL pública de tu servicio (`https://tu-bot.onrender.com`) cada
 5-10 minutos. Cualquier petición HTTP cuenta como actividad y evita
-que se duerma — no hace falta que sea al endpoint del webhook. Esto
+que se duerma. La raíz `/` responde `200 OK` (GET y HEAD) gracias a
+`_enable_health_check()` en `bot.py`; sin eso, `python-telegram-bot` solo
+atiende `/webhook` y devolvería 404, que UptimeRobot interpreta como caído. Esto
 es especialmente importante ahora que usas `/alerts`, para que el bot
 esté despierto en los cierres de vela de 4h (00:00, 04:00, 08:00,
 12:00, 16:00, 20:00 UTC).

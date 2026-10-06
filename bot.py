@@ -942,6 +942,41 @@ async def _post_init(application: Application) -> None:
     logger.info("Comandos registrados en el menú de Telegram.")
 
 
+def _enable_health_check() -> None:
+    """
+    En modo webhook, python-telegram-bot solo responde en la ruta del webhook
+    (POST /webhook); cualquier otra URL, incluida la raíz "/", devuelve 404.
+    Eso hace que monitores como UptimeRobot (y el Health Check de Render)
+    vean el servicio como caído aunque el bot funcione bien.
+
+    Esta función añade al servidor interno una ruta GET/HEAD "/" que responde
+    200 "OK". Debe llamarse ANTES de `run_webhook`. Si en alguna versión
+    futura de la librería la estructura interna cambia, no rompe el bot:
+    solo deja un aviso en los logs y "/" seguirá devolviendo 404.
+    """
+    try:
+        from telegram.ext._utils.webhookhandler import WebhookAppClass
+        from tornado.web import RequestHandler
+
+        class HealthHandler(RequestHandler):
+            def get(self) -> None:
+                self.set_status(200)
+                self.write("OK")
+
+            def head(self) -> None:
+                self.set_status(200)
+
+        original_init = WebhookAppClass.__init__
+
+        def patched_init(self, *args, **kwargs) -> None:
+            original_init(self, *args, **kwargs)
+            self.add_handlers(r".*", [(r"/", HealthHandler)])
+
+        WebhookAppClass.__init__ = patched_init
+    except Exception:  # noqa: BLE001
+        logger.warning("No se pudo activar el health check en '/'; seguirá devolviendo 404.", exc_info=True)
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -995,6 +1030,7 @@ def main() -> None:
         webhook_path = "webhook"
         webhook_url = f"{render_url.rstrip('/')}/{webhook_path}"
         logger.info("Modo webhook (Render) -> %s", webhook_url)
+        _enable_health_check()
         application.run_webhook(
             listen="0.0.0.0",
             port=port,
