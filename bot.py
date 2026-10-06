@@ -531,9 +531,9 @@ async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await _send_chunks(update.message.reply_text, [f"📊 *Estado de la estrategia — {interval}*"] + blocks)
         return
 
-if action in ("add", "remove", "del") and len(args) < 2:
-        await update.message.reply_text(f"Uso: /watchlist {action} SIMBOLO")
-        return
+    if action in ("add", "remove", "del") and len(args) < 2:
+            await update.message.reply_text(f"Uso: /watchlist {action} SIMBOLO")
+            return
 
     if action == "add":
         symbol = _normalize_symbol(args[1])
