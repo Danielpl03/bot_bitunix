@@ -12,6 +12,7 @@ bitunix_client.py   # Lógica de conexión a la API de Bitunix (sin Telegram)
 indicators.py        # Cálculo de indicadores técnicos (estocástico, Bollinger)
 strategy.py           # Reglas de entrada de la estrategia (usa indicators.py)
 backtest.py           # Backtest de la estrategia sobre histórico (usa strategy.py)
+xlsx_export.py         # Arma el Excel del backtest (usa backtest.py, sin Telegram)
 bot.py               # Lógica de Telegram: comandos, confirmaciones y formato
 requirements.txt
 ```
@@ -48,7 +49,7 @@ o testear por separado de todo lo demás.
 | `/alerts remove SIMBOLO` | Dejar de vigilar un símbolo |
 | `/alerts reset` | Vaciar la lista de vigilancia |
 | `/alerts check [SIMBOLO]` | Evaluar la estrategia *ahora mismo* (sin esperar el cierre de vela), sobre un símbolo o sobre toda la lista |
-| `/backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE]` | Backtest de la estrategia sobre histórico |
+| `/backtest SIMBOLO (INTERVALO) (N_VELAS) (HORIZONTE)` | Backtest de la estrategia sobre histórico + Excel con el detalle |
 | `/balance [MONEDA]` | Balance de la cuenta de futuros (default `USDT`) |
 | `/positions [SIMBOLO]` | Posiciones abiertas |
 | `/open SIMBOLO BUY\|SELL CANTIDAD [PRECIO]` | Abrir posición (pide confirmación) |
@@ -291,6 +292,19 @@ simulación más realista.
 `get_kline_history()` en `bitunix_client.py` es quien trae el histórico:
 pagina hacia atrás en el tiempo en bloques de 200 velas (el máximo por
 request de la API) hasta reunir las que se pidan.
+
+### Excel con el detalle completo
+
+Después del resumen en texto, `/backtest` adjunta un archivo `.xlsx`
+(generado por `xlsx_export.py`, vía `openpyxl`) con tres hojas:
+
+- **Resumen** — metadatos de la corrida y la misma tabla Total/LONG/SHORT del mensaje de texto.
+- **Señales** — una fila por cada señal encontrada: fecha, lado, precio, %K/%D, bandas, precio N velas después, % de cambio y si fue acierto, fallo o está pendiente. Con filtros automáticos en el encabezado.
+- **Velas** — el histórico OHLC completo que se usó para el backtest, por si quieres revisarlo o graficarlo aparte.
+
+Útil para ordenar/filtrar en Excel, graficar la curva de aciertos, o
+cruzar las señales con tus propios criterios — cosas que un mensaje de
+Telegram no permite.
 
 ## Próximos pasos sugeridos
 

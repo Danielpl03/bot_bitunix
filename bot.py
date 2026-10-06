@@ -42,6 +42,7 @@ from backtest import run_backtest, summarize
 from bitunix_client import DEFAULT_WATCHLIST, BitunixAPIError, BitunixClient
 from indicators import bollinger_bands, stochastic_oscillator
 from strategy import detect_signal
+from xlsx_export import build_backtest_workbook
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -409,6 +410,22 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     detail_text = detail_header + "\n" + "\n".join(recent_lines)
 
     await update.message.reply_text(header + summary_text + "\n\n" + detail_text, parse_mode="Markdown")
+
+    try:
+        workbook_buffer = build_backtest_workbook(symbol, interval, horizon, klines, results, stats)
+    except Exception:  # noqa: BLE001
+        logger.exception("Error generando el Excel del backtest")
+        await update.message.reply_text(
+            "⚠️ El resumen de arriba sí se calculó bien, pero no pude generar el Excel con el detalle."
+        )
+        return
+
+    filename = f"backtest_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
+    await update.message.reply_document(
+        document=workbook_buffer,
+        filename=filename,
+        caption=f"📊 Detalle completo: {len(results)} señales y {len(klines)} velas de {symbol} ({interval}).",
+    )
 
 
 # --- Watchlist de alertas: monedas vigiladas por la estrategia de 4h ---
