@@ -250,8 +250,9 @@ Parámetros ajustables en `detect_signal()` (`strategy.py`): `oversold`/
 cámbialos a 20/80 si prefieres el umbral clásico) y `lookback` (10 velas,
 cuánto mirar hacia atrás buscando la sobreventa/sobrecompra previa).
 
-**Por ahora solo envía alertas — no abre operaciones.** Las condiciones
-de salida (stop-loss / take-profit) todavía no están definidas.
+**Por ahora solo envía alertas — no abre operaciones.** El stop loss y los
+objetivos por ratio (0.5:1 y 1:1, ver más abajo) ya se simulan en
+`/backtest`, pero las alertas todavía no muestran el objetivo.
 
 Cómo usarlo:
 
@@ -305,32 +306,47 @@ verdad y no te enterarías hasta que ya fuera tarde. Por ahora, usa el
 SL manualmente en Bitunix (o dime y lo investigamos a fondo para
 automatizarlo con la certeza que amerita).
 
-**Tampoco** este cambio hace que `/backtest` simule una operación
-completa con salida por stop — eso sigue pendiente (ver "Próximos pasos"
-más abajo); por ahora el stop solo se usa para calcular el riesgo y el
-R-múltiplo de cada señal, no para cortar la operación si el precio lo
-toca antes del horizonte.
+El stop ya se usa en `/backtest` para cortar la operación (ver la sección
+siguiente). El nivel de objetivo por ratio se calcula con
+`take_profit_level()` en `strategy.py`, pensada para reutilizarla cuando se
+conecten las órdenes reales a Bitunix.
 
 ## Backtest (`/backtest`)
 
 `/backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE]` — por ejemplo
 `/backtest BTCUSDT 4h 500 5` — recorre el histórico vela a vela aplicando
 `detect_signal()` en cada paso (solo con lo que "se sabría" hasta ese
-momento) y te devuelve un resumen: total de señales, tasa de acierto y
-cambio medio, separado por LONG/SHORT, más el detalle de las últimas
-señales encontradas.
+momento) y **simula cada operación completa**: entrada al cierre de la vela
+de la señal y, desde la vela siguiente, stop loss y objetivo.
 
 Valores por defecto: intervalo `4h`, 500 velas (~83 días), horizonte 5
-velas (a cuántas velas después de cada señal se mide el resultado). Tope
-de 1500 velas por consulta para que no se dispare el tiempo de respuesta.
+velas. Tope de 1500 velas por consulta para que no se dispare el tiempo de
+respuesta.
 
-**Limitación importante:** como todavía no hay reglas de salida
-definidas, esto *no* simula una operación completa con entrada y salida
-(stop/take-profit) — solo mide si el precio se movió a favor de la señal
-`horizon` velas después. Es una forma rápida de validar si la *dirección*
-de las señales suele acertar, no la rentabilidad real que habría tenido
-una operación. Cuando definamos las salidas, se puede reemplazar por una
-simulación más realista.
+### Cómo se simula cada operación
+
+- **Stop loss:** si el precio toca el stop (mínimo local en LONG, máximo
+  local en SHORT), la operación se corta ahí y la pérdida es exactamente la
+  distancia entrada → stop (**-1R**).
+- **Dos escenarios de objetivo**, simulados por separado sobre las mismas
+  señales, para ver cuál da mejor resultado:
+  - **0.5:1** → objetivo a 0.5 veces la distancia entrada → stop (+0.5R).
+  - **1:1** → objetivo a 1 vez esa distancia (+1R).
+- **Qué cuenta como "llegar":** se revisan los máximos y mínimos de cada
+  vela, no solo el cierre. Si el objetivo se toca antes que el stop, la
+  operación gana el ratio completo. Si el stop va primero (o en la misma
+  vela que el objetivo), cuenta como stop.
+- **Horizonte:** es el máximo de velas que se mantiene la operación. Si
+  pasan sin tocar ni stop ni objetivo, se cierra al cierre de esa vela
+  (puede salir en positivo o negativo). Si todavía no existen esas velas y
+  no se ha tocado nada, queda como *pendiente*.
+- **Misma vela, stop y objetivo:** con velas OHLC no se puede saber cuál fue
+  primero; se asume el caso conservador (stop).
+- No incluye comisiones ni slippage.
+
+El resumen compara ambos escenarios para Total / LONG / SHORT (operaciones
+que llegan al objetivo, cortadas por stop, win rate, R total, R medio,
+cambio total en %) e indica cuál es mejor **por R medio por operación**.
 
 `get_kline_history()` en `bitunix_client.py` es quien trae el histórico:
 pagina hacia atrás en el tiempo en bloques de 200 velas (el máximo por
@@ -341,8 +357,8 @@ request de la API) hasta reunir las que se pidan.
 Después del resumen en texto, `/backtest` adjunta un archivo `.xlsx`
 (generado por `xlsx_export.py`, vía `openpyxl`) con tres hojas:
 
-- **Resumen** — metadatos de la corrida y la misma tabla Total/LONG/SHORT del mensaje de texto.
-- **Señales** — una fila por cada señal encontrada: fecha, lado, precio, %K/%D, bandas, precio N velas después, % de cambio y si fue acierto, fallo o está pendiente. Con filtros automáticos en el encabezado.
+- **Resumen** — metadatos de la corrida, un bloque de métricas por escenario (0.5:1 y 1:1) con Total/LONG/SHORT, el mejor escenario y las notas del cálculo.
+- **Señales** — una fila por cada señal: fecha, lado, precio, %K/%D, bandas, stop loss y riesgo %, y por cada escenario cinco columnas: nivel del **objetivo**, **"Llega a"** (el precio en que se cumple el ratio, o `no` si no llegó o el stop fue primero; `pendiente` si aún no hay velas para saberlo), **salida** (TP / SL / HORIZONTE / PENDIENTE), % de resultado y R. Con filtros automáticos en el encabezado.
 - **Velas** — el histórico OHLC completo que se usó para el backtest, por si quieres revisarlo o graficarlo aparte.
 
 Útil para ordenar/filtrar en Excel, graficar la curva de aciertos, o
@@ -354,11 +370,11 @@ Telegram no permite.
 - **Confirmar los campos exactos de `slPrice`/`slTriggerType` en
   `place_order`** para poder adjuntar el stop loss automáticamente al
   abrir la posición (ver sección "Stop loss" arriba).
-- **Take-profit** — todavía no hay una regla definida para la salida
-  ganadora, solo el stop loss.
-- **Backtest con salida real por stop**: simular que la operación se
-  cierra si el precio toca el `stop_loss` antes de llegar al horizonte,
-  en vez de solo medir hacia dónde se movió el precio N velas después.
+- **Elegir el objetivo definitivo** a partir de los resultados del
+  backtest (0.5:1 vs 1:1, o ajustar el ratio) y usar `take_profit_level()`
+  para calcular el take-profit de las órdenes reales a Bitunix.
+- ~~Backtest con salida real por stop~~ — hecho: el stop corta la operación
+  y se comparan los objetivos 0.5:1 y 1:1.
 - Pasar de "solo alerta" a abrir la operación automáticamente cuando hay
   señal (reutilizando `place_order`, ya soportado por `bitunix_client.py`).
 - Historial de órdenes/trades (`get_history_orders`, `get_history_trades`).

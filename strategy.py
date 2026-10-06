@@ -42,6 +42,14 @@ Stop loss (mínimo/máximo local):
 sobreventa) a propósito: la ventana en la que buscar el mínimo/máximo
 local no tiene por qué coincidir con la ventana en la que se exige que
 el estocástico haya estado en zona extrema.
+
+Objetivo por ratio (`take_profit_level`):
+
+  La distancia entrada → stop es el "1R" de la operación. Un ratio 0.5:1
+  significa un objetivo a 0.5 veces esa distancia (a favor de la
+  operación); un ratio 1:1, a 1 vez esa distancia. El backtest y, más
+  adelante, las órdenes reales a Bitunix usan esta misma función para
+  que ambos calculen exactamente el mismo nivel.
 """
 
 from __future__ import annotations
@@ -123,3 +131,15 @@ def detect_signal(
         return Signal("SHORT", k_now, d_now, close, lower, middle, upper, stop_loss)
 
     return None
+
+
+def take_profit_level(side: str, entry: float, stop_loss: float, ratio: float) -> float:
+    """
+    Precio del objetivo para un ratio beneficio:riesgo dado.
+
+    El riesgo es la distancia entre la entrada y el stop. LONG: el objetivo
+    queda por encima de la entrada; SHORT: por debajo. Ejemplo: LONG con
+    entrada 100 y stop 98 (riesgo 2) → ratio 0.5 da 101, ratio 1 da 102.
+    """
+    risk = abs(entry - stop_loss)
+    return entry + risk * ratio if side == "LONG" else entry - risk * ratio

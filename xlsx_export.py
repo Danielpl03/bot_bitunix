@@ -16,7 +16,16 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from backtest import BacktestSignal
+from backtest import (
+    OUTCOME_NA,
+    OUTCOME_PENDING,
+    OUTCOME_SL,
+    OUTCOME_TP,
+    TP_RATIOS,
+    BacktestSignal,
+    best_scenario,
+    ratio_label,
+)
 
 FONT_NAME = "Arial"
 HEADER_FILL = PatternFill(start_color="1F2937", end_color="1F2937", fill_type="solid")
@@ -25,6 +34,9 @@ TITLE_FONT = Font(name=FONT_NAME, bold=True, size=14)
 LABEL_FONT = Font(name=FONT_NAME, bold=True)
 LONG_FILL = PatternFill(start_color="DCFCE7", end_color="DCFCE7", fill_type="solid")
 SHORT_FILL = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
+SECTION_FILL = PatternFill(start_color="E5E7EB", end_color="E5E7EB", fill_type="solid")
+TP_FILL = LONG_FILL  # verde: llegó al objetivo
+SL_FILL = SHORT_FILL  # rojo: cortada por stop
 
 
 def _ms_to_dt(ms: int) -> datetime:
@@ -63,7 +75,7 @@ def _write_summary_sheet(
     meta = [
         ("Símbolo", symbol),
         ("Intervalo", interval),
-        ("Horizonte (velas)", horizon),
+        ("Horizonte máx. (velas)", horizon),
         ("Velas analizadas", n_candles),
         ("Desde", first_date.strftime("%Y-%m-%d %H:%M")),
         ("Hasta", last_date.strftime("%Y-%m-%d %H:%M")),
@@ -76,73 +88,125 @@ def _write_summary_sheet(
         row += 1
 
     row += 1
-    table_start = row
     headers = ["Métrica", "Total", "LONG", "SHORT"]
     for col, text in enumerate(headers, start=1):
-        ws.cell(row=table_start, column=col, value=text)
-    _style_header_row(ws, table_start, len(headers))
+        ws.cell(row=row, column=col, value=text)
+    _style_header_row(ws, row, len(headers))
+    row += 1
 
-    metric_rows = [
-        ("Señales totales", "total", "{:d}"),
-        ("Con resultado (ya cumplieron el horizonte)", "con_resultado", "{:d}"),
-        ("Aciertos", "aciertos", "{:d}"),
-        ("Win rate", "win_rate", "pct"),
-        ("Cambio medio", "cambio_medio_pct", "pct"),
+    groups = (("total", 2), ("long", 3), ("short", 4))
+
+    def _put(r: int, col: int, value, fmt: str) -> None:
+        cell = ws.cell(row=r, column=col)
+        if value is None:
+            cell.value = "—"
+        elif fmt == "pct":
+            cell.value = round(value, 2)
+            cell.number_format = '0.00"%"'
+        elif fmt == "pct_signed":
+            cell.value = round(value, 2)
+            cell.number_format = '+0.00"%";-0.00"%"'
+        elif fmt == "r":
+            cell.value = round(value, 2)
+            cell.number_format = '+0.00"R";-0.00"R"'
+        else:
+            cell.value = value
+
+    # Métricas generales (no dependen del ratio)
+    for label, key, fmt in (
+        ("Señales totales", "total", "int"),
         ("Riesgo medio (entrada → stop loss)", "riesgo_medio_pct", "pct"),
-        ("R-múltiplo medio (cambio ÷ riesgo)", "r_multiple_medio", "r"),
-    ]
-    for offset, (label, key, fmt) in enumerate(metric_rows, start=1):
-        r = table_start + offset
-        ws.cell(row=r, column=1, value=label).font = LABEL_FONT
-        for col, group in ((2, "total"), (3, "long"), (4, "short")):
-            value = stats[group][key]
-            cell = ws.cell(row=r, column=col)
-            if value is None:
-                cell.value = "—"
-            elif fmt == "pct":
-                cell.value = round(value, 2)
-                cell.number_format = '0.00"%"'
-            elif fmt == "r":
-                cell.value = round(value, 2)
-                cell.number_format = '+0.00"R";-0.00"R"'
-            else:
-                cell.value = value
+    ):
+        ws.cell(row=row, column=1, value=label).font = LABEL_FONT
+        for group, col in groups:
+            _put(row, col, stats[group][key], fmt)
+        row += 1
 
-    _autosize(ws, [42, 12, 12, 12])
+    # Un bloque por escenario de objetivo
+    scenario_rows = [
+        ("Operaciones resueltas (objetivo, stop u horizonte)", "resueltas", "int"),
+        ("Llegan al objetivo antes que al stop", "tp", "int"),
+        ("Cortadas por el stop (pérdida = -1R)", "sl", "int"),
+        ("Cerradas al llegar al horizonte", "horizonte", "int"),
+        ("Pendientes (aún sin resolver)", "pendientes", "int"),
+        ("Win rate (resultado > 0)", "win_rate", "pct"),
+        ("R total", "r_total", "r"),
+        ("R medio por operación", "r_medio", "r"),
+        ("Cambio total", "cambio_total_pct", "pct_signed"),
+        ("Cambio medio por operación", "cambio_medio_pct", "pct_signed"),
+    ]
+    for ratio in TP_RATIOS:
+        for col in range(1, 5):
+            ws.cell(row=row, column=col).fill = SECTION_FILL
+        ws.cell(row=row, column=1, value=f"Escenario objetivo {ratio_label(ratio)}").font = LABEL_FONT
+        row += 1
+        for label, key, fmt in scenario_rows:
+            ws.cell(row=row, column=1, value=label).font = LABEL_FONT
+            for group, col in groups:
+                _put(row, col, stats[group]["escenarios"][ratio][key], fmt)
+            row += 1
+
+    # Comparación final
+    for col in range(1, 5):
+        ws.cell(row=row, column=col).fill = SECTION_FILL
+    ws.cell(row=row, column=1, value="Mejor escenario").font = LABEL_FONT
+    row += 1
+    ws.cell(row=row, column=1, value="Por R medio por operación").font = LABEL_FONT
+    for group, col in groups:
+        best = best_scenario(stats[group])
+        ws.cell(row=row, column=col, value=ratio_label(best) if best is not None else "—")
+    row += 2
+
+    notes = [
+        "Notas del cálculo:",
+        "• Entrada al cierre de la vela de la señal; se recorren las velas siguientes con sus máximos y mínimos.",
+        "• Si el precio toca el stop, la operación se corta ahí: pérdida = distancia entrada → stop (-1R).",
+        "• Objetivo 0.5:1 = 0.5 × la distancia entrada → stop; 1:1 = 1 × esa distancia. Cada escenario se simula por separado.",
+        "• Si en una misma vela se tocan stop y objetivo, se cuenta como stop (no se puede saber el orden con velas).",
+        f"• Si pasan {horizon} velas sin tocar stop ni objetivo, se cierra al cierre de esa vela.",
+        "• No incluye comisiones ni slippage.",
+    ]
+    for i, text in enumerate(notes):
+        cell = ws.cell(row=row + i, column=1, value=text)
+        if i == 0:
+            cell.font = LABEL_FONT
+
+    _autosize(ws, [52, 12, 12, 12])
     ws.freeze_panes = "A1"
 
 
 def _write_signals_sheet(ws, results: list[BacktestSignal]) -> None:
     ws.title = "Señales"
-    headers = [
-        "Fecha (UTC)",
-        "Lado",
-        "Precio cierre",
-        "%K",
-        "%D",
-        "Banda inferior",
-        "Banda media",
-        "Banda superior",
-        "Stop loss",
-        "Riesgo %",
-        "Precio +N velas",
-        "% cambio (a favor)",
-        "R-múltiplo",
-        "Resultado",
+
+    # (encabezado, ancho, formato) — las columnas por escenario se añaden después
+    columns: list[tuple[str, int, str]] = [
+        ("Fecha (UTC)", 17, "date"),
+        ("Lado", 7, ""),
+        ("Precio cierre", 13, "price"),
+        ("%K", 9, ""),
+        ("%D", 9, ""),
+        ("Banda inferior", 13, "price"),
+        ("Banda media", 13, "price"),
+        ("Banda superior", 13, "price"),
+        ("Stop loss", 13, "price"),
+        ("Riesgo %", 10, "pct"),
     ]
-    for col, text in enumerate(headers, start=1):
+    for ratio in TP_RATIOS:
+        label = ratio_label(ratio)
+        columns += [
+            (f"Objetivo {label}", 14, "price"),
+            (f"Llega a {label}", 14, "price"),
+            (f"Salida {label}", 12, ""),
+            (f"% resultado {label}", 16, "pct_signed"),
+            (f"R {label}", 10, "r"),
+        ]
+
+    for col, (text, _, _) in enumerate(columns, start=1):
         ws.cell(row=1, column=col, value=text)
-    _style_header_row(ws, 1, len(headers))
+    _style_header_row(ws, 1, len(columns))
 
     for i, r in enumerate(results, start=2):
-        if r.pct_change is None:
-            resultado = "Pendiente"
-        elif r.pct_change > 0:
-            resultado = "Acierto"
-        else:
-            resultado = "Fallo"
-
-        values = [
+        values: list = [
             _ms_to_dt(r.time),
             r.side,
             r.close,
@@ -153,30 +217,56 @@ def _write_signals_sheet(ws, results: list[BacktestSignal]) -> None:
             r.upper,
             r.stop_loss,
             round(r.risk_pct, 2),
-            r.horizon_close,
-            round(r.pct_change, 2) if r.pct_change is not None else None,
-            round(r.r_multiple, 2) if r.r_multiple is not None else None,
-            resultado,
         ]
+        outcomes: list[str] = []
+        for ratio in TP_RATIOS:
+            sc = r.scenarios[ratio]
+            outcomes.append(sc.outcome)
+            # "Llega a": precio en que se cumple el ratio; "no" si no llegó o
+            # el stop se tocó primero; "pendiente" si aún no hay velas para saberlo.
+            if sc.reached_price is not None:
+                reached = sc.reached_price
+            elif sc.outcome == OUTCOME_PENDING:
+                reached = "pendiente"
+            elif sc.outcome == OUTCOME_NA:
+                reached = "N/D"
+            else:
+                reached = "no"
+            values += [
+                sc.target,
+                reached,
+                sc.outcome,
+                round(sc.pct_change, 2) if sc.pct_change is not None else None,
+                round(sc.r_multiple, 2) if sc.r_multiple is not None else None,
+            ]
+
         for col, value in enumerate(values, start=1):
             cell = ws.cell(row=i, column=col, value=value)
-            if col == 1:
+            fmt = columns[col - 1][2]
+            if fmt == "date":
                 cell.number_format = "yyyy-mm-dd hh:mm"
-            elif col in (3, 6, 7, 8, 9, 11):
+            elif fmt == "price" and isinstance(value, (int, float)):
                 cell.number_format = "0.0000"
-            elif col == 10 and value is not None:
+            elif fmt == "pct" and value is not None:
                 cell.number_format = '0.00"%"'
-            elif col == 12 and value is not None:
+            elif fmt == "pct_signed" and value is not None:
                 cell.number_format = '+0.00"%";-0.00"%"'
-            elif col == 13 and value is not None:
+            elif fmt == "r" and value is not None:
                 cell.number_format = '+0.00"R";-0.00"R"'
 
-        fill = LONG_FILL if r.side == "LONG" else SHORT_FILL
-        ws.cell(row=i, column=2).fill = fill
+        ws.cell(row=i, column=2).fill = LONG_FILL if r.side == "LONG" else SHORT_FILL
 
-    _autosize(ws, [17, 7, 13, 9, 9, 13, 13, 13, 13, 10, 15, 16, 11, 11])
+        # Colorear "Llega a" y "Salida" de cada escenario según cómo terminó
+        for idx, outcome in enumerate(outcomes):
+            base_col = 11 + idx * 5  # primera columna de este escenario
+            fill = TP_FILL if outcome == OUTCOME_TP else SL_FILL if outcome == OUTCOME_SL else None
+            if fill is not None:
+                ws.cell(row=i, column=base_col + 1).fill = fill
+                ws.cell(row=i, column=base_col + 2).fill = fill
+
+    _autosize(ws, [width for _, width, _ in columns])
     ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(results) + 1}"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{len(results) + 1}"
 
 
 def _write_candles_sheet(ws, klines: list[dict]) -> None:

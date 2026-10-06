@@ -38,7 +38,17 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from backtest import run_backtest, summarize
+from backtest import (
+    OUTCOME_HORIZON,
+    OUTCOME_PENDING,
+    OUTCOME_SL,
+    OUTCOME_TP,
+    TP_RATIOS,
+    best_scenario,
+    ratio_label,
+    run_backtest,
+    summarize,
+)
 from bitunix_client import DEFAULT_WATCHLIST, BitunixAPIError, BitunixClient
 from indicators import bollinger_bands, stochastic_oscillator
 from strategy import detect_signal
@@ -305,15 +315,35 @@ BACKTEST_MAX_CANDLES = 1500  # tope para que la respuesta no tarde demasiado
 def _format_backtest_stats(label: str, stats: dict) -> str:
     if stats["total"] == 0:
         return f"*{label}*: sin señales"
-    win_rate = f"{stats['win_rate']:.1f}%" if stats["win_rate"] is not None else "N/D"
-    avg = f"{stats['cambio_medio_pct']:+.2f}%" if stats["cambio_medio_pct"] is not None else "N/D"
+
     risk = f"{stats['riesgo_medio_pct']:.2f}%" if stats["riesgo_medio_pct"] is not None else "N/D"
-    r_mult = f"{stats['r_multiple_medio']:+.2f}R" if stats["r_multiple_medio"] is not None else "N/D"
-    return (
-        f"*{label}*: {stats['total']} señales ({stats['con_resultado']} con resultado)\n"
-        f"  Acierto: {win_rate}  ·  Cambio medio: {avg}\n"
-        f"  Riesgo medio (a stop): {risk}  ·  R medio: {r_mult}"
-    )
+    lines = [f"*{label}*: {stats['total']} señales  ·  riesgo medio a stop: {risk}"]
+
+    for ratio in TP_RATIOS:
+        sc = stats["escenarios"][ratio]
+        if sc["resueltas"] == 0:
+            lines.append(f"  Objetivo {ratio_label(ratio)}: sin operaciones resueltas")
+            continue
+        win_rate = f"{sc['win_rate']:.1f}%" if sc["win_rate"] is not None else "N/D"
+        lines.append(
+            f"  Objetivo {ratio_label(ratio)}: {sc['tp']} TP · {sc['sl']} SL · "
+            f"{sc['horizonte']} horizonte · acierto {win_rate}\n"
+            f"    R total {sc['r_total']:+.2f}R · R medio {sc['r_medio']:+.2f}R "
+            f"· cambio total {sc['cambio_total_pct']:+.2f}%"
+        )
+
+    best = best_scenario(stats)
+    if best is not None:
+        lines.append(f"  ➜ Mejor: {ratio_label(best)} (por R medio)")
+    return "\n".join(lines)
+
+
+_OUTCOME_ICON = {
+    OUTCOME_TP: "✅",
+    OUTCOME_SL: "❌",
+    OUTCOME_HORIZON: "➖",
+    OUTCOME_PENDING: "⏳",
+}
 
 
 async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -324,8 +354,10 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "Ejemplo: /backtest BTCUSDT 4h 500 5\n\n"
             "INTERVALO por defecto `4h` (el de la estrategia).\n"
             f"N_VELAS por defecto 500, máximo {BACKTEST_MAX_CANDLES} — cuánto histórico traer.\n"
-            "HORIZONTE por defecto 5 — a cuántas velas después de cada señal se mide "
-            "si el precio se movió a favor.",
+            "HORIZONTE por defecto 5 — máximo de velas que se mantiene cada operación; "
+            "si no toca ni el stop ni el objetivo, se cierra al cierre de esa vela.\n"
+            "Se simulan dos objetivos (0.5:1 y 1:1 respecto a la distancia al stop) y se "
+            "comparan; el stop corta la operación si el precio lo toca.",
             parse_mode="Markdown",
         )
         return
@@ -402,9 +434,12 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     for r in recent:
         date = datetime.fromtimestamp(r.time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
         side_emoji = "🟢" if r.side == "LONG" else "🔴"
-        change = f"{r.pct_change:+.2f}%" if r.pct_change is not None else "pendiente"
+        outcomes = "  ".join(
+            f"{ratio_label(ratio)} {_OUTCOME_ICON.get(r.scenarios[ratio].outcome, '·')}"
+            for ratio in TP_RATIOS
+        )
         recent_lines.append(
-            f"{side_emoji} `{date}` {r.side} @ `{r.close:.4f}` SL `{r.stop_loss:.4f}` → {change}"
+            f"{side_emoji} `{date}` {r.side} @ `{r.close:.4f}` SL `{r.stop_loss:.4f}` → {outcomes}"
         )
 
     detail_header = (
@@ -413,6 +448,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         else "_Señales:_"
     )
     detail_text = detail_header + "\n" + "\n".join(recent_lines)
+    detail_text += "\n_✅ objetivo · ❌ stop · ➖ cerrada al horizonte · ⏳ pendiente_"
 
     await update.message.reply_text(header + summary_text + "\n\n" + detail_text, parse_mode="Markdown")
 
