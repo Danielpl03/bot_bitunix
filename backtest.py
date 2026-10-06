@@ -33,8 +33,11 @@ class BacktestSignal:
     lower: float
     middle: float
     upper: float
+    stop_loss: float  # mínimo local (LONG) o máximo local (SHORT) sugerido como stop
+    risk_pct: float  # distancia entre el precio de entrada y el stop loss, en %
     horizon_close: float | None  # precio `horizon` velas después (None si aún no hay esas velas)
     pct_change: float | None  # % de cambio ajustado a la dirección (positivo = a favor de la señal)
+    r_multiple: float | None  # pct_change / risk_pct — cuántas veces el riesgo asumido se movió el precio
 
 
 def run_backtest(
@@ -84,6 +87,9 @@ def run_backtest(
             horizon_close = None
             pct_change = None
 
+        risk_pct = abs(signal.close - signal.stop_loss) / signal.close * 100
+        r_multiple = (pct_change / risk_pct) if (pct_change is not None and risk_pct > 0) else None
+
         results.append(
             BacktestSignal(
                 time=times[i],
@@ -94,8 +100,11 @@ def run_backtest(
                 lower=signal.lower,
                 middle=signal.middle,
                 upper=signal.upper,
+                stop_loss=signal.stop_loss,
+                risk_pct=risk_pct,
                 horizon_close=horizon_close,
                 pct_change=pct_change,
+                r_multiple=r_multiple,
             )
         )
 
@@ -114,12 +123,17 @@ def summarize(results: list[BacktestSignal]) -> dict:
         with_result = [s for s in signals if s.pct_change is not None]
         wins = [s for s in with_result if s.pct_change > 0]
         avg = sum(s.pct_change for s in with_result) / len(with_result) if with_result else None
+        avg_risk = sum(s.risk_pct for s in signals) / len(signals) if signals else None
+        with_r = [s for s in with_result if s.r_multiple is not None]
+        avg_r = sum(s.r_multiple for s in with_r) / len(with_r) if with_r else None
         return {
             "total": len(signals),
             "con_resultado": len(with_result),
             "aciertos": len(wins),
             "win_rate": (len(wins) / len(with_result) * 100) if with_result else None,
             "cambio_medio_pct": avg,
+            "riesgo_medio_pct": avg_risk,
+            "r_multiple_medio": avg_r,
         }
 
     return {

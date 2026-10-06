@@ -25,6 +25,23 @@ parámetros ajustables (`oversold`, `overbought`, `lookback`). Los valores
 por defecto son una aproximación razonable a "cerca de la zona" — conviene
 revisarlos contra velas pasadas donde tu estrategia sí habría entrado y
 ajustarlos si hace falta.
+
+Stop loss (mínimo/máximo local):
+
+  LONG: mientras el precio cae va marcando mínimos cada vez más bajos;
+  el stop se fija en el mínimo local de ese movimiento — el `low` más
+  bajo dentro de las últimas `sl_lookback` velas (incluida la vela de
+  la señal, por si el mínimo de todo el movimiento lo marcó justo esa
+  vela con una mecha larga). Si el precio vuelve a caer hasta ahí,
+  significa que el mínimo que motivó la entrada ya no se sostuvo.
+
+  SHORT: exactamente lo contrario, con el `high` más alto de esas
+  mismas velas.
+
+`sl_lookback` es independiente de `lookback` (el de sobrecompra/
+sobreventa) a propósito: la ventana en la que buscar el mínimo/máximo
+local no tiene por qué coincidir con la ventana en la que se exige que
+el estocástico haya estado en zona extrema.
 """
 
 from __future__ import annotations
@@ -43,6 +60,7 @@ class Signal:
     lower: float
     middle: float
     upper: float
+    stop_loss: float  # mínimo local (LONG) o máximo local (SHORT) de las últimas sl_lookback velas
 
 
 def detect_signal(
@@ -52,6 +70,7 @@ def detect_signal(
     oversold: float = 25.0,
     overbought: float = 75.0,
     lookback: int = 10,
+    sl_lookback: int = 10,
 ) -> Signal | None:
     """
     Evalúa la última vela cerrada (closes[-1] / highs[-1] / lows[-1]) y
@@ -82,13 +101,17 @@ def detect_signal(
     # Ventana de %K justo antes del cruce (sin incluir el valor del cruce).
     recent_k = k_series[-(lookback + 1) : -1]
 
+    if len(lows) < sl_lookback or len(highs) < sl_lookback:
+        return None  # no hay suficientes velas todavía para ubicar el mínimo/máximo local
+
     if (
         crossed_up
         and min(recent_k) <= oversold
         and close < middle
         and close < (lower + middle) / 2
     ):
-        return Signal("LONG", k_now, d_now, close, lower, middle, upper)
+        stop_loss = min(lows[-sl_lookback:])
+        return Signal("LONG", k_now, d_now, close, lower, middle, upper, stop_loss)
 
     if (
         crossed_down
@@ -96,6 +119,7 @@ def detect_signal(
         and close > middle
         and close > (middle + upper) / 2
     ):
-        return Signal("SHORT", k_now, d_now, close, lower, middle, upper)
+        stop_loss = max(highs[-sl_lookback:])
+        return Signal("SHORT", k_now, d_now, close, lower, middle, upper, stop_loss)
 
     return None

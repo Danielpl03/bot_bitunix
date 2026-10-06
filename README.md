@@ -268,6 +268,49 @@ Cómo usarlo:
    valores actuales (%K, %D, precio, bandas) para que puedas verificar
    que el cálculo tiene sentido mientras pruebas la estrategia.
 
+## Stop loss (mínimo/máximo local)
+
+Cada señal que da `detect_signal()` (en `strategy.py`) ahora trae un
+`stop_loss` calculado así:
+
+- **LONG**: el `low` más bajo de las últimas `sl_lookback` velas
+  (10 por defecto, incluida la vela de la señal) — el mínimo local que
+  marcó el precio en el movimiento de caída que precedió a la entrada.
+- **SHORT**: lo mismo pero con el `high` más alto (máximo local).
+
+`sl_lookback` es independiente del `lookback` que exige al estocástico
+haber estado en zona de sobrecompra/sobreventa — se pueden ajustar por
+separado.
+
+Esto aparece ahora en:
+- Las alertas de `/alerts` (`check_alerts_job` y `/alerts check`), con el
+  riesgo en % hasta ese stop.
+- El resumen y el detalle de `/backtest`, incluyendo **riesgo medio** y
+  **R-múltiplo medio** (`cambio_medio_pct ÷ riesgo_medio_pct` — cuántas
+  veces el riesgo asumido se movió el precio a favor, la forma estándar
+  de medir una estrategia que ya tiene un stop definido).
+- El Excel de `/backtest` (columnas `Stop loss`, `Riesgo %` y
+  `R-múltiplo` en la hoja "Señales").
+
+**Lo que todavía falta — y por qué lo dejé fuera por ahora:** este stop
+loss es un *nivel sugerido*, calculado localmente; no está todavía
+conectado a `place_order()` en `bitunix_client.py` para que la posición
+se abra con el stop ya puesto en Bitunix. La API sí soporta mandar un
+`slPrice` al abrir la orden, pero no logré confirmar con certeza en la
+documentación los valores exactos que esperan los campos `slTriggerType`
+/ `slOrderType` — y prefiero no adivinarlos en una función que mueve
+dinero real: si el campo está mal, el stop podría no quedar activado de
+verdad y no te enterarías hasta que ya fuera tarde. Por ahora, usa el
+`stop_loss` que te muestra la alerta como referencia para poner tú el
+SL manualmente en Bitunix (o dime y lo investigamos a fondo para
+automatizarlo con la certeza que amerita).
+
+**Tampoco** este cambio hace que `/backtest` simule una operación
+completa con salida por stop — eso sigue pendiente (ver "Próximos pasos"
+más abajo); por ahora el stop solo se usa para calcular el riesgo y el
+R-múltiplo de cada señal, no para cortar la operación si el precio lo
+toca antes del horizonte.
+
 ## Backtest (`/backtest`)
 
 `/backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE]` — por ejemplo
@@ -308,9 +351,14 @@ Telegram no permite.
 
 ## Próximos pasos sugeridos
 
-- **Condiciones de salida** (stop-loss / take-profit) para la estrategia
-  de `/alerts` — y, una vez definidas, un backtest que simule la
-  operación completa en vez de solo medir la dirección del precio.
+- **Confirmar los campos exactos de `slPrice`/`slTriggerType` en
+  `place_order`** para poder adjuntar el stop loss automáticamente al
+  abrir la posición (ver sección "Stop loss" arriba).
+- **Take-profit** — todavía no hay una regla definida para la salida
+  ganadora, solo el stop loss.
+- **Backtest con salida real por stop**: simular que la operación se
+  cierra si el precio toca el `stop_loss` antes de llegar al horizonte,
+  en vez de solo medir hacia dónde se movió el precio N velas después.
 - Pasar de "solo alerta" a abrir la operación automáticamente cuando hay
   señal (reutilizando `place_order`, ya soportado por `bitunix_client.py`).
 - Historial de órdenes/trades (`get_history_orders`, `get_history_trades`).

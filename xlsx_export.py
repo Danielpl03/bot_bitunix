@@ -88,6 +88,8 @@ def _write_summary_sheet(
         ("Aciertos", "aciertos", "{:d}"),
         ("Win rate", "win_rate", "pct"),
         ("Cambio medio", "cambio_medio_pct", "pct"),
+        ("Riesgo medio (entrada → stop loss)", "riesgo_medio_pct", "pct"),
+        ("R-múltiplo medio (cambio ÷ riesgo)", "r_multiple_medio", "r"),
     ]
     for offset, (label, key, fmt) in enumerate(metric_rows, start=1):
         r = table_start + offset
@@ -100,6 +102,9 @@ def _write_summary_sheet(
             elif fmt == "pct":
                 cell.value = round(value, 2)
                 cell.number_format = '0.00"%"'
+            elif fmt == "r":
+                cell.value = round(value, 2)
+                cell.number_format = '+0.00"R";-0.00"R"'
             else:
                 cell.value = value
 
@@ -118,8 +123,11 @@ def _write_signals_sheet(ws, results: list[BacktestSignal]) -> None:
         "Banda inferior",
         "Banda media",
         "Banda superior",
-        f"Precio +N velas",
+        "Stop loss",
+        "Riesgo %",
+        "Precio +N velas",
         "% cambio (a favor)",
+        "R-múltiplo",
         "Resultado",
     ]
     for col, text in enumerate(headers, start=1):
@@ -143,23 +151,30 @@ def _write_signals_sheet(ws, results: list[BacktestSignal]) -> None:
             r.lower,
             r.middle,
             r.upper,
+            r.stop_loss,
+            round(r.risk_pct, 2),
             r.horizon_close,
             round(r.pct_change, 2) if r.pct_change is not None else None,
+            round(r.r_multiple, 2) if r.r_multiple is not None else None,
             resultado,
         ]
         for col, value in enumerate(values, start=1):
             cell = ws.cell(row=i, column=col, value=value)
             if col == 1:
                 cell.number_format = "yyyy-mm-dd hh:mm"
-            elif col in (3, 6, 7, 8, 9):
+            elif col in (3, 6, 7, 8, 9, 11):
                 cell.number_format = "0.0000"
             elif col == 10 and value is not None:
+                cell.number_format = '0.00"%"'
+            elif col == 12 and value is not None:
                 cell.number_format = '+0.00"%";-0.00"%"'
+            elif col == 13 and value is not None:
+                cell.number_format = '+0.00"R";-0.00"R"'
 
         fill = LONG_FILL if r.side == "LONG" else SHORT_FILL
         ws.cell(row=i, column=2).fill = fill
 
-    _autosize(ws, [17, 7, 13, 9, 9, 13, 13, 13, 15, 16, 11])
+    _autosize(ws, [17, 7, 13, 9, 9, 13, 13, 13, 13, 10, 15, 16, 11, 11])
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(results) + 1}"
 

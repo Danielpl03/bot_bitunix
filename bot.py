@@ -307,9 +307,12 @@ def _format_backtest_stats(label: str, stats: dict) -> str:
         return f"*{label}*: sin señales"
     win_rate = f"{stats['win_rate']:.1f}%" if stats["win_rate"] is not None else "N/D"
     avg = f"{stats['cambio_medio_pct']:+.2f}%" if stats["cambio_medio_pct"] is not None else "N/D"
+    risk = f"{stats['riesgo_medio_pct']:.2f}%" if stats["riesgo_medio_pct"] is not None else "N/D"
+    r_mult = f"{stats['r_multiple_medio']:+.2f}R" if stats["r_multiple_medio"] is not None else "N/D"
     return (
         f"*{label}*: {stats['total']} señales ({stats['con_resultado']} con resultado)\n"
-        f"  Acierto: {win_rate}  ·  Cambio medio: {avg}"
+        f"  Acierto: {win_rate}  ·  Cambio medio: {avg}\n"
+        f"  Riesgo medio (a stop): {risk}  ·  R medio: {r_mult}"
     )
 
 
@@ -400,7 +403,9 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         date = datetime.fromtimestamp(r.time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
         side_emoji = "🟢" if r.side == "LONG" else "🔴"
         change = f"{r.pct_change:+.2f}%" if r.pct_change is not None else "pendiente"
-        recent_lines.append(f"{side_emoji} `{date}` {r.side} @ `{r.close:.4f}` → {change}")
+        recent_lines.append(
+            f"{side_emoji} `{date}` {r.side} @ `{r.close:.4f}` SL `{r.stop_loss:.4f}` → {change}"
+        )
 
     detail_header = (
         f"_Últimas {len(recent)} de {len(results)} señales:_"
@@ -522,13 +527,16 @@ async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def _format_signal_message(symbol: str, signal) -> str:
     side_label = "🟢 LONG" if signal.side == "LONG" else "🔴 SHORT"
+    risk_pct = abs(signal.close - signal.stop_loss) / signal.close * 100
+    sl_label = "mínimo local" if signal.side == "LONG" else "máximo local"
     return (
         f"🔔 *Señal de entrada — {symbol}* ({side_label})\n\n"
         f"Vela de 4h recién cerrada.\n"
         f"Estocástico: %K `{signal.k:.2f}`  %D `{signal.d:.2f}`\n"
         f"Bandas de Bollinger: inf `{signal.lower:.4f}`  media `{signal.middle:.4f}`  "
         f"sup `{signal.upper:.4f}`\n"
-        f"Precio de cierre: `{signal.close:.4f}`"
+        f"Precio de cierre: `{signal.close:.4f}`\n"
+        f"Stop loss sugerido ({sl_label}): `{signal.stop_loss:.4f}` (riesgo {risk_pct:.2f}%)"
     )
 
 
