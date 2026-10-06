@@ -171,6 +171,11 @@ class BitunixClient:
             raise BitunixAPIError(f"Bitunix API error: {payload.get('msg')}")
 
         data = payload.get("data", [])
+        for candle in data:
+            # Bitunix devuelve 'time' como string; lo normalizamos a int para
+            # poder ordenar y hacer aritmética con él (paginación en get_kline_history).
+            if candle.get("time") is not None:
+                candle["time"] = int(candle["time"])
         return sorted(data, key=lambda k: k.get("time", 0))
 
     def get_kline_history(
@@ -284,3 +289,4 @@ class BitunixClient:
     def flash_close_position(self, position_id: str) -> dict:
         """Cierra una posición inmediatamente a precio de mercado."""
         return self._private_post(FLASH_CLOSE_ENDPOINT, {"positionId": position_id})
+        
