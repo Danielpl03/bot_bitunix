@@ -3,7 +3,7 @@
 Bot que consulta precios y gestiona tu cuenta de futuros en Bitunix: saldo,
 posiciones abiertas, apertura y cierre de posiciones. Además incluye una
 estrategia de entrada basada en estocástico + Bandas de Bollinger en velas
-de 4h, con alertas automáticas y backtest sobre histórico.
+de 4h y de 1h, con alertas automáticas y backtest sobre histórico.
 
 ## Estructura del proyecto
 
@@ -44,7 +44,7 @@ o testear por separado de todo lo demás.
 | `/watchlist remove SIMBOLO` | Quitar un símbolo de la watchlist |
 | `/watchlist reset` | Volver a la watchlist por defecto (BTC, ETH, SOL, BNB, XRP) |
 | `/indicators SIMBOLO [INTERVALO]` | Estocástico (14,3,3) y Bandas de Bollinger (20, 2σ). Intervalo por defecto `1h` |
-| `/alerts` | Ver las monedas vigiladas por la estrategia de 4h |
+| `/alerts` | Monedas vigiladas por la estrategia (4h y 1h); `/alerts check` muestra el estado de cada condición |
 | `/alerts add SIMBOLO` | Vigilar un símbolo (recibirás alerta cuando dé señal) |
 | `/alerts remove SIMBOLO` | Dejar de vigilar un símbolo |
 | `/alerts reset` | Vaciar la lista de vigilancia |
@@ -186,7 +186,7 @@ Los Web Services gratis de Render se suspenden tras ~15 min sin
 recibir ninguna petición HTTP, y tardan uno o dos minutos en
 despertar cuando llega la siguiente. Para un bot esto significa que
 el primer mensaje después de un rato de inactividad puede tardar en
-responder — y que el job de `/alerts` (cada 4h) **no se ejecutará si
+responder — y que el job de `/alerts` (cada 4h y cada 1h) **no se ejecutará si
 la instancia está dormida en ese momento**, así que te puedes perder
 una revisión.
 
@@ -198,8 +198,8 @@ que se duerma. La raíz `/` responde `200 OK` (GET y HEAD) gracias a
 `_enable_health_check()` en `bot.py`; sin eso, `python-telegram-bot` solo
 atiende `/webhook` y devolvería 404, que UptimeRobot interpreta como caído. Esto
 es especialmente importante ahora que usas `/alerts`, para que el bot
-esté despierto en los cierres de vela de 4h (00:00, 04:00, 08:00,
-12:00, 16:00, 20:00 UTC).
+esté despierto en los cierres de vela (cada hora para 1h; 00:00, 04:00,
+08:00, 12:00, 16:00, 20:00 UTC para 4h).
 
 Si el "sleep" se vuelve un problema serio, la alternativa es pasar a
 un plan pago de Render o a una VM propia.
@@ -232,10 +232,10 @@ todo el cálculo vive en `indicators.py`:
 `/indicators BTCUSDT 15m` usa velas de 15 minutos. Intervalos válidos:
 `1m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d 3d 1w 1M`.
 
-## Estrategia de 4h y alertas (`/alerts`)
+## Estrategia (4h y 1h) y alertas (`/alerts`)
 
-`strategy.py` implementa la estrategia de entrada en velas de 4h
-(estocástico + Bollinger). Reglas, evaluadas al cierre de cada vela:
+`strategy.py` implementa la estrategia de entrada (estocástico + Bollinger),
+que se evalúa tanto en velas de 4h como de 1h con los mismos parámetros. Reglas, evaluadas al cierre de cada vela:
 
 - **LONG**: la línea rápida del estocástico (%K) cruza hacia arriba a la
   lenta (%D), y en las velas recientes anteriores al cruce %K estuvo en
@@ -272,15 +272,26 @@ Cómo usarlo:
 1. `/alerts add BTCUSDT` — añade símbolos a vigilar (se guardan en
    `alerts_watchlist.json`, lista separada de la watchlist de `/price`).
 2. El bot revisa automáticamente cada símbolo vigilado al cierre de
-   cada vela de 4h (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC) y te
-   manda un mensaje a tu `TELEGRAM_ALLOWED_USER_ID` si hay señal. Esto
-   requiere el extra `job-queue` instalado (ver sección 2) y
-   `TELEGRAM_ALLOWED_USER_ID` configurado — sin esto el job no puede
-   avisarte a nadie.
-3. `/alerts check [SIMBOLO]` — evalúa la estrategia *ahora mismo*, sin
-   esperar al cierre real de la vela. Si no hay señal, te muestra los
-   valores actuales (%K, %D, precio, bandas) para que puedas verificar
-   que el cálculo tiene sentido mientras pruebas la estrategia.
+   **cada vela de 1h** (cada hora en punto, UTC) y **cada vela de 4h**
+   (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC). Requiere el extra
+   `job-queue` instalado (ver sección 2) y `TELEGRAM_ALLOWED_USER_ID`
+   configurado — sin esto el job no puede avisarte a nadie. En cada
+   revisión recibes:
+   - Si hay señal: el mensaje de alerta de siempre (indicando el plazo).
+   - **Siempre:** un resumen del plazo con una entrada por moneda: el lado
+     (LONG/SHORT) que más condiciones cumple, cada condición con ✅/❌ y
+     sus valores concretos, y una línea para el otro lado. Si el resumen
+     no cabe en un mensaje de Telegram, se divide en varios.
+3. `/alerts check [SIMBOLO] [4h|1h]` — el mismo resumen *ahora mismo*, sin
+   esperar al cierre real de la vela. Sin argumentos muestra todas las
+   monedas en ambos plazos.
+
+Las 5 condiciones por lado (todas deben cumplirse para que haya señal):
+cruce de %K/%D, sobreventa/sobrecompra reciente, cierre cerca de la banda
+inferior/superior, vela a favor y TP 0.5:1 antes de la banda media. El
+resumen se calcula con `evaluate_conditions()` (`strategy.py`), la misma
+función que usa `detect_signal()`, así que el resumen y la señal nunca
+discrepan.
 
 ## Stop loss (mínimo/máximo local)
 
