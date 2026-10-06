@@ -316,7 +316,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Uso: /backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE]\n"
+            "Uso: /backtest SIMBOLO (INTERVALO) (N_VELAS) (HORIZONTE)\n"
             "Ejemplo: /backtest BTCUSDT 4h 500 5\n\n"
             "INTERVALO por defecto `4h` (el de la estrategia).\n"
             f"N_VELAS por defecto 500, máximo {BACKTEST_MAX_CANDLES} — cuánto histórico traer.\n"
@@ -846,6 +846,24 @@ async def handle_close_confirmation(update: Update, context: ContextTypes.DEFAUL
     await query.edit_message_text(f"✅ Posición `{position_id}` cerrada correctamente.", parse_mode="Markdown")
 
 
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handler global: registra cualquier excepción no capturada y, si puede
+    identificar el chat de origen, le avisa al usuario en vez de dejarlo
+    sin respuesta (como pasó con el error de Markdown en /backtest).
+    """
+    logger.exception("Excepción no manejada", exc_info=context.error)
+
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Ocurrió un error inesperado procesando tu comando. Ya quedó registrado en los logs.",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("No se pudo notificar el error al chat de origen")
+
+
 async def _post_init(application: Application) -> None:
     """Registra los comandos en Telegram (botón 'Menú' / lista al escribir '/')."""
     await application.bot.set_my_commands(BOT_COMMANDS)
@@ -881,6 +899,7 @@ def main() -> None:
     application.add_handler(CommandHandler("close", close_position))
     application.add_handler(CallbackQueryHandler(handle_open_confirmation, pattern="^(confirm|cancel)_open$"))
     application.add_handler(CallbackQueryHandler(handle_close_confirmation, pattern="^(confirm|cancel)_close$"))
+    application.add_error_handler(_error_handler)
 
     if application.job_queue is not None:
         first_run = _next_4h_boundary_utc()
