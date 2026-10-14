@@ -16,6 +16,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from risk_management import RiskConfig, calculate_position, scenario_pnl_usdt
+
 from backtest import (
     OUTCOME_NA,
     OUTCOME_PENDING,
@@ -297,6 +299,46 @@ def _write_candles_sheet(ws, klines: list[dict]) -> None:
     ws.freeze_panes = "A2"
 
 
+
+def _write_risk_sheet(ws, results, config: RiskConfig, ratios) -> None:
+    ws.title = "Gestión riesgo"
+    ws["A1"] = "Dimensionamiento de posiciones — estimación"
+    ws["A1"].font = TITLE_FONT
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=14)
+    ws["A2"] = "Modalidad"; ws["B2"] = config.label
+    ws["A3"] = "Margen"; ws["B3"] = "Aislado"
+    ws["A4"] = "Buffer liquidación"; ws["B4"] = config.safety_buffer_percent / 100
+    ws["B4"].number_format = '0.00%'
+    ws["A5"] = "Aviso"; ws["B5"] = "Liquidación estimada; confirmar tier, límite de apalancamiento y mantenimiento reales de Bitunix."
+    headers = ["Fecha UTC", "Lado", "Entrada", "Stop", "Distancia stop %", "Riesgo USDT",
+               "Cantidad", "Nominal USDT", "Apalancamiento x", "Margen aislado USDT",
+               "Distancia liquidación estimada %", "Cumple buffer", "P/L USDT", "Nota"]
+    start = 7
+    for col, name in enumerate(headers, 1): ws.cell(start, col, name)
+    _style_header_row(ws, start, len(headers))
+    row = start + 1
+    for signal in results:
+        pos = calculate_position(signal.close, signal.stop_loss, config)
+        for ratio in ratios:
+            scenario = signal.scenarios[ratio]
+            vals = [_ms_to_dt(signal.time), signal.side, signal.close, signal.stop_loss,
+                    pos.stop_distance_percent, pos.risk_usdt, pos.quantity, pos.notional_usdt,
+                    pos.leverage, pos.isolated_margin_usdt, pos.estimated_liquidation_distance_percent,
+                    "Sí" if pos.feasible else "NO — descartar", scenario_pnl_usdt(scenario.r_multiple, pos), pos.note]
+            # Una fila por escenario para que los P/L estén ligados al ratio.
+            vals[1] = f"{signal.side} · TP {ratio:g}:1"
+            for col, value in enumerate(vals, 1):
+                cell = ws.cell(row, col, value)
+                if col == 1: cell.number_format = "yyyy-mm-dd hh:mm"
+                elif col in (3, 4, 7, 8, 10): cell.number_format = "0.000000"
+                elif col in (5, 11): cell.number_format = '0.00"%"'
+                elif col in (6, 13): cell.number_format = '0.00" USDT"'
+            row += 1
+    _autosize(ws, [18, 17, 14, 14, 16, 14, 16, 17, 16, 19, 24, 18, 15, 70])
+    ws.freeze_panes = f"A{start+1}"
+    ws.auto_filter.ref = f"A{start}:N{row-1}"
+
+
 def build_backtest_workbook(
     symbol: str,
     interval: str,
@@ -304,6 +346,7 @@ def build_backtest_workbook(
     klines: list[dict],
     results: list[BacktestSignal],
     stats: dict,
+    risk_config: RiskConfig | None = None,
 ) -> BytesIO:
     """
     Arma el workbook completo del backtest con 3 hojas (Resumen, Señales,
@@ -321,6 +364,8 @@ def build_backtest_workbook(
 
     candles_ws = wb.create_sheet("Velas")
     _write_candles_sheet(candles_ws, klines)
+
+    _write_risk_sheet(wb.create_sheet("Gestión riesgo"), results, risk_config or RiskConfig(), TP_RATIOS)
 
     for ws in wb.worksheets:
         for row in ws.iter_rows():

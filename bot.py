@@ -60,6 +60,8 @@ from backtest_kelner import (
     summarize as summarize_keltner,
 )
 from xlsx_export_keltner import build_keltner_workbook
+from backtest_common import parse_backtest_request, load_backtest_klines, filter_signals_to_period
+from risk_management import RiskConfig
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -75,8 +77,8 @@ BOT_COMMANDS = [
     BotCommand("watchlist", "Ver o editar la watchlist de /price"),
     BotCommand("indicators", "Estocástico y Bandas de Bollinger (/indicators BTCUSDT 1h)"),
     BotCommand("alerts", "Monedas vigiladas por la estrategia en 4h y 1h (add/remove/check)"),
-    BotCommand("backtest", "Backtest de Bollinger (/backtest BTCUSDT 4h 500)"),
-    BotCommand("backtest_keltner", "Backtest Keltner (/backtest_keltner BTCUSDT 4h 500)"),
+    BotCommand("backtest", "Backtest Bollinger por velas o fechas"),
+    BotCommand("backtest_keltner", "Backtest Keltner por velas o fechas"),
     BotCommand("balance", "Balance de tu cuenta de futuros (/balance USDT)"),
     BotCommand("positions", "Ver posiciones abiertas (/positions BTCUSDT)"),
     BotCommand("open", "Abrir posición (/open BTCUSDT BUY 0.01)"),
@@ -230,7 +232,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/watchlist - ver o editar tu watchlist (add/remove/reset)\n"
         "/indicators SIMBOLO [INTERVALO] - estocástico y Bandas de Bollinger\n"
         "/alerts - monedas vigiladas por la estrategia en 4h y 1h (add/remove/check)\n"
-        "/backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE] - backtest de la estrategia\n\n"
+        "/backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE] - backtest por cantidad de velas\n"
+        "/backtest SIMBOLO [INTERVALO] AAAA-MM-DD AAAA-MM-DD [HORIZONTE] - backtest por fechas UTC\n\n"
         "Cuenta (requieren autorización):\n"
         "/balance [MONEDA] - balance de futuros (default USDT)\n"
         "/positions [SIMBOLO] - posiciones abiertas\n"
@@ -320,6 +323,39 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 BACKTEST_MAX_CANDLES = 1500  # tope para que la respuesta no tarde demasiado
 
 
+def _parse_risk_args(raw_args: list[str]) -> tuple[list[str], RiskConfig]:
+    """Extrae opciones de riesgo sin romper la sintaxis histórica del backtest.
+
+    Opciones: --riesgo fijo [USDT] | --riesgo porcentaje [PORCENTAJE] [CAPITAL_USDT]
+    """
+    args = list(raw_args)
+    config = RiskConfig()
+    try:
+        idx = args.index("--riesgo")
+    except ValueError:
+        return args, config
+    risk_args = args[idx + 1:]
+    args = args[:idx]
+    if not risk_args:
+        raise ValueError("Uso de riesgo: --riesgo fijo [USDT] o --riesgo porcentaje [PORCENTAJE] [CAPITAL_USDT].")
+    mode = risk_args[0].lower()
+    try:
+        if mode in ("fijo", "fixed"):
+            amount = float(risk_args[1]) if len(risk_args) > 1 else 10.0
+            if len(risk_args) > 2: raise ValueError
+            config = RiskConfig(mode="fixed", fixed_risk_usdt=amount)
+        elif mode in ("porcentaje", "percent", "porcentual"):
+            pct = float(risk_args[1]) if len(risk_args) > 1 else 1.0
+            capital = float(risk_args[2]) if len(risk_args) > 2 else 1000.0
+            if len(risk_args) > 3: raise ValueError
+            config = RiskConfig(mode="percent", risk_percent=pct, initial_capital_usdt=capital)
+        else:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("Opciones de riesgo inválidas. Usa --riesgo fijo 10 o --riesgo porcentaje 1 1000.") from exc
+    return args, config
+
+
 def _format_backtest_stats(label: str, stats: dict) -> str:
     if stats["total"] == 0:
         return f"*{label}*: sin señales"
@@ -360,25 +396,31 @@ _OUTCOME_ICON = {
 
 
 async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = context.args
+    try:
+        args, risk_config = _parse_risk_args(context.args)
+    except ValueError as exc:
+        await update.message.reply_text(f"⚠️ {exc}")
+        return
     if not args:
         await update.message.reply_text(
-            "Uso: /backtest SIMBOLO (INTERVALO) (N_VELAS) (HORIZONTE)\n"
-            "Ejemplo: /backtest BTCUSDT 4h 500 (o con límite: /backtest BTCUSDT 4h 500 5)\n\n"
-            "INTERVALO por defecto `4h` (el de la estrategia).\n"
-            f"N_VELAS por defecto 500, máximo {BACKTEST_MAX_CANDLES} — cuánto histórico traer.\n"
-            "HORIZONTE es opcional — máximo de velas que se mantiene cada operación; "
-            "si no lo pones, la operación dura hasta tocar el objetivo o el stop. "
-            "Con horizonte, si no toca ninguno, se cierra al cierre de esa vela.\n"
-            "Se simulan dos objetivos (0.5:1 y 1:1 respecto a la distancia al stop) y se "
-            "comparan; el stop corta la operación si el precio lo toca.",
+            "Uso por cantidad: /backtest BTCUSDT 4h 500 [HORIZONTE]\n"
+            "Uso por período: /backtest BTCUSDT 4h 2025-01-01 2025-06-30 [HORIZONTE]\n\n"
+            f"Las fechas son UTC e incluyen ambos días. Máximo histórico por cantidad: {BACKTEST_MAX_CANDLES} velas.\n"
+            "En modo fechas se descargan velas previas para calentar indicadores y posteriores para evaluar las últimas operaciones; "
+            "solo se cuentan señales cuya entrada esté dentro del período.\n"
+            "HORIZONTE es opcional: máximo de velas por operación.\n"
+            "Riesgo opcional: --riesgo fijo 10 | --riesgo porcentaje 1 1000.\n"
+            "Por defecto: 10 USDT por operación; margen aislado y buffer estimado del 25% más allá del stop.",
             parse_mode="Markdown",
         )
         return
 
-    symbol = _normalize_symbol(args[0])
-    interval = args[1] if len(args) > 1 else "4h"
-
+    try:
+        request = parse_backtest_request(args, normalize_symbol=_normalize_symbol, default_interval="4h", max_candles=BACKTEST_MAX_CANDLES)
+    except ValueError as exc:
+        await update.message.reply_text(f"⚠️ {exc}")
+        return
+    symbol, interval, horizon = request.symbol, request.interval, request.horizon
     if interval not in VALID_INTERVALS:
         await update.message.reply_text(
             f"Intervalo `{interval}` no válido. Usa uno de: {' '.join(sorted(VALID_INTERVALS, key=len))}",
@@ -386,33 +428,24 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    try:
-        n_velas = int(args[2]) if len(args) > 2 else 500
-        horizon = int(args[3]) if len(args) > 3 else None
-    except ValueError:
-        await update.message.reply_text("N_VELAS y HORIZONTE deben ser números enteros.")
-        return
-
-    n_velas = max(50, min(n_velas, BACKTEST_MAX_CANDLES))
-    if horizon is not None:
-        horizon = max(1, horizon)
-
+    period_text = (
+        f"período {datetime.fromtimestamp(request.start_ms / 1000, tz=timezone.utc):%Y-%m-%d} → "
+        f"{datetime.fromtimestamp(request.end_ms / 1000, tz=timezone.utc):%Y-%m-%d} UTC"
+        if request.is_date_range else f"hasta {request.candle_count} velas recientes"
+    )
     await update.message.reply_text(
-        f"Descargando histórico de `{symbol}` ({interval}, hasta {n_velas} velas) y corriendo el backtest…",
+        f"Descargando histórico de `{symbol}` ({interval}, {period_text}) y corriendo el backtest…",
         parse_mode="Markdown",
     )
-
     try:
-        klines = bitunix.get_kline_history(symbol, interval=interval, total=n_velas)
+        klines, signal_start, signal_end = load_backtest_klines(bitunix, request)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Error consultando histórico de Bitunix")
         await update.message.reply_text(f"⚠️ Error consultando histórico de Bitunix: {exc}")
         return
-
     if len(klines) < 40:
         await update.message.reply_text(
-            f"Solo hay {len(klines)} velas de histórico para `{symbol}` en `{interval}` — "
-            "no es suficiente para un backtest útil.",
+            f"Solo hay {len(klines)} velas de histórico para `{symbol}` en `{interval}` — no es suficiente.",
             parse_mode="Markdown",
         )
         return
@@ -422,116 +455,91 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     lows = [float(k["low"]) for k in klines]
     opens = [float(k["open"]) for k in klines]
     times = [k["time"] for k in klines]
-
     results = run_backtest(closes, highs, lows, opens, times, horizon=horizon)
+    results = filter_signals_to_period(results, signal_start, signal_end)
     stats = summarize(results)
 
     first_date = datetime.fromtimestamp(times[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
     last_date = datetime.fromtimestamp(times[-1] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    requested = (
+        f"período de señales {datetime.fromtimestamp(signal_start / 1000, tz=timezone.utc):%Y-%m-%d} → "
+        f"{datetime.fromtimestamp(signal_end / 1000, tz=timezone.utc):%Y-%m-%d} UTC"
+        if signal_start is not None else f"{len(klines)} velas ({first_date} → {last_date})"
+    )
     header = (
-        f"*Backtest {symbol} — {interval}*\n"
-        f"{len(klines)} velas ({first_date} → {last_date}), "
+        f"*Backtest Bollinger {symbol} — {interval}*\n"
+        f"Gestión de riesgo: {risk_config.label}; margen aislado.\n"
+        f"{requested}; velas cargadas {len(klines)} ({first_date} → {last_date}), "
         + (f"horizonte {horizon} velas" if horizon is not None else "sin límite de velas por operación")
         + "\n\n"
     )
-
     if not results:
-        await update.message.reply_text(
-            header + "No se dio ninguna señal en ese período con los parámetros actuales.",
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text(header + "No se dio ninguna señal en ese período con los parámetros actuales.", parse_mode="Markdown")
         return
-
     summary_text = "\n\n".join(
         _format_backtest_stats(label, stats[key])
         for label, key in (("Total", "total"), ("LONG", "long"), ("SHORT", "short"))
     )
-
     recent = results[-8:]
     recent_lines = []
     for r in recent:
         date = datetime.fromtimestamp(r.time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
         side_emoji = "🟢" if r.side == "LONG" else "🔴"
-        outcomes = "  ".join(
-            f"{ratio_label(ratio)} {_OUTCOME_ICON.get(r.scenarios[ratio].outcome, '·')}"
-            for ratio in TP_RATIOS
-        )
-        recent_lines.append(
-            f"{side_emoji} `{date}` {r.side} @ `{r.close:.4f}` SL `{r.stop_loss:.4f}` → {outcomes}"
-        )
-
-    detail_header = (
-        f"_Últimas {len(recent)} de {len(results)} señales:_"
-        if len(results) > len(recent)
-        else "_Señales:_"
-    )
-    detail_text = detail_header + "\n" + "\n".join(recent_lines)
-    detail_text += "\n_✅ objetivo · ❌ stop · ➖ cerrada al horizonte · ⏳ aún abierta_"
-
+        outcomes = "  ".join(f"{ratio_label(ratio)} {_OUTCOME_ICON.get(r.scenarios[ratio].outcome, '·')}" for ratio in TP_RATIOS)
+        recent_lines.append(f"{side_emoji} `{date}` {r.side} @ `{r.close:.4f}` SL `{r.stop_loss:.4f}` → {outcomes}")
+    detail_header = f"_Últimas {len(recent)} de {len(results)} señales:_" if len(results) > len(recent) else "_Señales:_"
+    detail_text = detail_header + "\n" + "\n".join(recent_lines) + "\n_✅ objetivo · ❌ stop · ➖ cerrada al horizonte · ⏳ aún abierta_"
     await update.message.reply_text(header + summary_text + "\n\n" + detail_text, parse_mode="Markdown")
-
     try:
-        workbook_buffer = build_backtest_workbook(symbol, interval, horizon, klines, results, stats)
+        workbook_buffer = build_backtest_workbook(symbol, interval, horizon, klines, results, stats, risk_config)
     except Exception:  # noqa: BLE001
         logger.exception("Error generando el Excel del backtest")
-        await update.message.reply_text(
-            "⚠️ El resumen de arriba sí se calculó bien, pero no pude generar el Excel con el detalle."
-        )
+        await update.message.reply_text("⚠️ El resumen se calculó bien, pero no pude generar el Excel.")
         return
-
     filename = f"backtest_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
-    await update.message.reply_document(
-        document=workbook_buffer,
-        filename=filename,
-        caption=f"📊 Detalle completo: {len(results)} señales y {len(klines)} velas de {symbol} ({interval}).",
-    )
+    await update.message.reply_document(document=workbook_buffer, filename=filename, caption=f"📊 Detalle: {len(results)} señales y {len(klines)} velas cargadas de {symbol} ({interval}).")
 
 
 async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ejecuta el backtest Keltner y envía resumen más Excel descargable."""
-    args = context.args
+    """Ejecuta Keltner usando la misma capa genérica de selección de período."""
+    try:
+        args, risk_config = _parse_risk_args(context.args)
+    except ValueError as exc:
+        await update.message.reply_text(f"⚠️ {exc}")
+        return
     if not args:
         await update.message.reply_text(
-            "Uso: /backtest_keltner SIMBOLO (INTERVALO) (N_VELAS) (HORIZONTE)\n"
-            "Ejemplo: /backtest_keltner BTCUSDT 4h 500 (o con límite: /backtest_keltner BTCUSDT 4h 500 5)\n\n"
-            f"INTERVALO por defecto 4h. N_VELAS por defecto 500, máximo {BACKTEST_MAX_CANDLES}.\n"
-            "HORIZONTE es opcional. Se comparan objetivos 1:1, 1.5:1 y 2:1; "
-            "el Excel incluye resumen, señales, velas y curva de ratios."
+            "Uso por cantidad: /backtest_keltner BTCUSDT 4h 500 [HORIZONTE]\n"
+            "Uso por período: /backtest_keltner BTCUSDT 4h 2025-01-01 2025-06-30 [HORIZONTE]\n\n"
+            "Las fechas son UTC e incluyen ambos días. Se cargan velas previas/posteriores para evitar truncar indicadores y operaciones.\n"
+            "El Excel incluye resumen, señales, velas, curva de ratios y gestión de riesgo.\n"
+            "Riesgo opcional: --riesgo fijo 10 | --riesgo porcentaje 1 1000. Por defecto: 10 USDT.",
         )
         return
-
-    symbol = _normalize_symbol(args[0])
-    interval = args[1] if len(args) > 1 else "4h"
+    try:
+        request = parse_backtest_request(args, normalize_symbol=_normalize_symbol, default_interval="4h", max_candles=BACKTEST_MAX_CANDLES)
+    except ValueError as exc:
+        await update.message.reply_text(f"⚠️ {exc}")
+        return
+    symbol, interval, horizon = request.symbol, request.interval, request.horizon
     if interval not in VALID_INTERVALS:
-        await update.message.reply_text(
-            f"Intervalo {interval} no válido. Usa uno de: {' '.join(sorted(VALID_INTERVALS, key=len))}"
-        )
+        await update.message.reply_text(f"Intervalo {interval} no válido. Usa uno de: {' '.join(sorted(VALID_INTERVALS, key=len))}")
         return
-    try:
-        n_velas = int(args[2]) if len(args) > 2 else 500
-        horizon = int(args[3]) if len(args) > 3 else None
-    except ValueError:
-        await update.message.reply_text("N_VELAS y HORIZONTE deben ser números enteros.")
-        return
-    n_velas = max(50, min(n_velas, BACKTEST_MAX_CANDLES))
-    if horizon is not None:
-        horizon = max(1, horizon)
-
-    await update.message.reply_text(
-        f"Descargando histórico de {symbol} ({interval}, hasta {n_velas} velas) y ejecutando Keltner…"
+    period_text = (
+        f"período {datetime.fromtimestamp(request.start_ms / 1000, tz=timezone.utc):%Y-%m-%d} → "
+        f"{datetime.fromtimestamp(request.end_ms / 1000, tz=timezone.utc):%Y-%m-%d} UTC"
+        if request.is_date_range else f"hasta {request.candle_count} velas recientes"
     )
+    await update.message.reply_text(f"Descargando histórico de {symbol} ({interval}, {period_text}) y ejecutando Keltner…")
     try:
-        klines = bitunix.get_kline_history(symbol, interval=interval, total=n_velas)
+        klines, signal_start, signal_end = load_backtest_klines(bitunix, request)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Error consultando histórico para backtest Keltner")
         await update.message.reply_text(f"⚠️ Error consultando histórico de Bitunix: {exc}")
         return
     if len(klines) < 40:
-        await update.message.reply_text(
-            f"Solo hay {len(klines)} velas para {symbol} en {interval}; no es suficiente para el backtest."
-        )
+        await update.message.reply_text(f"Solo hay {len(klines)} velas para {symbol} en {interval}; no es suficiente para el backtest.")
         return
-
     closes = [float(k["close"]) for k in klines]
     highs = [float(k["high"]) for k in klines]
     lows = [float(k["low"]) for k in klines]
@@ -539,19 +547,23 @@ async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT
     times = [int(k["time"]) for k in klines]
     try:
         results = run_keltner_backtest(closes, highs, lows, opens, times, horizon=horizon)
+        results = filter_signals_to_period(results, signal_start, signal_end)
         stats = summarize_keltner(results)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Error ejecutando backtest Keltner")
         await update.message.reply_text(f"⚠️ Error calculando el backtest Keltner: {exc}")
         return
-
     first_date = datetime.fromtimestamp(times[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
     last_date = datetime.fromtimestamp(times[-1] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-    header = (
-        f"*Backtest Keltner {symbol} — {interval}*\\n"
-        f"{len(klines)} velas ({first_date} → {last_date}), "
-        + (f"horizonte {horizon} velas" if horizon is not None else "sin límite por operación")
+    requested = (
+        f"señales entre {datetime.fromtimestamp(signal_start / 1000, tz=timezone.utc):%Y-%m-%d} → "
+        f"{datetime.fromtimestamp(signal_end / 1000, tz=timezone.utc):%Y-%m-%d} UTC"
+        if signal_start is not None else f"{len(klines)} velas ({first_date} → {last_date})"
     )
+    header = f"*Backtest Keltner {symbol} — {interval}*\nGestión de riesgo: {risk_config.label}; margen aislado.\n{requested}; velas cargadas {len(klines)} ({first_date} → {last_date}), " + (f"horizonte {horizon} velas" if horizon is not None else "sin límite por operación")
+    if not results:
+        await update.message.reply_text(header + "\nNo hubo señales dentro del período con los parámetros actuales.", parse_mode="Markdown")
+        return
     blocks = []
     for label, key in (("Total", "total"), ("LONG", "long"), ("SHORT", "short")):
         group = stats[key]
@@ -565,34 +577,22 @@ async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT
             if sc["r_medio"] is None:
                 lines.append(f"  TP {ratio_label(ratio)}: sin operaciones resueltas")
             else:
-                lines.append(
-                    f"  TP {ratio_label(ratio)}: {sc['tp']} TP · {sc['sl']} SL · "
-                    f"{sc['horizonte']} horizonte · {sc['pendientes']} pendientes · "
-                    f"acierto {wr} · R medio {sc['r_medio']:+.2f}R"
-                )
+                lines.append(f"  TP {ratio_label(ratio)}: {sc['tp']} TP · {sc['sl']} SL · {sc['horizonte']} horizonte · {sc['pendientes']} pendientes · acierto {wr} · R medio {sc['r_medio']:+.2f}R")
         best = group["mejor_ratio"]
-        lines.append(
-            f"  Ratio más rentable de la curva: {best['ratio']:g}:1 (R medio {best['r_medio']:+.2f}R)"
-            if best else "  Curva sin operaciones evaluables"
-        )
+        lines.append(f"  Ratio más rentable de la curva: {best['ratio']:g}:1 (R medio {best['r_medio']:+.2f}R)" if best else "  Curva sin operaciones evaluables")
         mr = group["max_ratio"]
         if mr["mediana"] is not None:
             lines.append(f"  Ratio máximo alcanzado: mediana {mr['mediana']:.2f}R · media {mr['medio']:.2f}R")
-        blocks.append("\\n".join(lines))
-    await update.message.reply_text(header + "\\n\\n" + "\\n\\n".join(blocks), parse_mode="Markdown")
-
+        blocks.append("\n".join(lines))
+    await update.message.reply_text(header + "\n\n" + "\n\n".join(blocks), parse_mode="Markdown")
     try:
-        workbook_buffer = build_keltner_workbook(symbol, interval, horizon, klines, results, stats)
+        workbook_buffer = build_keltner_workbook(symbol, interval, horizon, klines, results, stats, risk_config)
     except Exception:  # noqa: BLE001
         logger.exception("Error generando Excel del backtest Keltner")
         await update.message.reply_text("⚠️ El backtest terminó, pero no se pudo generar el Excel.")
         return
     filename = f"backtest_keltner_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
-    await update.message.reply_document(
-        document=workbook_buffer,
-        filename=filename,
-        caption=f"📊 Backtest Keltner: {len(results)} señales y {len(klines)} velas de {symbol} ({interval}).",
-    )
+    await update.message.reply_document(document=workbook_buffer, filename=filename, caption=f"📊 Backtest Keltner: {len(results)} señales y {len(klines)} velas cargadas de {symbol} ({interval}).")
 
 
 

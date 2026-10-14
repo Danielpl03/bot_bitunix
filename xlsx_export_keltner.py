@@ -10,6 +10,7 @@ from openpyxl.utils import get_column_letter
 
 from backtest import OUTCOME_NA, OUTCOME_PENDING, OUTCOME_SL, OUTCOME_TP, ratio_label
 from backtest_kelner import KELTNER_TP_RATIOS, KeltnerBacktestSignal
+from risk_management import RiskConfig, calculate_position, scenario_pnl_usdt
 
 FONT_NAME = "Arial"
 HEADER_FILL = PatternFill("solid", fgColor="1F2937")
@@ -181,15 +182,52 @@ def _curve(ws, stats):
     ws.auto_filter.ref = f"A1:G{row-1}"
 
 
+
+def _risk_sheet(ws, results, config: RiskConfig):
+    ws.title = "Gestión riesgo"
+    ws["A1"] = "Dimensionamiento de posiciones — estimación"
+    ws["A1"].font = TITLE_FONT
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=14)
+    ws["A2"] = "Modalidad"; ws["B2"] = config.label
+    ws["A3"] = "Margen"; ws["B3"] = "Aislado"
+    ws["A4"] = "Buffer liquidación"; ws["B4"] = config.safety_buffer_percent / 100; ws["B4"].number_format = '0.00%'
+    ws["A5"] = "Aviso"; ws["B5"] = "Estimación; confirmar tier, mantenimiento y apalancamiento máximo real de Bitunix."
+    headers = ["Fecha UTC", "Lado", "Entrada", "Stop", "Distancia stop %", "Riesgo USDT", "Cantidad",
+               "Nominal USDT", "Apalancamiento x", "Margen aislado USDT", "Distancia liquidación estimada %", "Cumple buffer", "P/L USDT", "Nota"]
+    start = 7
+    for col, name in enumerate(headers, 1): ws.cell(start, col, name)
+    _header(ws, start, len(headers))
+    row = start + 1
+    for sig in results:
+        pos = calculate_position(sig.close, sig.stop_loss, config)
+        for ratio in KELTNER_TP_RATIOS:
+            sc = sig.scenarios[ratio]
+            pnl = scenario_pnl_usdt(sc.r_multiple, pos)
+            vals = [_dt(sig.time), f"{sig.side} · TP {ratio:g}:1", sig.close, sig.stop_loss, pos.stop_distance_percent,
+                    pos.risk_usdt, pos.quantity, pos.notional_usdt, pos.leverage, pos.isolated_margin_usdt,
+                    pos.estimated_liquidation_distance_percent, "Sí" if pos.feasible else "NO — descartar", pnl, pos.note]
+            for col, value in enumerate(vals, 1):
+                c = ws.cell(row, col, value)
+                if col == 1: c.number_format = "yyyy-mm-dd hh:mm"
+                elif col in (3, 4, 7, 8, 10): c.number_format = "0.000000"
+                elif col in (5, 11): c.number_format = '0.00"%"'
+                elif col in (6, 13): c.number_format = '0.00" USDT"'
+            row += 1
+    _autosize(ws, [18, 17, 14, 14, 16, 14, 16, 17, 16, 19, 24, 18, 15, 70])
+    ws.freeze_panes = f"A{start+1}"
+    ws.auto_filter.ref = f"A{start}:N{row-1}"
+
+
 def build_keltner_workbook(symbol: str, interval: str, horizon: int | None,
                            klines: list[dict], results: list[KeltnerBacktestSignal],
-                           stats: dict) -> BytesIO:
+                           stats: dict, risk_config: RiskConfig | None = None) -> BytesIO:
     """Construye un Excel con resumen, señales, velas y curva de ratios."""
     wb = Workbook()
     _summary(wb.active, symbol, interval, horizon, klines, stats)
     _signals(wb.create_sheet("Señales"), results)
     _candles(wb.create_sheet("Velas"), klines)
     _curve(wb.create_sheet("Curva ratios"), stats)
+    _risk_sheet(wb.create_sheet("Gestión riesgo"), results, risk_config or RiskConfig())
     for ws in wb.worksheets:
         for row in ws.iter_rows():
             for cell in row:

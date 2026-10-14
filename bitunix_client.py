@@ -185,6 +185,7 @@ class BitunixClient:
         total: int = 500,
         kline_type: str = "LAST_PRICE",
         end_time: int | None = None,
+        start_time: int | None = None,
     ) -> list[dict]:
         """
         Igual que `get_kline`, pero sin el límite de 200 velas por request:
@@ -195,9 +196,11 @@ class BitunixClient:
 
         `end_time` opcional fija el punto más reciente desde el que mirar
         hacia atrás (ms, timestamp Unix); si no se da, parte de "ahora".
+        `start_time` opcional permite acotar también el inicio del histórico.
 
         Devuelve las velas ordenadas de más antigua a más reciente, sin
-        duplicados, recortadas a como mucho `total`.
+        duplicados, recortadas a como mucho `total` y dentro de los límites
+        temporales indicados.
         """
         all_candles: dict[int, dict] = {}
         cursor_end_time = end_time
@@ -230,6 +233,10 @@ class BitunixClient:
                 break  # la API devolvió menos del máximo: no queda más historial atrás
 
         candles = sorted(all_candles.values(), key=lambda c: c.get("time", 0))
+        if start_time is not None:
+            candles = [c for c in candles if c.get("time", 0) >= start_time]
+        if end_time is not None:
+            candles = [c for c in candles if c.get("time", 0) <= end_time]
         return candles[-total:] if len(candles) > total else candles
 
     # --- Endpoints privados (requieren api_key/secret_key) ---
