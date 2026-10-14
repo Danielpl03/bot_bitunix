@@ -54,6 +54,12 @@ from bitunix_client import DEFAULT_WATCHLIST, BitunixAPIError, BitunixClient
 from indicators import bollinger_bands, stochastic_oscillator
 from strategy import StrategyStatus, evaluate_conditions
 from xlsx_export import build_backtest_workbook
+from backtest_kelner import (
+    KELTNER_TP_RATIOS,
+    run_backtest as run_keltner_backtest,
+    summarize as summarize_keltner,
+)
+from xlsx_export_keltner import build_keltner_workbook
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -69,7 +75,8 @@ BOT_COMMANDS = [
     BotCommand("watchlist", "Ver o editar la watchlist de /price"),
     BotCommand("indicators", "Estocástico y Bandas de Bollinger (/indicators BTCUSDT 1h)"),
     BotCommand("alerts", "Monedas vigiladas por la estrategia en 4h y 1h (add/remove/check)"),
-    BotCommand("backtest", "Backtest de la estrategia (/backtest BTCUSDT 4h 500)"),
+    BotCommand("backtest", "Backtest de Bollinger (/backtest BTCUSDT 4h 500)"),
+    BotCommand("backtest_keltner", "Backtest Keltner (/backtest_keltner BTCUSDT 4h 500)"),
     BotCommand("balance", "Balance de tu cuenta de futuros (/balance USDT)"),
     BotCommand("positions", "Ver posiciones abiertas (/positions BTCUSDT)"),
     BotCommand("open", "Abrir posición (/open BTCUSDT BUY 0.01)"),
@@ -478,6 +485,115 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         filename=filename,
         caption=f"📊 Detalle completo: {len(results)} señales y {len(klines)} velas de {symbol} ({interval}).",
     )
+
+
+async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ejecuta el backtest Keltner y envía resumen más Excel descargable."""
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Uso: /backtest_keltner SIMBOLO (INTERVALO) (N_VELAS) (HORIZONTE)\n"
+            "Ejemplo: /backtest_keltner BTCUSDT 4h 500 (o con límite: /backtest_keltner BTCUSDT 4h 500 5)\n\n"
+            f"INTERVALO por defecto 4h. N_VELAS por defecto 500, máximo {BACKTEST_MAX_CANDLES}.\n"
+            "HORIZONTE es opcional. Se comparan objetivos 1:1, 1.5:1 y 2:1; "
+            "el Excel incluye resumen, señales, velas y curva de ratios."
+        )
+        return
+
+    symbol = _normalize_symbol(args[0])
+    interval = args[1] if len(args) > 1 else "4h"
+    if interval not in VALID_INTERVALS:
+        await update.message.reply_text(
+            f"Intervalo {interval} no válido. Usa uno de: {' '.join(sorted(VALID_INTERVALS, key=len))}"
+        )
+        return
+    try:
+        n_velas = int(args[2]) if len(args) > 2 else 500
+        horizon = int(args[3]) if len(args) > 3 else None
+    except ValueError:
+        await update.message.reply_text("N_VELAS y HORIZONTE deben ser números enteros.")
+        return
+    n_velas = max(50, min(n_velas, BACKTEST_MAX_CANDLES))
+    if horizon is not None:
+        horizon = max(1, horizon)
+
+    await update.message.reply_text(
+        f"Descargando histórico de {symbol} ({interval}, hasta {n_velas} velas) y ejecutando Keltner…"
+    )
+    try:
+        klines = bitunix.get_kline_history(symbol, interval=interval, total=n_velas)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error consultando histórico para backtest Keltner")
+        await update.message.reply_text(f"⚠️ Error consultando histórico de Bitunix: {exc}")
+        return
+    if len(klines) < 40:
+        await update.message.reply_text(
+            f"Solo hay {len(klines)} velas para {symbol} en {interval}; no es suficiente para el backtest."
+        )
+        return
+
+    closes = [float(k["close"]) for k in klines]
+    highs = [float(k["high"]) for k in klines]
+    lows = [float(k["low"]) for k in klines]
+    opens = [float(k["open"]) for k in klines]
+    times = [int(k["time"]) for k in klines]
+    try:
+        results = run_keltner_backtest(closes, highs, lows, opens, times, horizon=horizon)
+        stats = summarize_keltner(results)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error ejecutando backtest Keltner")
+        await update.message.reply_text(f"⚠️ Error calculando el backtest Keltner: {exc}")
+        return
+
+    first_date = datetime.fromtimestamp(times[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    last_date = datetime.fromtimestamp(times[-1] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    header = (
+        f"*Backtest Keltner {symbol} — {interval}*\\n"
+        f"{len(klines)} velas ({first_date} → {last_date}), "
+        + (f"horizonte {horizon} velas" if horizon is not None else "sin límite por operación")
+    )
+    blocks = []
+    for label, key in (("Total", "total"), ("LONG", "long"), ("SHORT", "short")):
+        group = stats[key]
+        if not group["total"]:
+            blocks.append(f"*{label}*: sin señales")
+            continue
+        lines = [f"*{label}*: {group['total']} señales · riesgo medio {group['riesgo_medio_pct']:.2f}%"]
+        for ratio in KELTNER_TP_RATIOS:
+            sc = group["escenarios"][ratio]
+            wr = f"{sc['win_rate']:.1f}%" if sc["win_rate"] is not None else "N/D"
+            if sc["r_medio"] is None:
+                lines.append(f"  TP {ratio_label(ratio)}: sin operaciones resueltas")
+            else:
+                lines.append(
+                    f"  TP {ratio_label(ratio)}: {sc['tp']} TP · {sc['sl']} SL · "
+                    f"{sc['horizonte']} horizonte · {sc['pendientes']} pendientes · "
+                    f"acierto {wr} · R medio {sc['r_medio']:+.2f}R"
+                )
+        best = group["mejor_ratio"]
+        lines.append(
+            f"  Ratio más rentable de la curva: {best['ratio']:g}:1 (R medio {best['r_medio']:+.2f}R)"
+            if best else "  Curva sin operaciones evaluables"
+        )
+        mr = group["max_ratio"]
+        if mr["mediana"] is not None:
+            lines.append(f"  Ratio máximo alcanzado: mediana {mr['mediana']:.2f}R · media {mr['medio']:.2f}R")
+        blocks.append("\\n".join(lines))
+    await update.message.reply_text(header + "\\n\\n" + "\\n\\n".join(blocks), parse_mode="Markdown")
+
+    try:
+        workbook_buffer = build_keltner_workbook(symbol, interval, horizon, klines, results, stats)
+    except Exception:  # noqa: BLE001
+        logger.exception("Error generando Excel del backtest Keltner")
+        await update.message.reply_text("⚠️ El backtest terminó, pero no se pudo generar el Excel.")
+        return
+    filename = f"backtest_keltner_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
+    await update.message.reply_document(
+        document=workbook_buffer,
+        filename=filename,
+        caption=f"📊 Backtest Keltner: {len(results)} señales y {len(klines)} velas de {symbol} ({interval}).",
+    )
+
 
 
 # --- Watchlist de alertas: monedas vigiladas por la estrategia (4h y 1h) ---
@@ -1072,6 +1188,7 @@ def main() -> None:
     application.add_handler(CommandHandler("indicators", indicators_command))
     application.add_handler(CommandHandler("alerts", alerts_command))
     application.add_handler(CommandHandler("backtest", backtest_command))
+    application.add_handler(CommandHandler("backtest_keltner", backtest_keltner_command))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("positions", positions))
     application.add_handler(CommandHandler("open", open_position))
