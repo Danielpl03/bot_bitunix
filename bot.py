@@ -60,7 +60,7 @@ from backtest_kelner import (
     summarize as summarize_keltner,
 )
 from xlsx_export_keltner import build_keltner_workbook
-from backtest_common import (parse_backtest_request, load_backtest_klines, filter_signals_to_period, filter_signals_by_density)
+from backtest_common import (parse_backtest_request, load_backtest_klines, filter_signals_to_period, filter_signals_by_density, filter_signals_by_opposite_band)
 from risk_management import RiskConfig
 
 logging.basicConfig(
@@ -323,19 +323,32 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 BACKTEST_MAX_CANDLES = 1500  # tope para que la respuesta no tarde demasiado
 
 
-def _parse_backtest_args(raw_args: list[str]) -> tuple[list[str], RiskConfig, int | None, int | None]:
+def _parse_backtest_args(raw_args: list[str]) -> tuple[list[str], RiskConfig, int | None, int | None, float | None]:
     """Extrae opciones de riesgo y del filtro de señales, en cualquier orden.
 
     --riesgo fijo [USDT] | --riesgo porcentaje [PORCENTAJE] [CAPITAL_USDT]
     --filtro-rango VELAS_ANTERIORES LIMITE_SEÑALES
+    --filtro-banda RATIO (distancia a banda contraria en múltiplos de R)
     """
     positional: list[str] = []
     config = RiskConfig()
     window = limit = None
+    band_ratio = None
     args = list(raw_args)
     i = 0
     while i < len(args):
         token = args[i].lower()
+        if token == "--filtro-banda":
+            if i + 1 >= len(args):
+                raise ValueError("Uso del filtro de banda: --filtro-banda 2.")
+            try:
+                band_ratio = float(args[i + 1])
+            except ValueError as exc:
+                raise ValueError("El ratio del filtro de banda debe ser numérico; ejemplo: --filtro-banda 2.") from exc
+            if band_ratio <= 0:
+                raise ValueError("El ratio del filtro de banda debe ser mayor que cero.")
+            i += 2
+            continue
         if token == "--filtro-rango":
             if i + 2 >= len(args):
                 raise ValueError("Uso del filtro: --filtro-rango VELAS_ANTERIORES LIMITE_SEÑALES.")
@@ -373,7 +386,7 @@ def _parse_backtest_args(raw_args: list[str]) -> tuple[list[str], RiskConfig, in
             continue
         positional.append(args[i])
         i += 1
-    return positional, config, window, limit
+    return positional, config, window, limit, band_ratio
 
 
 def _format_backtest_stats(label: str, stats: dict) -> str:
@@ -417,7 +430,7 @@ _OUTCOME_ICON = {
 
 async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        args, risk_config, filter_window, filter_limit = _parse_backtest_args(context.args)
+        args, risk_config, filter_window, filter_limit, band_ratio = _parse_backtest_args(context.args)
     except ValueError as exc:
         await update.message.reply_text(f"⚠️ {exc}")
         return
@@ -430,7 +443,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "solo se cuentan señales cuya entrada esté dentro del período.\n"
             "HORIZONTE es opcional: máximo de velas por operación.\n"
             "Riesgo opcional: --riesgo fijo 10 | --riesgo porcentaje 1 1000.\n"
-            "Filtro opcional: --filtro-rango 10 3 (en las 10 velas previas ya hubo 3 señales: rechaza la actual).\n"
+            "Filtros opcionales: --filtro-rango 10 3; --filtro-banda 2 (la banda contraria debe dejar espacio superior a 2R).\n"
             "Por defecto: 10 USDT por operación; margen aislado y buffer estimado del 25% más allá del stop.",
             parse_mode="Markdown",
         )
@@ -480,12 +493,15 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     times = [k["time"] for k in klines]
     results = run_backtest(closes, highs, lows, opens, times, horizon=horizon)
     raw_results = results
-    results, rejected_results = filter_signals_by_density(
+    density_accepted, rejected_results = filter_signals_by_density(
         raw_results, times, filter_window, filter_limit
     )
-    # El filtro se aplica antes de recortar el período para que las señales de
-    # calentamiento previas también cuenten al decidir las primeras entradas.
+    band_accepted, rejected_band_results = filter_signals_by_opposite_band(raw_results, band_ratio)
+    band_accepted_times = {int(item.time) for item in band_accepted}
+    results = [item for item in density_accepted if int(item.time) in band_accepted_times]
+    # Los filtros se calculan sobre todas las señales, antes de recortar el período.
     rejected_in_period = filter_signals_to_period(rejected_results, signal_start, signal_end)
+    rejected_band_in_period = filter_signals_to_period(rejected_band_results, signal_start, signal_end)
     results = filter_signals_to_period(results, signal_start, signal_end)
     stats = summarize(results)
 
@@ -509,6 +525,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if filter_window is not None else "Filtro de agrupación: desactivado.\n"
     )
     header += filter_description
+    header += (f"Filtro de banda contraria: espacio > {band_ratio:g}R; rechazadas en el período: {len(rejected_band_in_period)}.\n" if band_ratio is not None else "Filtro de banda contraria: desactivado.\n")
     if not results:
         await update.message.reply_text(header + "No quedaron señales operables en ese período con los parámetros actuales.", parse_mode="Markdown")
         return
@@ -527,19 +544,19 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     detail_text = detail_header + "\n" + "\n".join(recent_lines) + "\n_✅ objetivo · ❌ stop · ➖ cerrada al horizonte · ⏳ aún abierta_"
     await update.message.reply_text(header + summary_text + "\n\n" + detail_text, parse_mode="Markdown")
     try:
-        workbook_buffer = build_backtest_workbook(symbol, interval, horizon, klines, results, stats, risk_config, {"window": filter_window, "limit": filter_limit, "rejected": len(rejected_in_period)})
+        workbook_buffer = build_backtest_workbook(symbol, interval, horizon, klines, results, stats, risk_config, {"window": filter_window, "limit": filter_limit, "rejected": len(rejected_in_period), "band_ratio": band_ratio, "band_rejected": len(rejected_band_in_period)})
     except Exception:  # noqa: BLE001
         logger.exception("Error generando el Excel del backtest")
         await update.message.reply_text("⚠️ El resumen se calculó bien, pero no pude generar el Excel.")
         return
     filename = f"backtest_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
-    await update.message.reply_document(document=workbook_buffer, filename=filename, caption=f"📊 Detalle: {len(results)} señales operables; {len(rejected_in_period)} rechazadas por filtro; {len(klines)} velas de {symbol} ({interval}).")
+    await update.message.reply_document(document=workbook_buffer, filename=filename, caption=f"📊 Detalle: {len(results)} señales operables; rechazos por agrupación {len(rejected_in_period)}, por banda {len(rejected_band_in_period)}; {len(klines)} velas de {symbol} ({interval}).")
 
 
 async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ejecuta Keltner usando la misma capa genérica de selección de período."""
     try:
-        args, risk_config, filter_window, filter_limit = _parse_backtest_args(context.args)
+        args, risk_config, filter_window, filter_limit, band_ratio = _parse_backtest_args(context.args)
     except ValueError as exc:
         await update.message.reply_text(f"⚠️ {exc}")
         return
@@ -550,7 +567,7 @@ async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT
             "Las fechas son UTC e incluyen ambos días. Se cargan velas previas/posteriores para evitar truncar indicadores y operaciones.\n"
             "El Excel incluye resumen, señales, velas, curva de ratios y gestión de riesgo.\n"
             "Riesgo opcional: --riesgo fijo 10 | --riesgo porcentaje 1 1000.\n"
-            "Filtro opcional: --filtro-rango 10 3 (X velas anteriores, límite de señales). Por defecto está desactivado.",
+            "Filtros opcionales: --filtro-rango 10 3; --filtro-banda 2 (la banda contraria debe dejar espacio superior a 2R). Por defecto están desactivados.",
         )
         return
     try:
@@ -587,10 +604,14 @@ async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT
     try:
         results = run_keltner_backtest(closes, highs, lows, opens, times, horizon=horizon)
         raw_results = results
-        results, rejected_results = filter_signals_by_density(
+        density_accepted, rejected_results = filter_signals_by_density(
             raw_results, times, filter_window, filter_limit
         )
+        band_accepted, rejected_band_results = filter_signals_by_opposite_band(raw_results, band_ratio)
+        band_accepted_times = {int(item.time) for item in band_accepted}
+        results = [item for item in density_accepted if int(item.time) in band_accepted_times]
         rejected_in_period = filter_signals_to_period(rejected_results, signal_start, signal_end)
+        rejected_band_in_period = filter_signals_to_period(rejected_band_results, signal_start, signal_end)
         results = filter_signals_to_period(results, signal_start, signal_end)
         stats = summarize_keltner(results)
     except Exception as exc:  # noqa: BLE001
@@ -611,6 +632,7 @@ async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT
         if filter_window is not None else "\nFiltro de agrupación: desactivado."
     )
     header += filter_description
+    header += (f"Filtro de banda contraria: espacio > {band_ratio:g}R; rechazadas en el período: {len(rejected_band_in_period)}.\n" if band_ratio is not None else "Filtro de banda contraria: desactivado.\n")
     if not results:
         await update.message.reply_text(header + "\nNo quedaron señales operables dentro del período con los parámetros actuales.", parse_mode="Markdown")
         return
@@ -636,13 +658,13 @@ async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT
         blocks.append("\n".join(lines))
     await update.message.reply_text(header + "\n\n" + "\n\n".join(blocks), parse_mode="Markdown")
     try:
-        workbook_buffer = build_keltner_workbook(symbol, interval, horizon, klines, results, stats, risk_config, {"window": filter_window, "limit": filter_limit, "rejected": len(rejected_in_period)})
+        workbook_buffer = build_keltner_workbook(symbol, interval, horizon, klines, results, stats, risk_config, {"window": filter_window, "limit": filter_limit, "rejected": len(rejected_in_period), "band_ratio": band_ratio, "band_rejected": len(rejected_band_in_period)})
     except Exception:  # noqa: BLE001
         logger.exception("Error generando Excel del backtest Keltner")
         await update.message.reply_text("⚠️ El backtest terminó, pero no se pudo generar el Excel.")
         return
     filename = f"backtest_keltner_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
-    await update.message.reply_document(document=workbook_buffer, filename=filename, caption=f"📊 Keltner: {len(results)} señales operables; {len(rejected_in_period)} rechazadas por filtro; {len(klines)} velas de {symbol} ({interval}).")
+    await update.message.reply_document(document=workbook_buffer, filename=filename, caption=f"📊 Keltner: {len(results)} señales operables; rechazos por agrupación {len(rejected_in_period)}, por banda {len(rejected_band_in_period)}; {len(klines)} velas de {symbol} ({interval}).")
 
 
 

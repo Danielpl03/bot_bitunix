@@ -139,3 +139,35 @@ def filter_signals_by_density(results, candle_times: list[int], window_candles: 
         # Toda señal detectada cuenta, incluso si fue rechazada como operación.
         recent_indices.append(idx)
     return accepted, rejected
+
+
+def filter_signals_by_opposite_band(results, min_ratio: float | None = None):
+    """Rechaza señales sin espacio suficiente hasta la banda contraria.
+
+    LONG: upper - entrada debe ser estrictamente mayor que min_ratio * riesgo.
+    SHORT: entrada - lower debe ser estrictamente mayor que min_ratio * riesgo.
+    Devuelve (aceptadas, rechazadas). Solo usa bandas conocidas al entrar.
+    """
+    if min_ratio is None:
+        return list(results), []
+    if min_ratio <= 0:
+        raise ValueError("El ratio del filtro de banda debe ser mayor que cero.")
+
+    accepted, rejected = [], []
+    for signal in results:
+        entry = float(signal.close)
+        risk = abs(entry - float(signal.stop_loss))
+        lower = float(signal.lower)
+        upper = float(signal.upper)
+        if risk <= 0:
+            rejected.append(signal)
+            continue
+        if signal.side == "LONG":
+            room = upper - entry
+        else:
+            room = entry - lower
+        if room > min_ratio * risk:
+            accepted.append(signal)
+        else:
+            rejected.append(signal)
+    return accepted, rejected

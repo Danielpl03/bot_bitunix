@@ -346,9 +346,15 @@ def _write_signal_filter_sheet(ws, signal_filter: dict | None) -> None:
     if enabled:
         ws.append(["Ventana de velas anteriores", signal_filter["window"]])
         ws.append(["Límite de señales previas", signal_filter["limit"]])
-        ws.append(["Señales rechazadas dentro del período", signal_filter.get("rejected", 0)])
-        ws.append(["Regla", "Se rechaza la señal actual si en las X velas previas ya hubo al menos el límite; las rechazadas también cuentan para señales futuras."])
-    ws.column_dimensions["A"].width = 38
+        ws.append(["Señales rechazadas por agrupación dentro del período", signal_filter.get("rejected", 0)])
+        ws.append(["Regla de agrupación", "Se rechaza la señal actual si en las X velas previas ya hubo al menos el límite; las rechazadas también cuentan para señales futuras."])
+    band_ratio = signal_filter.get("band_ratio") if signal_filter else None
+    ws.append(["Filtro de banda contraria", "Activado" if band_ratio is not None else "Desactivado"])
+    if band_ratio is not None:
+        ws.append(["Ratio mínimo de espacio hasta banda contraria", band_ratio])
+        ws.append(["Señales rechazadas por banda dentro del período", signal_filter.get("band_rejected", 0)])
+        ws.append(["Regla de banda", "LONG: Upper - entrada > ratio × riesgo. SHORT: entrada - Lower > ratio × riesgo. La desigualdad es estricta."])
+    ws.column_dimensions["A"].width = 45
     ws.column_dimensions["B"].width = 100
     for cell in ws[1]:
         cell.font = Font(name=FONT_NAME, bold=True)
