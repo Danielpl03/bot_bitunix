@@ -60,7 +60,7 @@ from backtest_kelner import (
     summarize as summarize_keltner,
 )
 from xlsx_export_keltner import build_keltner_workbook
-from backtest_common import parse_backtest_request, load_backtest_klines, filter_signals_to_period
+from backtest_common import (parse_backtest_request, load_backtest_klines, filter_signals_to_period, filter_signals_by_density)
 from risk_management import RiskConfig
 
 logging.basicConfig(
@@ -323,37 +323,57 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 BACKTEST_MAX_CANDLES = 1500  # tope para que la respuesta no tarde demasiado
 
 
-def _parse_risk_args(raw_args: list[str]) -> tuple[list[str], RiskConfig]:
-    """Extrae opciones de riesgo sin romper la sintaxis histórica del backtest.
+def _parse_backtest_args(raw_args: list[str]) -> tuple[list[str], RiskConfig, int | None, int | None]:
+    """Extrae opciones de riesgo y del filtro de señales, en cualquier orden.
 
-    Opciones: --riesgo fijo [USDT] | --riesgo porcentaje [PORCENTAJE] [CAPITAL_USDT]
+    --riesgo fijo [USDT] | --riesgo porcentaje [PORCENTAJE] [CAPITAL_USDT]
+    --filtro-rango VELAS_ANTERIORES LIMITE_SEÑALES
     """
-    args = list(raw_args)
+    positional: list[str] = []
     config = RiskConfig()
-    try:
-        idx = args.index("--riesgo")
-    except ValueError:
-        return args, config
-    risk_args = args[idx + 1:]
-    args = args[:idx]
-    if not risk_args:
-        raise ValueError("Uso de riesgo: --riesgo fijo [USDT] o --riesgo porcentaje [PORCENTAJE] [CAPITAL_USDT].")
-    mode = risk_args[0].lower()
-    try:
-        if mode in ("fijo", "fixed"):
-            amount = float(risk_args[1]) if len(risk_args) > 1 else 10.0
-            if len(risk_args) > 2: raise ValueError
-            config = RiskConfig(mode="fixed", fixed_risk_usdt=amount)
-        elif mode in ("porcentaje", "percent", "porcentual"):
-            pct = float(risk_args[1]) if len(risk_args) > 1 else 1.0
-            capital = float(risk_args[2]) if len(risk_args) > 2 else 1000.0
-            if len(risk_args) > 3: raise ValueError
-            config = RiskConfig(mode="percent", risk_percent=pct, initial_capital_usdt=capital)
-        else:
-            raise ValueError
-    except ValueError as exc:
-        raise ValueError("Opciones de riesgo inválidas. Usa --riesgo fijo 10 o --riesgo porcentaje 1 1000.") from exc
-    return args, config
+    window = limit = None
+    args = list(raw_args)
+    i = 0
+    while i < len(args):
+        token = args[i].lower()
+        if token == "--filtro-rango":
+            if i + 2 >= len(args):
+                raise ValueError("Uso del filtro: --filtro-rango VELAS_ANTERIORES LIMITE_SEÑALES.")
+            try:
+                window, limit = int(args[i + 1]), int(args[i + 2])
+            except ValueError as exc:
+                raise ValueError("El filtro requiere dos enteros: --filtro-rango 10 3.") from exc
+            if window < 1 or limit < 1:
+                raise ValueError("Las velas y el límite del filtro deben ser enteros positivos.")
+            i += 3
+            continue
+        if token == "--riesgo":
+            if i + 1 >= len(args):
+                raise ValueError("Uso de riesgo: --riesgo fijo 10 o --riesgo porcentaje 1 1000.")
+            mode = args[i + 1].lower()
+            try:
+                if mode in ("fijo", "fixed"):
+                    amount = 10.0
+                    consumed = 2
+                    if i + 2 < len(args) and not args[i + 2].startswith("--"):
+                        amount = float(args[i + 2]); consumed = 3
+                    config = RiskConfig(mode="fixed", fixed_risk_usdt=amount)
+                elif mode in ("porcentaje", "percent", "porcentual"):
+                    pct, capital, consumed = 1.0, 1000.0, 2
+                    if i + 2 < len(args) and not args[i + 2].startswith("--"):
+                        pct = float(args[i + 2]); consumed = 3
+                    if i + 3 < len(args) and not args[i + 3].startswith("--"):
+                        capital = float(args[i + 3]); consumed = 4
+                    config = RiskConfig(mode="percent", risk_percent=pct, initial_capital_usdt=capital)
+                else:
+                    raise ValueError
+            except (ValueError, TypeError) as exc:
+                raise ValueError("Opciones de riesgo inválidas. Usa --riesgo fijo 10 o --riesgo porcentaje 1 1000.") from exc
+            i += consumed
+            continue
+        positional.append(args[i])
+        i += 1
+    return positional, config, window, limit
 
 
 def _format_backtest_stats(label: str, stats: dict) -> str:
@@ -397,7 +417,7 @@ _OUTCOME_ICON = {
 
 async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        args, risk_config = _parse_risk_args(context.args)
+        args, risk_config, filter_window, filter_limit = _parse_backtest_args(context.args)
     except ValueError as exc:
         await update.message.reply_text(f"⚠️ {exc}")
         return
@@ -410,6 +430,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "solo se cuentan señales cuya entrada esté dentro del período.\n"
             "HORIZONTE es opcional: máximo de velas por operación.\n"
             "Riesgo opcional: --riesgo fijo 10 | --riesgo porcentaje 1 1000.\n"
+            "Filtro opcional: --filtro-rango 10 3 (en las 10 velas previas ya hubo 3 señales: rechaza la actual).\n"
             "Por defecto: 10 USDT por operación; margen aislado y buffer estimado del 25% más allá del stop.",
             parse_mode="Markdown",
         )
@@ -438,7 +459,9 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         parse_mode="Markdown",
     )
     try:
-        klines, signal_start, signal_end = load_backtest_klines(bitunix, request)
+        klines, signal_start, signal_end = load_backtest_klines(
+            bitunix, request, warmup_candles=max(100, filter_window or 0)
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Error consultando histórico de Bitunix")
         await update.message.reply_text(f"⚠️ Error consultando histórico de Bitunix: {exc}")
@@ -456,6 +479,13 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     opens = [float(k["open"]) for k in klines]
     times = [k["time"] for k in klines]
     results = run_backtest(closes, highs, lows, opens, times, horizon=horizon)
+    raw_results = results
+    results, rejected_results = filter_signals_by_density(
+        raw_results, times, filter_window, filter_limit
+    )
+    # El filtro se aplica antes de recortar el período para que las señales de
+    # calentamiento previas también cuenten al decidir las primeras entradas.
+    rejected_in_period = filter_signals_to_period(rejected_results, signal_start, signal_end)
     results = filter_signals_to_period(results, signal_start, signal_end)
     stats = summarize(results)
 
@@ -473,8 +503,14 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         + (f"horizonte {horizon} velas" if horizon is not None else "sin límite de velas por operación")
         + "\n\n"
     )
+    filter_description = (
+        f"Filtro de agrupación: máximo {filter_limit} señales en las {filter_window} velas anteriores; "
+        f"rechazadas en el período: {len(rejected_in_period)}.\n"
+        if filter_window is not None else "Filtro de agrupación: desactivado.\n"
+    )
+    header += filter_description
     if not results:
-        await update.message.reply_text(header + "No se dio ninguna señal en ese período con los parámetros actuales.", parse_mode="Markdown")
+        await update.message.reply_text(header + "No quedaron señales operables en ese período con los parámetros actuales.", parse_mode="Markdown")
         return
     summary_text = "\n\n".join(
         _format_backtest_stats(label, stats[key])
@@ -491,19 +527,19 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     detail_text = detail_header + "\n" + "\n".join(recent_lines) + "\n_✅ objetivo · ❌ stop · ➖ cerrada al horizonte · ⏳ aún abierta_"
     await update.message.reply_text(header + summary_text + "\n\n" + detail_text, parse_mode="Markdown")
     try:
-        workbook_buffer = build_backtest_workbook(symbol, interval, horizon, klines, results, stats, risk_config)
+        workbook_buffer = build_backtest_workbook(symbol, interval, horizon, klines, results, stats, risk_config, {"window": filter_window, "limit": filter_limit, "rejected": len(rejected_in_period)})
     except Exception:  # noqa: BLE001
         logger.exception("Error generando el Excel del backtest")
         await update.message.reply_text("⚠️ El resumen se calculó bien, pero no pude generar el Excel.")
         return
     filename = f"backtest_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
-    await update.message.reply_document(document=workbook_buffer, filename=filename, caption=f"📊 Detalle: {len(results)} señales y {len(klines)} velas cargadas de {symbol} ({interval}).")
+    await update.message.reply_document(document=workbook_buffer, filename=filename, caption=f"📊 Detalle: {len(results)} señales operables; {len(rejected_in_period)} rechazadas por filtro; {len(klines)} velas de {symbol} ({interval}).")
 
 
 async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ejecuta Keltner usando la misma capa genérica de selección de período."""
     try:
-        args, risk_config = _parse_risk_args(context.args)
+        args, risk_config, filter_window, filter_limit = _parse_backtest_args(context.args)
     except ValueError as exc:
         await update.message.reply_text(f"⚠️ {exc}")
         return
@@ -513,7 +549,8 @@ async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT
             "Uso por período: /backtest_keltner BTCUSDT 4h 2025-01-01 2025-06-30 [HORIZONTE]\n\n"
             "Las fechas son UTC e incluyen ambos días. Se cargan velas previas/posteriores para evitar truncar indicadores y operaciones.\n"
             "El Excel incluye resumen, señales, velas, curva de ratios y gestión de riesgo.\n"
-            "Riesgo opcional: --riesgo fijo 10 | --riesgo porcentaje 1 1000. Por defecto: 10 USDT.",
+            "Riesgo opcional: --riesgo fijo 10 | --riesgo porcentaje 1 1000.\n"
+            "Filtro opcional: --filtro-rango 10 3 (X velas anteriores, límite de señales). Por defecto está desactivado.",
         )
         return
     try:
@@ -532,7 +569,9 @@ async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT
     )
     await update.message.reply_text(f"Descargando histórico de {symbol} ({interval}, {period_text}) y ejecutando Keltner…")
     try:
-        klines, signal_start, signal_end = load_backtest_klines(bitunix, request)
+        klines, signal_start, signal_end = load_backtest_klines(
+            bitunix, request, warmup_candles=max(100, filter_window or 0)
+        )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Error consultando histórico para backtest Keltner")
         await update.message.reply_text(f"⚠️ Error consultando histórico de Bitunix: {exc}")
@@ -547,6 +586,11 @@ async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT
     times = [int(k["time"]) for k in klines]
     try:
         results = run_keltner_backtest(closes, highs, lows, opens, times, horizon=horizon)
+        raw_results = results
+        results, rejected_results = filter_signals_by_density(
+            raw_results, times, filter_window, filter_limit
+        )
+        rejected_in_period = filter_signals_to_period(rejected_results, signal_start, signal_end)
         results = filter_signals_to_period(results, signal_start, signal_end)
         stats = summarize_keltner(results)
     except Exception as exc:  # noqa: BLE001
@@ -561,8 +605,14 @@ async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT
         if signal_start is not None else f"{len(klines)} velas ({first_date} → {last_date})"
     )
     header = f"*Backtest Keltner {symbol} — {interval}*\nGestión de riesgo: {risk_config.label}; margen aislado.\n{requested}; velas cargadas {len(klines)} ({first_date} → {last_date}), " + (f"horizonte {horizon} velas" if horizon is not None else "sin límite por operación")
+    filter_description = (
+        f"\nFiltro de agrupación: máximo {filter_limit} señales en las {filter_window} velas anteriores; "
+        f"rechazadas en el período: {len(rejected_in_period)}."
+        if filter_window is not None else "\nFiltro de agrupación: desactivado."
+    )
+    header += filter_description
     if not results:
-        await update.message.reply_text(header + "\nNo hubo señales dentro del período con los parámetros actuales.", parse_mode="Markdown")
+        await update.message.reply_text(header + "\nNo quedaron señales operables dentro del período con los parámetros actuales.", parse_mode="Markdown")
         return
     blocks = []
     for label, key in (("Total", "total"), ("LONG", "long"), ("SHORT", "short")):
@@ -586,13 +636,13 @@ async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT
         blocks.append("\n".join(lines))
     await update.message.reply_text(header + "\n\n" + "\n\n".join(blocks), parse_mode="Markdown")
     try:
-        workbook_buffer = build_keltner_workbook(symbol, interval, horizon, klines, results, stats, risk_config)
+        workbook_buffer = build_keltner_workbook(symbol, interval, horizon, klines, results, stats, risk_config, {"window": filter_window, "limit": filter_limit, "rejected": len(rejected_in_period)})
     except Exception:  # noqa: BLE001
         logger.exception("Error generando Excel del backtest Keltner")
         await update.message.reply_text("⚠️ El backtest terminó, pero no se pudo generar el Excel.")
         return
     filename = f"backtest_keltner_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
-    await update.message.reply_document(document=workbook_buffer, filename=filename, caption=f"📊 Backtest Keltner: {len(results)} señales y {len(klines)} velas cargadas de {symbol} ({interval}).")
+    await update.message.reply_document(document=workbook_buffer, filename=filename, caption=f"📊 Keltner: {len(results)} señales operables; {len(rejected_in_period)} rechazadas por filtro; {len(klines)} velas de {symbol} ({interval}).")
 
 
 

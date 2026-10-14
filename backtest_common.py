@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 import re
+from collections import deque
 
 INTERVAL_MS = {
     "1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
@@ -102,3 +103,39 @@ def filter_signals_to_period(results, start_ms: int | None, end_ms: int | None):
     if start_ms is None or end_ms is None:
         return results
     return [result for result in results if start_ms <= int(result.time) <= end_ms]
+
+
+def filter_signals_by_density(results, candle_times: list[int], window_candles: int | None = None,
+                              max_signals: int | None = None):
+    """Filtra entradas agrupadas, pero cada señal detectada cuenta para las siguientes.
+
+    Para una señal en la vela i, se cuentan todas las señales detectadas en las
+    X velas anteriores (i-X ... i-1). Si el conteo es >= max_signals, se rechaza
+    la entrada actual. La señal actual se registra siempre, aunque se rechace,
+    por lo que también limita señales futuras. Devuelve (aceptadas, rechazadas).
+    """
+    if window_candles is None or max_signals is None:
+        return list(results), []
+    if window_candles < 1 or max_signals < 1:
+        raise ValueError("El filtro de agrupación requiere X velas y límite, ambos enteros positivos.")
+
+    time_to_index = {int(t): i for i, t in enumerate(candle_times)}
+    ordered = sorted(results, key=lambda item: int(item.time))
+    recent_indices = deque()
+    accepted, rejected = [], []
+    for result in ordered:
+        idx = time_to_index.get(int(result.time))
+        if idx is None:
+            # Si no coincide exactamente, no se puede calcular con seguridad.
+            accepted.append(result)
+            continue
+        oldest_allowed = idx - window_candles
+        while recent_indices and recent_indices[0] < oldest_allowed:
+            recent_indices.popleft()
+        if len(recent_indices) >= max_signals:
+            rejected.append(result)
+        else:
+            accepted.append(result)
+        # Toda señal detectada cuenta, incluso si fue rechazada como operación.
+        recent_indices.append(idx)
+    return accepted, rejected

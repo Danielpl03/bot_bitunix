@@ -339,6 +339,21 @@ def _write_risk_sheet(ws, results, config: RiskConfig, ratios) -> None:
     ws.auto_filter.ref = f"A{start}:N{row-1}"
 
 
+def _write_signal_filter_sheet(ws, signal_filter: dict | None) -> None:
+    ws.append(["Parámetro", "Valor"])
+    enabled = bool(signal_filter and signal_filter.get("window") is not None)
+    ws.append(["Filtro de agrupación", "Activado" if enabled else "Desactivado"])
+    if enabled:
+        ws.append(["Ventana de velas anteriores", signal_filter["window"]])
+        ws.append(["Límite de señales previas", signal_filter["limit"]])
+        ws.append(["Señales rechazadas dentro del período", signal_filter.get("rejected", 0)])
+        ws.append(["Regla", "Se rechaza la señal actual si en las X velas previas ya hubo al menos el límite; las rechazadas también cuentan para señales futuras."])
+    ws.column_dimensions["A"].width = 38
+    ws.column_dimensions["B"].width = 100
+    for cell in ws[1]:
+        cell.font = Font(name=FONT_NAME, bold=True)
+
+
 def build_backtest_workbook(
     symbol: str,
     interval: str,
@@ -347,6 +362,7 @@ def build_backtest_workbook(
     results: list[BacktestSignal],
     stats: dict,
     risk_config: RiskConfig | None = None,
+    signal_filter: dict | None = None,
 ) -> BytesIO:
     """
     Arma el workbook completo del backtest con 3 hojas (Resumen, Señales,
@@ -366,6 +382,7 @@ def build_backtest_workbook(
     _write_candles_sheet(candles_ws, klines)
 
     _write_risk_sheet(wb.create_sheet("Gestión riesgo"), results, risk_config or RiskConfig(), TP_RATIOS)
+    _write_signal_filter_sheet(wb.create_sheet("Filtro señales"), signal_filter)
 
     for ws in wb.worksheets:
         for row in ws.iter_rows():

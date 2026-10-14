@@ -220,7 +220,7 @@ def _risk_sheet(ws, results, config: RiskConfig):
 
 def build_keltner_workbook(symbol: str, interval: str, horizon: int | None,
                            klines: list[dict], results: list[KeltnerBacktestSignal],
-                           stats: dict, risk_config: RiskConfig | None = None) -> BytesIO:
+                           stats: dict, risk_config: RiskConfig | None = None, signal_filter: dict | None = None) -> BytesIO:
     """Construye un Excel con resumen, señales, velas y curva de ratios."""
     wb = Workbook()
     _summary(wb.active, symbol, interval, horizon, klines, stats)
@@ -228,6 +228,17 @@ def build_keltner_workbook(symbol: str, interval: str, horizon: int | None,
     _candles(wb.create_sheet("Velas"), klines)
     _curve(wb.create_sheet("Curva ratios"), stats)
     _risk_sheet(wb.create_sheet("Gestión riesgo"), results, risk_config or RiskConfig())
+    filter_ws = wb.create_sheet("Filtro señales")
+    enabled = bool(signal_filter and signal_filter.get("window") is not None)
+    filter_ws.append(["Parámetro", "Valor"])
+    filter_ws.append(["Filtro de agrupación", "Activado" if enabled else "Desactivado"])
+    if enabled:
+        filter_ws.append(["Ventana de velas anteriores", signal_filter["window"]])
+        filter_ws.append(["Límite de señales previas", signal_filter["limit"]])
+        filter_ws.append(["Señales rechazadas dentro del período", signal_filter.get("rejected", 0)])
+        filter_ws.append(["Regla", "Se rechaza la señal actual si en las X velas previas ya hubo al menos el límite; las rechazadas también cuentan para señales futuras."])
+    filter_ws.column_dimensions["A"].width = 38
+    filter_ws.column_dimensions["B"].width = 100
     for ws in wb.worksheets:
         for row in ws.iter_rows():
             for cell in row:
