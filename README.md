@@ -71,10 +71,17 @@ Parámetros iniciales de indicadores:
 - Sobrecompra: 80.
 - Ventana del stop: 10 velas.
 
-Reglas actuales:
+Reglas actuales (modo original, predeterminado):
 
 - **LONG:** el cierre de la vela de señal está por debajo de la banda inferior de Bollinger; `%K` cruza al alza `%D`; ambas líneas están por debajo de 20; el stop calculado con el mínimo de las últimas 10 velas queda debajo del cierre y la banda media está por encima del cierre.
 - **SHORT:** el cierre está por encima de la banda superior; `%K` cruza a la baja `%D`; ambas líneas están por encima de 80; el stop calculado con el máximo de las últimas 10 velas queda por encima del cierre y la banda media debajo del cierre.
+
+Variante opcional de comparación: `--recuperacion-banda`.
+
+- **LONG:** durante las últimas 5 velas el precio debe haber tocado/perforado la banda inferior (mínimo de vela <= banda inferior de esa misma vela) o haber cerrado por debajo de ella. La vela de señal debe cerrar otra vez por encima de la banda inferior, y el Estocástico debe confirmar cruce alcista con `%K` y `%D` bajo 20.
+- **SHORT:** regla simétrica: durante las últimas 5 velas el precio toca/perfora o cierra por encima de la banda superior; la vela de señal cierra otra vez por debajo de la banda superior y el Estocástico confirma cruce bajista con ambas líneas sobre 80.
+- El lookback compara cada vela con sus propias bandas de Bollinger calculadas hasta esa vela, no con las bandas actuales.
+- El modo de recuperación no cambia el modo original ni lo activa por defecto; se selecciona añadiendo el flag al comando. Las reglas de stop, objetivo, ejecución en la siguiente apertura y simulación siguen siendo las mismas.
 - La señal se conoce al cierre de una vela y la entrada del backtest se intenta en la **apertura de la siguiente vela**, para no simular una entrada retrospectiva al cierre de la señal.
 - El objetivo es la banda media de Bollinger calculada en la vela de señal y queda fijo durante esa operación.
 - Solo puede existir una operación simultánea por símbolo en esta simulación.
@@ -109,7 +116,7 @@ Formato por cantidad de velas:
 ```text
 /backtest SIMBOLO INTERVALO NUM_VELAS [HORIZONTE]
 /backtest_keltner SIMBOLO INTERVALO NUM_VELAS [HORIZONTE]
-/backtest_reversion SIMBOLO INTERVALO NUM_VELAS [HORIZONTE]
+/backtest_reversion SIMBOLO INTERVALO NUM_VELAS [HORIZONTE] [--recuperacion-banda]
 ```
 
 Formato por fechas UTC inclusivas:
@@ -117,7 +124,7 @@ Formato por fechas UTC inclusivas:
 ```text
 /backtest SIMBOLO INTERVALO AAAA-MM-DD AAAA-MM-DD [HORIZONTE]
 /backtest_keltner SIMBOLO INTERVALO AAAA-MM-DD AAAA-MM-DD [HORIZONTE]
-/backtest_reversion SIMBOLO INTERVALO AAAA-MM-DD AAAA-MM-DD [HORIZONTE]
+/backtest_reversion SIMBOLO INTERVALO AAAA-MM-DD AAAA-MM-DD [HORIZONTE] [--recuperacion-banda]
 ```
 
 Ejemplos:

@@ -53,7 +53,8 @@ def _simulate(side, entry, stop, target, opens, highs, lows, closes, times, entr
 def run_backtest(closes: list[float], highs: list[float], lows: list[float], opens: list[float], times: list[int],
                  horizon: int | None = None, *, bb_period: int = 20, bb_std: float = 2.0,
                  k_period: int = 14, smooth_k: int = 3, d_period: int = 3,
-                 oversold: float = 20.0, overbought: float = 80.0, sl_lookback: int = 10) -> list[ReversionTrade]:
+                 oversold: float = 20.0, overbought: float = 80.0, sl_lookback: int = 10,
+                 recovery_mode: bool = False, recovery_lookback: int = 5) -> list[ReversionTrade]:
     trades = []
     # Una sola posición simultánea por símbolo: no se abre otra hasta que la anterior cierre.
     time_to_index = {int(t): i for i, t in enumerate(times)}
@@ -65,6 +66,7 @@ def run_backtest(closes: list[float], highs: list[float], lows: list[float], ope
             closes[:i+1], highs[:i+1], lows[:i+1], bb_period=bb_period, bb_std=bb_std,
             k_period=k_period, smooth_k=smooth_k, d_period=d_period,
             oversold=oversold, overbought=overbought, sl_lookback=sl_lookback,
+            recovery_mode=recovery_mode, recovery_lookback=recovery_lookback,
         )
         if sig is None:
             continue

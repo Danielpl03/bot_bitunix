@@ -586,8 +586,11 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def backtest_reversion_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Backtest de reversión a la media: Bollinger + Estocástico."""
+    raw_args = list(context.args)
+    recovery_mode = any(token.lower() == "--recuperacion-banda" for token in raw_args)
+    raw_args = [token for token in raw_args if token.lower() != "--recuperacion-banda"]
     try:
-        args, risk_config, filter_window, filter_limit, band_ratio, channel_width_pct, only_outer_bands = _parse_backtest_args(context.args)
+        args, risk_config, filter_window, filter_limit, band_ratio, channel_width_pct, only_outer_bands = _parse_backtest_args(raw_args)
     except ValueError as exc:
         await update.message.reply_text(f"⚠️ {exc}")
         return
@@ -602,8 +605,9 @@ async def backtest_reversion_command(update: Update, context: ContextTypes.DEFAU
             "Estrategia de reversión a la media: Bollinger (20, 2) + Estocástico lento (14, 3, 3).\n\n"
             "Uso por cantidad: /backtest_reversion BTCUSDT 4h 500 [HORIZONTE]\n"
             "Uso por período: /backtest_reversion BTCUSDT 15m 2025-01-01 2025-01-31 [HORIZONTE]\n\n"
-            "LONG: cierre bajo la banda inferior + cruce alcista de %K/%D con ambos < 20.\n"
-            "SHORT: cierre sobre la banda superior + cruce bajista con ambos > 80.\n"
+            "Modo original (predeterminado): LONG cierra bajo la banda inferior + cruce alcista de %K/%D con ambos < 20; "
+            "SHORT cierra sobre la banda superior + cruce bajista con ambos > 80.\n"
+            "Modo opcional --recuperacion-banda: exige toque/cierre fuera de la banda en las últimas 5 velas y que la vela de señal cierre de nuevo dentro del canal; mantiene el cruce estocástico extremo.\n"
             "Una sola posición simultánea por símbolo. Entrada a la apertura de la vela siguiente; stop en el extremo de las últimas 10 velas; "
             "objetivo en la banda media calculada en la vela de señal.\n"
             "HORIZONTE es opcional. Riesgo: --riesgo fijo 10 | --riesgo porcentaje 1 1000. "
@@ -642,7 +646,10 @@ async def backtest_reversion_command(update: Update, context: ContextTypes.DEFAU
     opens = [float(k["open"]) for k in klines]
     times = [int(k["time"]) for k in klines]
     try:
-        all_trades = run_reversion_backtest(closes, highs, lows, opens, times, horizon=horizon)
+        all_trades = run_reversion_backtest(
+            closes, highs, lows, opens, times, horizon=horizon,
+            recovery_mode=recovery_mode, recovery_lookback=5,
+        )
         trades = filter_signals_to_period(all_trades, signal_start, signal_end)
         stats = summarize_reversion(trades)
     except Exception as exc:  # noqa: BLE001
@@ -654,9 +661,10 @@ async def backtest_reversion_command(update: Update, context: ContextTypes.DEFAU
     period = (f"señales entre {datetime.fromtimestamp(signal_start / 1000, tz=timezone.utc):%Y-%m-%d} → "
               f"{datetime.fromtimestamp(signal_end / 1000, tz=timezone.utc):%Y-%m-%d} UTC"
               if signal_start is not None else f"{len(klines)} velas ({first_date} → {last_date})")
+    variant_label = "Recuperación de banda (5 velas)" if recovery_mode else "Original (cierre fuera de banda)"
     header = (
         f"*Backtest Reversión Bollinger + Estocástico — {symbol} · {interval}*\n"
-        f"Gestión de riesgo: {risk_config.label}.\n{period}; velas cargadas: {len(klines)}; "
+        f"Variante: {variant_label}.\nGestión de riesgo: {risk_config.label}.\n{period}; velas cargadas: {len(klines)}; "
         + (f"horizonte: {horizon} velas.\n" if horizon is not None else "sin límite de duración por operación.\n")
         + "Entrada: apertura de la vela siguiente; objetivo: banda media fijada en la señal; máximo una posición simultánea.\n"
         + "Costes de trading no incluidos.\n\n"
@@ -687,14 +695,17 @@ async def backtest_reversion_command(update: Update, context: ContextTypes.DEFAU
         recent_lines.append(f"{icon} `{dt}` {t.side} entrada `{t.entry:.6g}` · SL `{t.stop_loss:.6g}` · TP `{t.target:.6g}` · {result}")
     await update.message.reply_text(header + "\n\n".join(groups) + "\n\n_Últimas operaciones:_\n" + "\n".join(recent_lines), parse_mode="Markdown")
     try:
-        workbook = build_reversion_workbook(symbol, interval, horizon, klines, trades, stats, risk_config)
+        workbook = build_reversion_workbook(
+            symbol, interval, horizon, klines, trades, stats, risk_config,
+            recovery_mode=recovery_mode,
+        )
     except Exception:  # noqa: BLE001
         logger.exception("Error generando Excel del backtest de reversión")
         await update.message.reply_text("⚠️ El backtest terminó, pero no se pudo generar el Excel.")
         return
     filename = f"backtest_reversion_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
     await update.message.reply_document(document=workbook, filename=filename,
-        caption=f"📊 Reversión Bollinger + Estocástico: {len(trades)} operaciones; {symbol} ({interval}).")
+        caption=f"📊 Reversión Bollinger + Estocástico ({variant_label}): {len(trades)} operaciones; {symbol} ({interval}).")
 
 
 async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -14,11 +14,13 @@ BOLD = Font(name="Arial", bold=True)
 TITLE = Font(name="Arial", bold=True, size=14)
 
 
-def build_reversion_workbook(symbol, interval, horizon, klines, trades, stats, risk_config: RiskConfig):
+def build_reversion_workbook(symbol, interval, horizon, klines, trades, stats, risk_config: RiskConfig,
+                             recovery_mode: bool = False):
     wb = Workbook()
     ws = wb.active
     ws.title = "Resumen"
-    ws["A1"] = f"Reversión Bollinger + Estocástico — {symbol} {interval}"
+    mode_label = "Recuperación de banda" if recovery_mode else "Original: cierre fuera de banda"
+    ws["A1"] = f"Reversión Bollinger + Estocástico ({mode_label}) — {symbol} {interval}"
     ws["A1"].font = TITLE
     ws.merge_cells("A1:D1")
     first = datetime.fromtimestamp(int(klines[0]["time"]) / 1000, timezone.utc)
@@ -29,6 +31,9 @@ def build_reversion_workbook(symbol, interval, horizon, klines, trades, stats, r
         ("Velas cargadas", len(klines)), ("Horizonte máximo", horizon if horizon else "Sin límite"),
         ("Bandas de Bollinger", "Período 20; desviación 2"),
         ("Estocástico lento", "14, 3, 3; sobreventa < 20; sobrecompra > 80"),
+        ("Variante de entrada", mode_label),
+        ("Lookback extremo reciente", "5 velas: toque/mecha o cierre fuera de banda" if recovery_mode else "No aplica"),
+        ("Confirmación de recuperación", "La vela de señal cierra de nuevo dentro de la banda límite" if recovery_mode else "No aplica"),
         ("Lookback del stop", "10 velas, incluida la vela de señal"),
         ("Posiciones simultáneas", "Máximo una posición abierta por símbolo"),
         ("Entrada", "Apertura de la vela posterior a la señal"),
