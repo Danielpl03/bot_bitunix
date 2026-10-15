@@ -1,406 +1,293 @@
-# Bot de Telegram para Bitunix
+# Bot de Telegram para análisis y backtesting de estrategias cripto
 
-Bot que consulta precios y gestiona tu cuenta de futuros en Bitunix: saldo,
-posiciones abiertas, apertura y cierre de posiciones. Además incluye una
-estrategia de entrada basada en estocástico + Bandas de Bollinger en velas
-de 4h y de 1h, con alertas automáticas y backtest sobre histórico.
+> **Documento de contexto para desarrolladores e IA.** Este README describe la arquitectura, la responsabilidad de cada archivo, las reglas conocidas de las estrategias, los comandos disponibles y las limitaciones que deben conservarse al modificar el proyecto. Debe leerse antes de proponer o implementar cambios.
 
-## Estructura del proyecto
+## 1. Objetivo del proyecto
 
+El proyecto es un bot de Telegram escrito en Python que consulta datos de mercado de Bitunix, calcula indicadores técnicos, informa sobre señales y permite ejecutar backtests de varias estrategias sobre velas históricas. También incluye funciones para consultar datos privados de la cuenta de futuros y abrir/cerrar posiciones mediante Bitunix.
+
+La necesidad principal actual es **investigar de forma reproducible estrategias de trading y comparar sus resultados**, sin mezclar las reglas de entrada de una estrategia con las de otra. La rentabilidad no está demostrada: los backtests actuales no incorporan todos los costes reales de trading.
+
+El proyecto debe permitir probar símbolos y temporalidades distintas. Los intervalos aceptados por el bot son: `1m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h`, `1d`, `3d`, `1w` y `1M`. **Nota técnica:** el intervalo mensual `1M` está en la lista aceptada, pero el mapa de duración usado para consultar rangos de fechas en `backtest_common.py` no incluye `1M`; el modo por cantidad de velas puede funcionar, mientras que el modo por fechas necesita que se implemente esa duración.
+
+## 2. Estado funcional actual
+
+Hay tres backtests registrados como comandos separados:
+
+1. `/backtest`: estrategia original basada en Bollinger + Estocástico.
+2. `/backtest_keltner`: estrategia de cruces del Canal de Keltner.
+3. `/backtest_reversion`: estrategia experimental de reversión a la media con Bollinger + Estocástico.
+
+Las tres estrategias comparten cliente de datos de Bitunix, utilidades de carga de velas y parte de la infraestructura de gestión de riesgo/exportación, pero mantienen lógicas de entrada y simulación distintas.
+
+### 2.1 Estrategia original: `/backtest`
+
+La estrategia original está implementada en `strategy.py` y su simulación en `backtest.py`.
+
+A nivel general combina cruces del Estocástico con la posición del cierre respecto a las Bandas de Bollinger, la dirección de la vela y la ubicación del stop. Sus reglas exactas están documentadas en el docstring de `strategy.py`; **no sustituirlas por las reglas de la estrategia de reversión**.
+
+Admite filtros opcionales de señales:
+
+- `--filtro-rango VELAS LIMITE`: limita la densidad de señales dentro de una ventana de velas.
+- `--filtro-banda RATIO`: exige que haya espacio hasta la banda contraria superior a `RATIO` veces el riesgo hasta el stop.
+- `--filtro-anchura PORCENTAJE`: exige una anchura mínima del canal expresada como porcentaje del precio.
+- `--riesgo fijo USDT` o `--riesgo porcentaje PORCENTAJE CAPITAL_USDT`: configura los cálculos auxiliares de riesgo y exposición.
+
+Los filtros de banda y anchura utilizan los atributos de banda y precio de las señales producidas por esta estrategia. Todos los filtros están desactivados por defecto.
+
+### 2.2 Estrategia Keltner: `/backtest_keltner`
+
+Implementada en `strategy_keltner.py` y simulada en `backtest_kelner.py` (el nombre del archivo contiene históricamente la grafía `kelner`; no renombrarlo sin actualizar todos los imports).
+
+Reglas generales:
+
+- LONG: la vela cruza de abajo hacia arriba la banda inferior o la media del Canal de Keltner.
+- SHORT: la vela cruza de arriba hacia abajo la banda superior o la media.
+- La detección del cruce usa apertura y cierre; una mecha aislada no cuenta como cruce.
+- El stop inicial se coloca en el mínimo de la vela de señal para LONG o el máximo para SHORT.
+- El backtest estudia objetivos por múltiplos de riesgo (R); la lógica y las estadísticas concretas están en `backtest_kelner.py`.
+
+Opciones opcionales:
+
+- `--solo-bandas-limite`: LONG solo cruza la banda inferior y SHORT solo cruza la superior.
+- `--filtro-rango VELAS LIMITE`.
+- `--filtro-banda RATIO`.
+- `--filtro-anchura PORCENTAJE`.
+- `--riesgo fijo USDT` o `--riesgo porcentaje PORCENTAJE CAPITAL_USDT`.
+
+Los filtros son opcionales y no se aplican por defecto. No asumir que el modo de bandas límite está activado si el parámetro no aparece.
+
+### 2.3 Estrategia experimental de reversión: `/backtest_reversion`
+
+Es la primera estrategia del nuevo ciclo de investigación. Se añadió como módulo separado para poder comparar su hipótesis con las estrategias anteriores sin alterar estas últimas.
+
+Archivos principales: `strategy_reversion.py`, `backtest_reversion.py` y `xlsx_export_reversion.py`.
+
+Parámetros iniciales de indicadores:
+
+- Bandas de Bollinger: período 20, desviación 2.
+- Estocástico lento: `14, 3, 3`.
+- Sobreventa: 20.
+- Sobrecompra: 80.
+- Ventana del stop: 10 velas.
+
+Reglas actuales:
+
+- **LONG:** el cierre de la vela de señal está por debajo de la banda inferior de Bollinger; `%K` cruza al alza `%D`; ambas líneas están por debajo de 20; el stop calculado con el mínimo de las últimas 10 velas queda debajo del cierre y la banda media está por encima del cierre.
+- **SHORT:** el cierre está por encima de la banda superior; `%K` cruza a la baja `%D`; ambas líneas están por encima de 80; el stop calculado con el máximo de las últimas 10 velas queda por encima del cierre y la banda media debajo del cierre.
+- La señal se conoce al cierre de una vela y la entrada del backtest se intenta en la **apertura de la siguiente vela**, para no simular una entrada retrospectiva al cierre de la señal.
+- El objetivo es la banda media de Bollinger calculada en la vela de señal y queda fijo durante esa operación.
+- Solo puede existir una operación simultánea por símbolo en esta simulación.
+- Si la apertura de la vela de entrada ya invalida el orden lógico entre stop, entrada y objetivo, se descarta la operación.
+- Si una misma vela toca stop y objetivo y el OHLC no permite conocer cuál se alcanzó primero, se considera el stop primero (supuesto conservador).
+- Si se indica un horizonte máximo y no se toca ni stop ni objetivo, la operación se cierra al cierre de la última vela del horizonte. Sin horizonte, puede quedar pendiente al final del histórico.
+
+Esta estrategia **no acepta los filtros heredados** `--filtro-rango`, `--filtro-banda`, `--filtro-anchura` ni `--solo-bandas-limite`: el comando devuelve un aviso si se intentan usar. La opción de riesgo se usa para el cálculo auxiliar/exportación, pero las estadísticas base de esta estrategia se expresan en R y variación porcentual.
+
+No se debe describir esta estrategia como rentable hasta medirla con costes y en datos fuera de muestra.
+
+## 3. Comandos de Telegram
+
+### 3.1 Comandos generales
+
+- `/start`: ayuda y listado de comandos.
+- `/price [SIMBOLO]`: consulta precio/ticker.
+- `/watchlist`: ver o editar la lista de símbolos para `/price`.
+- `/indicators SIMBOLO [INTERVALO]`: muestra valores de indicadores.
+- `/alerts`: administra o consulta símbolos vigilados por alertas.
+- `/balance [MONEDA]`: consulta balance privado de futuros.
+- `/positions [SIMBOLO]`: consulta posiciones abiertas.
+- `/open SIMBOLO BUY|SELL CANTIDAD`: solicita abrir una posición; revisar cuidadosamente antes de usar.
+- `/close POSITION_ID`: solicita cerrar una posición; revisar cuidadosamente antes de usar.
+
+Los comandos privados requieren credenciales de Bitunix. El bot puede enviar botones de confirmación para las acciones de apertura/cierre; son operaciones potencialmente reales, no un simulador.
+
+### 3.2 Formato de backtests
+
+Formato por cantidad de velas:
+
+```text
+/backtest SIMBOLO INTERVALO NUM_VELAS [HORIZONTE]
+/backtest_keltner SIMBOLO INTERVALO NUM_VELAS [HORIZONTE]
+/backtest_reversion SIMBOLO INTERVALO NUM_VELAS [HORIZONTE]
 ```
-bitunix_client.py   # Lógica de conexión a la API de Bitunix (sin Telegram)
-indicators.py        # Cálculo de indicadores técnicos (estocástico, Bollinger)
-strategy.py           # Reglas de entrada de la estrategia (usa indicators.py)
-backtest.py           # Backtest de la estrategia sobre histórico (usa strategy.py)
-xlsx_export.py         # Arma el Excel del backtest (usa backtest.py, sin Telegram)
-bot.py               # Lógica de Telegram: comandos, confirmaciones y formato
-requirements.txt
+
+Formato por fechas UTC inclusivas:
+
+```text
+/backtest SIMBOLO INTERVALO AAAA-MM-DD AAAA-MM-DD [HORIZONTE]
+/backtest_keltner SIMBOLO INTERVALO AAAA-MM-DD AAAA-MM-DD [HORIZONTE]
+/backtest_reversion SIMBOLO INTERVALO AAAA-MM-DD AAAA-MM-DD [HORIZONTE]
 ```
 
-`bitunix_client.py` es independiente de Telegram a propósito: expone
-una clase `BitunixClient` que se puede importar desde cualquier otro
-servicio (una API propia con FastAPI/Flask, un script, una app) para
-usarla como backend común.
+Ejemplos:
 
-```python
-from bitunix_client import BitunixClient
-
-client = BitunixClient(api_key="...", secret_key="...")
-account = client.get_account("USDT")
+```text
+/backtest_reversion BTCUSDT 4h 1000
+/backtest_reversion ETHUSDT 15m 2025-01-01 2025-03-31
+/backtest_reversion BTCUSDT 4h 500 20
+/backtest_keltner BTCUSDT 4h 500 --solo-bandas-limite --filtro-banda 2
+/backtest BTCUSDT 1h 500 --filtro-rango 10 3 --filtro-anchura 1.5
+/backtest BTCUSDT 4h 500 --riesgo fijo 10
+/backtest BTCUSDT 4h 500 --riesgo porcentaje 1 1000
 ```
 
-`indicators.py`, `strategy.py` y `backtest.py` siguen la misma idea: son
-módulos puros, sin ningún import de Telegram ni de Bitunix, que solo
-reciben listas de precios ya extraídas de las velas. Se pueden reutilizar
-o testear por separado de todo lo demás.
+El parámetro `HORIZONTE`, cuando se proporciona, es un número máximo de velas que dura una operación; no es la duración del histórico. El parser limita la cantidad de velas al rango permitido por el bot (actualmente máximo 1500 para comandos de backtest). Los rangos de fechas están limitados por `backtest_common.py` a un máximo aproximado de 10.000 velas incluyendo calentamiento y seguimiento. La carga histórica añade velas previas para calentar indicadores y velas posteriores para observar salidas; las señales se cuentan dentro del período pedido.
 
-## Comandos disponibles
+### 3.3 Indicadores disponibles
 
-| Comando | Descripción |
-|---|---|
-| `/price [SIMBOLO...]` | Precios (tu watchlist guardada o símbolos dados) |
-| `/watchlist` | Ver la watchlist actual |
-| `/watchlist add SIMBOLO` | Añadir un símbolo a la watchlist |
-| `/watchlist remove SIMBOLO` | Quitar un símbolo de la watchlist |
-| `/watchlist reset` | Volver a la watchlist por defecto (BTC, ETH, SOL, BNB, XRP) |
-| `/indicators SIMBOLO [INTERVALO]` | Estocástico (14,3,3) y Bandas de Bollinger (20, 2σ). Intervalo por defecto `1h` |
-| `/alerts` | Monedas vigiladas por la estrategia (4h y 1h); `/alerts check` muestra el estado de cada condición |
-| `/alerts add SIMBOLO` | Vigilar un símbolo (recibirás alerta cuando dé señal) |
-| `/alerts remove SIMBOLO` | Dejar de vigilar un símbolo |
-| `/alerts reset` | Vaciar la lista de vigilancia |
-| `/alerts check [SIMBOLO]` | Evaluar la estrategia *ahora mismo* (sin esperar el cierre de vela), sobre un símbolo o sobre toda la lista |
-| `/backtest SIMBOLO (INTERVALO) (N_VELAS) (HORIZONTE)` | Backtest de la estrategia sobre histórico + Excel con el detalle |
-| `/balance [MONEDA]` | Balance de la cuenta de futuros (default `USDT`) |
-| `/positions [SIMBOLO]` | Posiciones abiertas |
-| `/open SIMBOLO BUY\|SELL CANTIDAD [PRECIO]` | Abrir posición (pide confirmación) |
-| `/close POSITION_ID` | Cerrar posición a mercado (pide confirmación) |
+Los cálculos principales están en `indicators.py`:
 
-`/balance`, `/positions`, `/open`, `/close`, `/watchlist` y `/alerts`
-requieren `TELEGRAM_ALLOWED_USER_ID` configurado para restringir quién
-puede usarlos; `/balance`, `/positions`, `/open` y `/close` además
-necesitan `BITUNIX_API_KEY` y `BITUNIX_API_SECRET`.
+- Bandas de Bollinger.
+- Estocástico `%K` y `%D`.
+- EMA, ATR y serie del Canal de Keltner.
 
-## ⚠️ Seguridad — leer antes de desplegar
+## 4. Arquitectura y flujo de datos
 
-Este bot puede mover tu dinero real. Ten en cuenta:
+Flujo típico de un backtest:
 
-- **Restringe el acceso.** Configura `TELEGRAM_ALLOWED_USER_ID` con tu
-  `user_id` numérico de Telegram (puedes obtenerlo hablando con
-  [@userinfobot](https://t.me/userinfobot)). Sin esta variable,
-  *cualquiera* que encuentre tu bot podría ver tu saldo y abrir/cerrar
-  posiciones.
-- **Permisos mínimos en la API Key.** Al crear la API Key en Bitunix
-  (Cuenta → API Management), NO actives el permiso de retiro (withdraw).
-  Solo necesitas permisos de lectura y trading de futuros.
-- **`/open` y `/close` piden confirmación** con un botón antes de
-  ejecutar la orden — aun así, revisa bien símbolo, lado y cantidad
-  antes de confirmar.
-- Nunca subas tu `BITUNIX_API_SECRET` ni tu `TELEGRAM_BOT_TOKEN` a un
-  repositorio público; van siempre como variables de entorno.
+1. Telegram recibe el comando en `bot.py`.
+2. El comando analiza símbolo, intervalo, rango histórico, horizonte y opciones.
+3. `backtest_common.py` coordina la carga de velas históricas desde `bitunix_client.py`, el calentamiento de indicadores y la delimitación del período.
+4. `indicators.py` calcula series de indicadores.
+5. El módulo `strategy*.py` determina las señales sin conocer Telegram ni realizar llamadas a la API.
+6. El módulo `backtest*.py` simula entradas/salidas y calcula resultados.
+7. `risk_management.py` calcula tamaños orientativos de posición, PnL en USDT y estimaciones relacionadas con riesgo/margen para los informes.
+8. `xlsx_export*.py` genera el archivo Excel en memoria.
+9. `bot.py` envía el resumen y el Excel al chat de Telegram.
 
+**Principio de diseño:** los módulos de estrategia deben permanecer lo más puros posible: reciben datos numéricos ya ordenados y devuelven señales; no deben hacer peticiones a Telegram ni a Bitunix. Las simulaciones y exportadores se mantienen separados.
 
+## 5. Inventario de archivos
 
-## 1. Crear el bot en Telegram
+### `bot.py`
+Punto de entrada principal y capa de Telegram. Registra comandos, valida/normaliza argumentos, controla la autorización por `TELEGRAM_ALLOWED_USER_ID`, consulta datos a través del cliente, invoca backtests, formatea estadísticas y envía informes/Excel. También contiene las funciones de alertas y las operaciones privadas de cuenta.
 
-1. Habla con [@BotFather](https://t.me/BotFather) en Telegram.
-2. Envía `/newbot` y sigue las instrucciones.
-3. Copia el token que te entrega (algo como `123456789:ABC-...`).
+### `run_local.py`
+Entrada para ejecución local. Carga variables de entorno desde un archivo `.env` situado en la misma carpeta y después importa/ejecuta `bot.main()`.
 
-## 2. Instalar dependencias
+### `bitunix_client.py`
+Cliente HTTP para Bitunix. Consulta tickers y velas de mercado públicas y ofrece endpoints privados para balance, posiciones y órdenes. Gestiona la firma de solicitudes privadas. La carga de datos de mercado no necesita claves privadas; las funciones de cuenta/órdenes sí.
+
+### `indicators.py`
+Implementaciones numéricas de Bollinger, Estocástico, EMA, ATR y Canal de Keltner. Es la base compartida de indicadores. Los cambios aquí pueden afectar varias estrategias y deben validarse con pruebas de regresión.
+
+### `strategy.py`
+Reglas de la estrategia original Bollinger + Estocástico. Expone estructuras de señal/condiciones y funciones para evaluar la última vela, detectar señal y calcular niveles de take-profit por múltiplos de R.
+
+### `backtest.py`
+Motor de simulación y estadísticas de la estrategia original. Evalúa resultados de operaciones y escenarios con distintos ratios de take-profit.
+
+### `strategy_keltner.py`
+Reglas de la estrategia de cruces del Canal de Keltner. Incluye selección de cruces de bandas externas mediante `only_outer_bands` y objetos de estado/señal.
+
+### `backtest_kelner.py`
+Motor de backtest de Keltner. El nombre está escrito `kelner` en el repositorio y así lo importa `bot.py`. Calcula operaciones, resultados y curvas/escenarios por ratios.
+
+### `strategy_reversion.py`
+Reglas de entrada de la nueva estrategia de reversión Bollinger + Estocástico. Calcula la señal al cierre de la vela actual y determina stop y objetivo iniciales a partir del histórico disponible hasta esa vela.
+
+### `backtest_reversion.py`
+Simula las operaciones de reversión. Ejecuta al open de la siguiente vela, sigue stop/objetivo/horizonte, impide solapamiento de operaciones por símbolo y calcula estadísticas en R, porcentaje, profit factor y drawdown.
+
+### `backtest_common.py`
+Infraestructura compartida de backtesting: parseo de períodos, conversión de fechas UTC, descarga de velas, calentamiento y seguimiento, filtrado por período y filtros opcionales de densidad, espacio hasta banda contraria y anchura del canal.
+
+### `risk_management.py`
+Configuración común de riesgo y funciones para estimar tamaño de posición, PnL en USDT y margen. Las estimaciones de margen son aproximadas: el código documenta que no reproduce todos los tiers de mantenimiento, comisiones ni precio de marca de Bitunix.
+
+### `xlsx_export.py`
+Genera el libro Excel del backtest original. Incluye hojas de resumen, señales/operaciones, velas históricas, escenarios de riesgo y configuración de filtros.
+
+### `xlsx_export_keltner.py`
+Genera el libro Excel del backtest Keltner, con resumen, operaciones, velas, curva/escenarios y hoja de riesgo.
+
+### `xlsx_export_reversion.py`
+Genera el Excel del backtest de reversión con los resultados y operaciones de esa estrategia, más información de riesgo y datos históricos.
+
+### Archivos de estado creados en ejecución
+
+- `watchlist.json`: lista de símbolos para la función de watchlist; la ruta puede cambiar con `WATCHLIST_FILE`.
+- `alerts_watchlist.json`: lista de símbolos para alertas; la ruta puede cambiar con `ALERTS_FILE`.
+- `.env`: configuración local de secretos/variables de entorno. No debe subirse al control de versiones ni compartirse con una IA si contiene credenciales.
+
+Estos archivos no están incluidos necesariamente en el ZIP de código; se crean o configuran según la instalación.
+
+## 6. Configuración y dependencias
+
+Variables de entorno utilizadas:
+
+- `TELEGRAM_BOT_TOKEN`: token del bot de Telegram (obligatorio para ejecutar el bot).
+- `TELEGRAM_ALLOWED_USER_ID`: ID numérico de Telegram autorizado. Muy recomendado. Si no se define, el código permite el acceso a cualquier usuario a los comandos; no es adecuado para producción.
+- `BITUNIX_API_KEY`: clave API privada de Bitunix para operaciones de cuenta.
+- `BITUNIX_API_SECRET`: secreto API privado de Bitunix.
+- `WATCHLIST_FILE`: ruta opcional para la lista de símbolos de precio.
+- `ALERTS_FILE`: ruta opcional para la lista de alertas.
+- `PORT` y `RENDER_EXTERNAL_URL`: variables usadas para el despliegue en Render/webhook cuando corresponda.
+
+El ZIP actual no contiene `requirements.txt`. Por los imports del código, las dependencias externas principales son `python-telegram-bot`, `requests`, `python-dotenv` y `openpyxl`; la versión exacta compatible no está fijada en este README. Antes de preparar un despliegue reproducible conviene crear un `requirements.txt` con versiones probadas.
+
+Ejemplo de `.env` local (sustituir valores y no publicar este archivo):
+
+```dotenv
+TELEGRAM_BOT_TOKEN=REEMPLAZAR_CON_TOKEN
+TELEGRAM_ALLOWED_USER_ID=REEMPLAZAR_CON_ID_NUMERICO
+BITUNIX_API_KEY=
+BITUNIX_API_SECRET=
+```
+
+Instalación orientativa en un entorno virtual:
 
 ```bash
-python -m venv venv
-source venv/bin/activate  # en Windows: venv\Scripts\activate
-pip install -r requirements.txt
+python -m venv .venv
+# Windows PowerShell:
+.venv\Scripts\Activate.ps1
+# Linux/macOS:
+# source .venv/bin/activate
+python -m pip install python-telegram-bot requests python-dotenv openpyxl
+python run_local.py
 ```
 
-`requirements.txt` debe incluir el extra `job-queue` de
-`python-telegram-bot` (además de `webhooks`, que ya usas para Render):
+El bot también puede iniciarse con `python bot.py` si las variables de entorno ya están exportadas. `run_local.py` es preferible en local porque carga `.env`.
 
-```
-python-telegram-bot[webhooks,job-queue]==21.4
-requests==2.32.3
-```
+## 7. Limitaciones actuales que una IA debe conservar y señalar
 
-Sin el extra `job-queue` el bot arranca igual, pero las alertas
-automáticas de `/alerts` nunca se disparan solas (verás un aviso en los
-logs); `/alerts check` sí funciona siempre porque es manual.
+1. **Rentabilidad no demostrada.** Las estrategias son hipótesis de investigación, no recomendaciones financieras.
+2. **Costes incompletos.** Los backtests no descuentan de forma integral comisiones, funding ni deslizamiento. Los resultados deben considerarse preliminares hasta incorporarlos.
+3. **Datos OHLC.** Cuando una misma vela alcanza stop y objetivo, el orden intravela es desconocido; en reversión se adopta stop primero.
+4. **Riesgo/margen aproximado.** `risk_management.py` declara que la estimación no replica exactamente los tiers de margen de mantenimiento ni todos los detalles de Bitunix.
+5. **Temporalidad mensual.** `1M` está en la lista de intervalos aceptados, pero falta su duración en `INTERVAL_MS` para backtests por fechas.
+6. **Sin manifiesto de dependencias.** El proyecto no contiene `requirements.txt` en el paquete actual.
+7. **Pruebas limitadas.** No se incluye una suite formal de pruebas automatizadas en este paquete. Antes de afirmar que un cambio funciona, ejecutar compilación, pruebas unitarias y un smoke test con datos sintéticos; las pruebas de API real requieren credenciales/red y deben separarse de pruebas de órdenes.
+8. **No ejecutar operaciones reales para probar estrategias.** Usar backtests o entornos de prueba; los comandos `/open` y `/close` pueden actuar sobre la cuenta real de futuros.
+9. **Sin look-ahead.** Las señales se calculan con la información disponible al cierre de la vela de señal; cuando la estrategia lo define, la ejecución se hace en la siguiente apertura. No utilizar máximos, mínimos o indicadores futuros para decidir una entrada pasada.
+10. **No mezclar reglas entre estrategias.** Los filtros heredados de Bollinger/Keltner no deben aplicarse automáticamente a `/backtest_reversion`; el código actual los rechaza para ese comando.
 
-## 3. Configurar el token
+## 8. Próximas líneas de desarrollo acordadas
 
-```bash
-export TELEGRAM_BOT_TOKEN="tu_token_aqui"   # en Windows: set TELEGRAM_BOT_TOKEN=tu_token_aqui
-```
+La intención de investigación es desarrollar y comparar tres enfoques independientes:
 
-## 4. Ejecutar
+1. **Reversión:** Bollinger + Estocástico. Es el primer módulo experimental actual (`/backtest_reversion`).
+2. **Ruptura de volatilidad (Squeeze):** Bollinger + Keltner, buscando compresión seguida de ruptura. Aún no está implementada como estrategia separada en este paquete.
+3. **Continuación de tendencia:** retroceso en Keltner + Estocástico. Aún no está implementada como estrategia separada en este paquete.
 
-```bash
-python bot.py
-```
+La siguiente tarea es evaluar la estrategia de reversión con datos históricos y mejorar la calidad del backtest antes de desarrollar las otras dos. Se recomienda que toda nueva estrategia tenga su propio módulo `strategy_*.py`, motor `backtest_*.py` y exportador `xlsx_export_*.py`, reutilizando las utilidades comunes cuando la semántica coincida.
 
-## 5. Probar en Telegram
+## 9. Guía de trabajo para una IA que reciba este README
 
-Busca tu bot por su username y envía:
+Al continuar el desarrollo:
 
-- `/start` — mensaje de bienvenida
-- `/price` — precios de una watchlist por defecto (BTC, ETH, SOL, BNB, XRP)
-- `/price BTCUSDT` — precio de un par específico
-- `/price BTCUSDT ETHUSDT` — varios pares a la vez
-- `/indicators BTCUSDT` — estocástico y Bandas de Bollinger
-- `/alerts check BTCUSDT` — evaluar la estrategia ahora mismo
-- `/backtest BTCUSDT` — backtest rápido con los valores por defecto
+1. Lee primero `README.md`, `bot.py` y los módulos de la estrategia que se va a tocar.
+2. Inspecciona el código real antes de dar por cierta una descripción; este README resume el estado documentado y puede quedar desactualizado tras cambios futuros.
+3. Mantén cada estrategia aislada y evita alterar el comportamiento de comandos existentes sin una petición explícita.
+4. Antes de cambiar argumentos de Telegram, actualiza validación, mensajes de ayuda, ejemplos y pruebas.
+5. Evita introducir sesgo de anticipación: documenta cuándo se conoce la señal y cuándo se simula la ejecución.
+6. Incluye comisiones, deslizamiento y funding como parámetros explícitos cuando se implementen; no los supongas iguales a cero sin avisarlo.
+7. Prueba los casos de LONG, SHORT, stop, objetivo, salida por horizonte, operación pendiente, vela que toca stop y objetivo, fechas UTC y ausencia de datos suficientes.
+8. No inventes métricas de rentabilidad ni afirmes que una estrategia está validada sin ejecutar el backtest y analizar los resultados.
+9. Nunca incluyas tokens, claves privadas ni secretos en código, README, logs, Excel o mensajes.
+10. Si modificas archivos, actualiza este README para que siga sirviendo como contexto de transferencia a otra IA.
 
-### ⚠️ Si el deploy falla con `RuntimeError: There is no current event loop`
+---
 
-Render usa Python 3.14 por defecto en servicios nuevos, y
-`python-telegram-bot` 21.4 aún no es compatible con los cambios de
-`asyncio` en esa versión. El proyecto ya incluye un archivo
-`.python-version` que fija Python 3.12, así que si vuelves a ver este
-error:
-
-1. Revisa que el archivo `.python-version` esté en la raíz del repo
-   (no dentro de una subcarpeta) y contenga `3.12.7`.
-2. En Render, ve a **Environment** → agrega la variable
-   `PYTHON_VERSION` = `3.12.7` (esto tiene prioridad sobre el archivo
-   y es la forma más segura de forzarlo).
-3. Haz **Manual Deploy → Clear build cache & deploy** para que tome
-   la nueva versión.
-
-## 6. Desplegar en Render (gratis)
-
-El bot detecta automáticamente el entorno: en local corre con *polling*,
-y en Render cambia solo a modo *webhook* (usando la variable
-`RENDER_EXTERNAL_URL` que Render inyecta sola). No hay que tocar código
-para pasar de uno a otro.
-
-### Pasos
-
-1. **Sube el proyecto a GitHub** (repo público o privado, ambos sirven).
-
-2. En [render.com](https://render.com), crea cuenta y luego:
-   `New +` → `Web Service` → conecta tu repositorio.
-
-3. Configura el servicio:
-   - **Environment**: `Python 3`
-   - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `python bot.py`
-   - **Instance Type**: `Free`
-
-4. En la sección **Environment Variables**, agrega:
-   - `TELEGRAM_BOT_TOKEN` = tu token de @BotFather
-   - `TELEGRAM_ALLOWED_USER_ID` = tu user_id numérico de Telegram (muy recomendado)
-   - `BITUNIX_API_KEY` = tu API key de Bitunix (para comandos privados)
-   - `BITUNIX_API_SECRET` = tu secret key de Bitunix (para comandos privados)
-
-   (No necesitas definir `PORT` ni `RENDER_EXTERNAL_URL` — Render los
-   pone automáticamente.)
-
-5. Dale a **Create Web Service**. Render construye y despliega; revisa
-   los *logs* y deberías ver `Modo webhook (Render) -> https://...`.
-
-6. Prueba el bot en Telegram con `/start` y `/price`.
-
-### ⚠️ Limitación del plan gratis: se "duerme"
-
-Los Web Services gratis de Render se suspenden tras ~15 min sin
-recibir ninguna petición HTTP, y tardan uno o dos minutos en
-despertar cuando llega la siguiente. Para un bot esto significa que
-el primer mensaje después de un rato de inactividad puede tardar en
-responder — y que el job de `/alerts` (cada 4h y cada 1h) **no se ejecutará si
-la instancia está dormida en ese momento**, así que te puedes perder
-una revisión.
-
-**Solución simple:** usa un servicio gratuito de monitoreo (por
-ejemplo [UptimeRobot](https://uptimerobot.com)) para hacer un `GET`
-a la URL pública de tu servicio (`https://tu-bot.onrender.com`) cada
-5-10 minutos. Cualquier petición HTTP cuenta como actividad y evita
-que se duerma. La raíz `/` responde `200 OK` (GET y HEAD) gracias a
-`_enable_health_check()` en `bot.py`; sin eso, `python-telegram-bot` solo
-atiende `/webhook` y devolvería 404, que UptimeRobot interpreta como caído. Esto
-es especialmente importante ahora que usas `/alerts`, para que el bot
-esté despierto en los cierres de vela (cada hora para 1h; 00:00, 04:00,
-08:00, 12:00, 16:00, 20:00 UTC para 4h).
-
-Si el "sleep" se vuelve un problema serio, la alternativa es pasar a
-un plan pago de Render o a una VM propia.
-
-## Watchlist de `/price`
-
-La watchlist se guarda en `watchlist.json` (junto al bot) y se edita con
-`/watchlist add|remove|reset`. En Render (plan free) ese archivo sobrevive
-mientras la instancia siga "despierta" o duerma por inactividad, pero
-**se pierde en cada redeploy** (el disco no es persistente entre builds).
-Si quieres que sobreviva a los redeploys, la alternativa es guardarla en
-una base de datos pequeña (por ejemplo SQLite en un disco persistente de
-pago, o un servicio como Supabase/Upstash). Lo mismo aplica a
-`alerts_watchlist.json` (ver más abajo).
-
-## Indicadores técnicos (`/indicators`)
-
-La API de Bitunix no expone indicadores ya calculados (estocástico,
-Bollinger, RSI, etc.), solo el histórico de velas
-(`GET /api/v1/futures/market/kline`, endpoint público). Por eso
-`bitunix_client.py` solo añade `get_kline(...)` para traer esas velas, y
-todo el cálculo vive en `indicators.py`:
-
-- **Estocástico lento (14, 3, 3)** — el mismo ajuste por defecto que usa
-  la mayoría de plataformas de gráficos, incluida la app de Bitunix.
-- **Bandas de Bollinger (20, 2σ)** — media móvil simple de 20 velas ±2
-  desviaciones típicas.
-
-`/indicators BTCUSDT` usa el intervalo `1h` por defecto;
-`/indicators BTCUSDT 15m` usa velas de 15 minutos. Intervalos válidos:
-`1m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d 3d 1w 1M`.
-
-## Estrategia (4h y 1h) y alertas (`/alerts`)
-
-`strategy.py` implementa la estrategia de entrada (estocástico + Bollinger),
-que se evalúa tanto en velas de 4h como de 1h con los mismos parámetros. Reglas, evaluadas al cierre de cada vela:
-
-- **LONG**: la línea rápida del estocástico (%K) cruza hacia arriba a la
-  lenta (%D), y en las velas recientes anteriores al cruce %K estuvo en
-  zona de sobreventa (no hace falta que el cruce en sí ocurra dentro de
-  la zona). Además, el precio de cierre debe estar por debajo de la
-  banda media de Bollinger y más cerca de la banda inferior que de la
-  media.
-- **SHORT**: exactamente lo contrario (cruce hacia abajo, sobrecompra
-  reciente, precio por encima de la media y más cerca de la banda
-  superior).
-
-Filtros adicionales (aplican a LONG y SHORT, en alertas y en `/backtest`):
-
-- **Vela a favor:** la vela que da la señal debe ir en la dirección de la
-  operación — alcista (cierre > apertura) para LONG, bajista para SHORT.
-- **Objetivo 0.5:1 antes de la banda media:** el nivel del TP de ratio 0.5:1
-  (ver `take_profit_level`) debe quedar por debajo de la banda media de
-  Bollinger del momento de la señal en un LONG, o por encima en un SHORT.
-  Si el 0.5:1 ya cruzaría la media, no se entra.
-
-`detect_signal()` ahora recibe también las aperturas (`opens`) para evaluar la vela.
-
-Parámetros ajustables en `detect_signal()` (`strategy.py`): `oversold`/
-`overbought` (25/75 por defecto — una aproximación a "cerca de la zona";
-cámbialos a 20/80 si prefieres el umbral clásico) y `lookback` (10 velas,
-cuánto mirar hacia atrás buscando la sobreventa/sobrecompra previa).
-
-**Por ahora solo envía alertas — no abre operaciones.** El stop loss y los
-objetivos por ratio (0.5:1 y 1:1, ver más abajo) ya se simulan en
-`/backtest`, pero las alertas todavía no muestran el objetivo.
-
-Cómo usarlo:
-
-1. `/alerts add BTCUSDT` — añade símbolos a vigilar (se guardan en
-   `alerts_watchlist.json`, lista separada de la watchlist de `/price`).
-2. El bot revisa automáticamente cada símbolo vigilado al cierre de
-   **cada vela de 1h** (cada hora en punto, UTC) y **cada vela de 4h**
-   (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC). Requiere el extra
-   `job-queue` instalado (ver sección 2) y `TELEGRAM_ALLOWED_USER_ID`
-   configurado — sin esto el job no puede avisarte a nadie. En cada
-   revisión recibes:
-   - Si hay señal: el mensaje de alerta de siempre (indicando el plazo).
-   - **Siempre:** un resumen del plazo con una entrada por moneda: el lado
-     (LONG/SHORT) que más condiciones cumple, cada condición con ✅/❌ y
-     sus valores concretos, y una línea para el otro lado. Si el resumen
-     no cabe en un mensaje de Telegram, se divide en varios.
-3. `/alerts check [SIMBOLO] [4h|1h]` — el mismo resumen *ahora mismo*, sin
-   esperar al cierre real de la vela. Sin argumentos muestra todas las
-   monedas en ambos plazos.
-
-Las 5 condiciones por lado (todas deben cumplirse para que haya señal):
-cruce de %K/%D, sobreventa/sobrecompra reciente, cierre cerca de la banda
-inferior/superior, vela a favor y TP 0.5:1 antes de la banda media. El
-resumen se calcula con `evaluate_conditions()` (`strategy.py`), la misma
-función que usa `detect_signal()`, así que el resumen y la señal nunca
-discrepan.
-
-## Stop loss (mínimo/máximo local)
-
-Cada señal que da `detect_signal()` (en `strategy.py`) ahora trae un
-`stop_loss` calculado así:
-
-- **LONG**: el `low` más bajo de las últimas `sl_lookback` velas
-  (10 por defecto, incluida la vela de la señal) — el mínimo local que
-  marcó el precio en el movimiento de caída que precedió a la entrada.
-- **SHORT**: lo mismo pero con el `high` más alto (máximo local).
-
-`sl_lookback` es independiente del `lookback` que exige al estocástico
-haber estado en zona de sobrecompra/sobreventa — se pueden ajustar por
-separado.
-
-Esto aparece ahora en:
-- Las alertas de `/alerts` (`check_alerts_job` y `/alerts check`), con el
-  riesgo en % hasta ese stop.
-- El resumen y el detalle de `/backtest`, incluyendo **riesgo medio** y
-  **R-múltiplo medio** (`cambio_medio_pct ÷ riesgo_medio_pct` — cuántas
-  veces el riesgo asumido se movió el precio a favor, la forma estándar
-  de medir una estrategia que ya tiene un stop definido).
-- El Excel de `/backtest` (columnas `Stop loss`, `Riesgo %` y
-  `R-múltiplo` en la hoja "Señales").
-
-**Lo que todavía falta — y por qué lo dejé fuera por ahora:** este stop
-loss es un *nivel sugerido*, calculado localmente; no está todavía
-conectado a `place_order()` en `bitunix_client.py` para que la posición
-se abra con el stop ya puesto en Bitunix. La API sí soporta mandar un
-`slPrice` al abrir la orden, pero no logré confirmar con certeza en la
-documentación los valores exactos que esperan los campos `slTriggerType`
-/ `slOrderType` — y prefiero no adivinarlos en una función que mueve
-dinero real: si el campo está mal, el stop podría no quedar activado de
-verdad y no te enterarías hasta que ya fuera tarde. Por ahora, usa el
-`stop_loss` que te muestra la alerta como referencia para poner tú el
-SL manualmente en Bitunix (o dime y lo investigamos a fondo para
-automatizarlo con la certeza que amerita).
-
-El stop ya se usa en `/backtest` para cortar la operación (ver la sección
-siguiente). El nivel de objetivo por ratio se calcula con
-`take_profit_level()` en `strategy.py`, pensada para reutilizarla cuando se
-conecten las órdenes reales a Bitunix.
-
-## Backtest (`/backtest`)
-
-`/backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE]` — por ejemplo
-`/backtest BTCUSDT 4h 500 5` — recorre el histórico vela a vela aplicando
-`detect_signal()` en cada paso (solo con lo que "se sabría" hasta ese
-momento) y **simula cada operación completa**: entrada al cierre de la vela
-de la señal y, desde la vela siguiente, stop loss y objetivo.
-
-Valores por defecto: intervalo `4h`, 500 velas (~83 días), **sin límite de
-velas por operación** (el HORIZONTE es opcional). Tope de 1500 velas por consulta para que no se dispare el tiempo de
-respuesta.
-
-### Cómo se simula cada operación
-
-- **Stop loss:** si el precio toca el stop (mínimo local en LONG, máximo
-  local en SHORT), la operación se corta ahí y la pérdida es exactamente la
-  distancia entrada → stop (**-1R**).
-- **Dos escenarios de objetivo**, simulados por separado sobre las mismas
-  señales, para ver cuál da mejor resultado:
-  - **0.5:1** → objetivo a 0.5 veces la distancia entrada → stop (+0.5R).
-  - **1:1** → objetivo a 1 vez esa distancia (+1R).
-- **Qué cuenta como "llegar":** se revisan los máximos y mínimos de cada
-  vela, no solo el cierre. Si el objetivo se toca antes que el stop, la
-  operación gana el ratio completo. Si el stop va primero (o en la misma
-  vela que el objetivo), cuenta como stop.
-- **Horizonte (opcional):** sin él, cada operación dura hasta tocar su
-  objetivo o el stop; si el histórico se acaba antes, queda *pendiente*
-  (aún abierta). Con él (`/backtest BTCUSDT 4h 500 5`) es el máximo de
-  velas que se mantiene la operación: si pasan sin tocar ni stop ni
-  objetivo, se cierra al cierre de esa vela (puede salir en positivo o
-  negativo).
-- **Misma vela, stop y objetivo:** con velas OHLC no se puede saber cuál fue
-  primero; se asume el caso conservador (stop).
-- No incluye comisiones ni slippage.
-
-El resumen compara ambos escenarios para Total / LONG / SHORT (operaciones
-que llegan al objetivo, cortadas por stop, win rate, R total, R medio,
-cambio total en %) e indica cuál es mejor **por R medio por operación**.
-
-`get_kline_history()` en `bitunix_client.py` es quien trae el histórico:
-pagina hacia atrás en el tiempo en bloques de 200 velas (el máximo por
-request de la API) hasta reunir las que se pidan.
-
-### Excel con el detalle completo
-
-Después del resumen en texto, `/backtest` adjunta un archivo `.xlsx`
-(generado por `xlsx_export.py`, vía `openpyxl`) con tres hojas:
-
-- **Resumen** — metadatos de la corrida, un bloque de métricas por escenario (0.5:1 y 1:1) con Total/LONG/SHORT, el mejor escenario y las notas del cálculo.
-- **Señales** — una fila por cada señal: fecha, lado, precio, %K/%D, bandas, stop loss y riesgo %, y por cada escenario cinco columnas: nivel del **objetivo**, **"Llega a"** (el precio en que se cumple el ratio, o `no` si no llegó o el stop fue primero; `pendiente` si aún no hay velas para saberlo), **salida** (TP / SL / HORIZONTE / PENDIENTE), % de resultado y R. Con filtros automáticos en el encabezado.
-- **Velas** — el histórico OHLC completo que se usó para el backtest, por si quieres revisarlo o graficarlo aparte.
-
-Útil para ordenar/filtrar en Excel, graficar la curva de aciertos, o
-cruzar las señales con tus propios criterios — cosas que un mensaje de
-Telegram no permite.
-
-## Próximos pasos sugeridos
-
-- **Confirmar los campos exactos de `slPrice`/`slTriggerType` en
-  `place_order`** para poder adjuntar el stop loss automáticamente al
-  abrir la posición (ver sección "Stop loss" arriba).
-- **Elegir el objetivo definitivo** a partir de los resultados del
-  backtest (0.5:1 vs 1:1, o ajustar el ratio) y usar `take_profit_level()`
-  para calcular el take-profit de las órdenes reales a Bitunix.
-- ~~Backtest con salida real por stop~~ — hecho: el stop corta la operación
-  y se comparan los objetivos 0.5:1 y 1:1.
-- Pasar de "solo alerta" a abrir la operación automáticamente cuando hay
-  señal (reutilizando `place_order`, ya soportado por `bitunix_client.py`).
-- Historial de órdenes/trades (`get_history_orders`, `get_history_trades`).
+**Fin del documento de contexto.** Este archivo explica el propósito y las responsabilidades de los módulos; el código fuente sigue siendo la fuente definitiva para el comportamiento exacto.
