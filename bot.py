@@ -62,6 +62,8 @@ from backtest_kelner import (
 from xlsx_export_keltner import build_keltner_workbook
 from backtest_reversion import run_backtest as run_reversion_backtest, summarize as summarize_reversion, TP as REVERSION_TP, SL as REVERSION_SL, HORIZON as REVERSION_HORIZON, PENDING as REVERSION_PENDING
 from xlsx_export_reversion import build_reversion_workbook
+from backtest_squeeze import run_backtest as run_squeeze_backtest, summarize as summarize_squeeze, TP as SQUEEZE_TP, SL as SQUEEZE_SL, HORIZON as SQUEEZE_HORIZON, PENDING as SQUEEZE_PENDING
+from xlsx_export_squeeze import build_squeeze_workbook
 from backtest_common import (parse_backtest_request, load_backtest_klines, filter_signals_to_period, filter_signals_by_density, filter_signals_by_opposite_band, filter_signals_by_channel_width)
 from risk_management import RiskConfig
 
@@ -82,6 +84,7 @@ BOT_COMMANDS = [
     BotCommand("backtest", "Backtest Bollinger por velas o fechas"),
     BotCommand("backtest_keltner", "Backtest Keltner por velas o fechas"),
     BotCommand("backtest_reversion", "Backtest reversión Bollinger + Estocástico"),
+    BotCommand("backtest_squeeze", "Backtest Squeeze Bollinger + Keltner"),
     BotCommand("balance", "Balance de tu cuenta de futuros (/balance USDT)"),
     BotCommand("positions", "Ver posiciones abiertas (/positions BTCUSDT)"),
     BotCommand("open", "Abrir posición (/open BTCUSDT BUY 0.01)"),
@@ -238,7 +241,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE] - backtest por cantidad de velas\n"
         "/backtest SIMBOLO [INTERVALO] AAAA-MM-DD AAAA-MM-DD [HORIZONTE] - backtest por fechas UTC\n"
         "/backtest_keltner ... - backtest con Canal Keltner\n"
-        "/backtest_reversion ... - reversión a la media con Bollinger + Estocástico\n\n"
+        "/backtest_reversion ... - reversión a la media con Bollinger + Estocástico\n"
+        "/backtest_squeeze ... - ruptura Squeeze con Bollinger + Keltner\n\n"
         "Cuenta (requieren autorización):\n"
         "/balance [MONEDA] - balance de futuros (default USDT)\n"
         "/positions [SIMBOLO] - posiciones abiertas\n"
@@ -706,6 +710,80 @@ async def backtest_reversion_command(update: Update, context: ContextTypes.DEFAU
     filename = f"backtest_reversion_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
     await update.message.reply_document(document=workbook, filename=filename,
         caption=f"📊 Reversión Bollinger + Estocástico ({variant_label}): {len(trades)} operaciones; {symbol} ({interval}).")
+
+
+async def backtest_squeeze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Backtest de compresión y ruptura Bollinger/Keltner."""
+    try:
+        args, risk_config, filter_window, filter_limit, band_ratio, channel_width_pct, only_outer_bands = _parse_backtest_args(context.args)
+    except ValueError as exc:
+        await update.message.reply_text(f"⚠️ {exc}")
+        return
+    if filter_window is not None or band_ratio is not None or channel_width_pct is not None or only_outer_bands:
+        await update.message.reply_text("⚠️ Los filtros genéricos no se aplican a /backtest_squeeze; la estrategia utiliza sus propias reglas.")
+        return
+    if not args:
+        await update.message.reply_text(
+            "Estrategia Squeeze: Bollinger (20, 2) + Keltner (EMA 20, ATR 20 × 1.5).\n\n"
+            "Uso por cantidad: /backtest_squeeze BTCUSDT 1h 1000 [HORIZONTE]\n"
+            "Uso por período: /backtest_squeeze BTCUSDT 4h 2025-01-01 2025-06-30 [HORIZONTE]\n\n"
+            "Entrada: la vela anterior estaba comprimida (Bollinger dentro de Keltner), la actual libera la compresión, cierra fuera de ambas bandas y el momentum de 12 velas confirma la dirección.\n"
+            "Entrada en apertura siguiente; stop en extremo de 10 velas; objetivo fijo 2R. Una posición simultánea.\n"
+            "Fechas UTC. No incluye comisiones, funding ni deslizamiento. Riesgo opcional: --riesgo fijo 10 | --riesgo porcentaje 1 1000."
+        )
+        return
+    try:
+        request = parse_backtest_request(args, normalize_symbol=_normalize_symbol, default_interval="4h", max_candles=BACKTEST_MAX_CANDLES)
+    except ValueError as exc:
+        await update.message.reply_text(f"⚠️ {exc}")
+        return
+    symbol, interval, horizon = request.symbol, request.interval, request.horizon
+    if interval not in VALID_INTERVALS:
+        await update.message.reply_text(f"Intervalo {interval} no válido. Usa uno de: {' '.join(sorted(VALID_INTERVALS, key=len))}")
+        return
+    period_text = (f"período {datetime.fromtimestamp(request.start_ms/1000, tz=timezone.utc):%Y-%m-%d} → {datetime.fromtimestamp(request.end_ms/1000, tz=timezone.utc):%Y-%m-%d} UTC" if request.is_date_range else f"hasta {request.candle_count} velas recientes")
+    await update.message.reply_text(f"Descargando histórico de {symbol} ({interval}, {period_text}) y ejecutando Squeeze Bollinger + Keltner…")
+    try:
+        klines, signal_start, signal_end = load_backtest_klines(bitunix, request, warmup_candles=100, followup_candles=200)
+    except Exception as exc:
+        logger.exception("Error consultando histórico para backtest Squeeze")
+        await update.message.reply_text(f"⚠️ Error consultando histórico de Bitunix: {exc}")
+        return
+    if len(klines) < 45:
+        await update.message.reply_text(f"Solo hay {len(klines)} velas para {symbol} en {interval}; no es suficiente para el backtest.")
+        return
+    closes=[float(k["close"]) for k in klines]; highs=[float(k["high"]) for k in klines]
+    lows=[float(k["low"]) for k in klines]; opens=[float(k["open"]) for k in klines]; times=[int(k["time"]) for k in klines]
+    try:
+        all_trades=run_squeeze_backtest(closes,highs,lows,opens,times,horizon=horizon)
+        trades=filter_signals_to_period(all_trades,signal_start,signal_end); stats=summarize_squeeze(trades)
+    except Exception as exc:
+        logger.exception("Error calculando backtest Squeeze")
+        await update.message.reply_text(f"⚠️ Error calculando el backtest Squeeze: {exc}")
+        return
+    first_date=datetime.fromtimestamp(times[0]/1000,tz=timezone.utc).strftime("%Y-%m-%d"); last_date=datetime.fromtimestamp(times[-1]/1000,tz=timezone.utc).strftime("%Y-%m-%d")
+    period=(f"señales entre {datetime.fromtimestamp(signal_start/1000,tz=timezone.utc):%Y-%m-%d} → {datetime.fromtimestamp(signal_end/1000,tz=timezone.utc):%Y-%m-%d} UTC" if signal_start is not None else f"{len(klines)} velas ({first_date} → {last_date})")
+    header=(f"*Backtest Squeeze Bollinger + Keltner — {symbol} · {interval}*\n" f"Gestión de riesgo: {risk_config.label}.\n{period}; velas cargadas: {len(klines)}; " + (f"horizonte: {horizon} velas.\n" if horizon is not None else "sin límite de duración por operación.\n") + "Entrada: apertura siguiente; stop swing 10 velas; objetivo fijo 2R.\nCostes de trading no incluidos.\n\n")
+    if not trades:
+        await update.message.reply_text(header + "No se generaron operaciones válidas. Puede ser normal si no hubo liberaciones de compresión que cumplieran todas las condiciones.")
+        return
+    groups=[]
+    for label,key in (("TOTAL","total"),("LONG","long"),("SHORT","short")):
+        st=stats[key]; wr=f"{st['win_rate']:.1f}%" if st['win_rate'] is not None else "N/D"; avg=f"{st['r_medio']:+.2f}R" if st['r_medio'] is not None else "N/D"; total_r=f"{st['r_total']:+.2f}R" if st['r_total'] is not None else "N/D"; pf="∞" if st['profit_factor']==float('inf') else (f"{st['profit_factor']:.2f}" if st['profit_factor'] is not None else "N/D"); dd=f"{st['max_drawdown_r']:.2f}R" if st['max_drawdown_r'] is not None else "N/D"
+        groups.append(f"*{label}*: {st['total']} operaciones · {st['tp']} TP · {st['sl']} SL · {st['horizonte']} horizonte · {st['pendientes']} pendientes\nAcierto: {wr} · R total: {total_r} · R medio: {avg}\nProfit factor: {pf} · drawdown máximo: {dd}")
+    recent=[]
+    for t in trades[-6:]:
+        dt=datetime.fromtimestamp(t.entry_time/1000,tz=timezone.utc).strftime("%Y-%m-%d %H:%M"); icon="🟢" if t.side=="LONG" else "🔴"; result=f"{t.r_multiple:+.2f}R" if t.r_multiple is not None else t.outcome
+        recent.append(f"{icon} `{dt}` {t.side} entrada `{t.entry:.6g}` · SL `{t.stop_loss:.6g}` · TP `{t.target:.6g}` · {result}")
+    await update.message.reply_text(header+"\n\n".join(groups)+"\n\n_Últimas operaciones:_\n"+"\n".join(recent),parse_mode="Markdown")
+    try:
+        workbook=build_squeeze_workbook(symbol,interval,horizon,klines,trades,stats,risk_config)
+    except Exception:
+        logger.exception("Error generando Excel Squeeze")
+        await update.message.reply_text("⚠️ El backtest terminó, pero no se pudo generar el Excel.")
+        return
+    filename=f"backtest_squeeze_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
+    await update.message.reply_document(document=workbook,filename=filename,caption=f"📊 Squeeze Bollinger + Keltner: {len(trades)} operaciones; {symbol} ({interval}).")
 
 
 async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1425,6 +1503,7 @@ def main() -> None:
     application.add_handler(CommandHandler("backtest", backtest_command))
     application.add_handler(CommandHandler("backtest_keltner", backtest_keltner_command))
     application.add_handler(CommandHandler("backtest_reversion", backtest_reversion_command))
+    application.add_handler(CommandHandler("backtest_squeeze", backtest_squeeze_command))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("positions", positions))
     application.add_handler(CommandHandler("open", open_position))

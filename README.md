@@ -12,13 +12,14 @@ El proyecto debe permitir probar símbolos y temporalidades distintas. Los inter
 
 ## 2. Estado funcional actual
 
-Hay tres backtests registrados como comandos separados:
+Hay cuatro backtests registrados como comandos separados:
 
 1. `/backtest`: estrategia original basada en Bollinger + Estocástico.
 2. `/backtest_keltner`: estrategia de cruces del Canal de Keltner.
 3. `/backtest_reversion`: estrategia experimental de reversión a la media con Bollinger + Estocástico.
+4. `/backtest_squeeze`: ruptura tras compresión de volatilidad con Bollinger + Keltner.
 
-Las tres estrategias comparten cliente de datos de Bitunix, utilidades de carga de velas y parte de la infraestructura de gestión de riesgo/exportación, pero mantienen lógicas de entrada y simulación distintas.
+Las cuatro estrategias comparten cliente de datos de Bitunix, utilidades de carga de velas y parte de la infraestructura de gestión de riesgo/exportación, pero mantienen lógicas de entrada y simulación distintas.
 
 ### 2.1 Estrategia original: `/backtest`
 
@@ -93,6 +94,28 @@ Esta estrategia **no acepta los filtros heredados** `--filtro-rango`, `--filtro-
 
 No se debe describir esta estrategia como rentable hasta medirla con costes y en datos fuera de muestra.
 
+
+### 2.4 Squeeze Bollinger + Keltner: `/backtest_squeeze`
+
+Implementada de forma independiente en `strategy_squeeze.py`, `backtest_squeeze.py` y `xlsx_export_squeeze.py`. Busca rupturas posteriores a una compresión de volatilidad.
+
+Parámetros iniciales:
+- Bollinger: período 20, desviación 2.
+- Keltner: EMA 20, ATR 20 y multiplicador 1.5.
+- Momentum direccional: cambio del cierre respecto al de hace 12 velas.
+- Stop: mínimo/máximo de las últimas 10 velas, incluida la señal.
+- Objetivo: 2R fijo.
+
+Reglas de señal:
+- La vela anterior debe tener las bandas de Bollinger completamente dentro del Canal de Keltner (squeeze).
+- En la vela actual debe haberse liberado la compresión.
+- LONG: cierre por encima de las bandas superior de Bollinger y Keltner, con momentum positivo.
+- SHORT: cierre por debajo de las bandas inferiores de ambos canales, con momentum negativo.
+- La señal se calcula al cierre; la entrada se intenta en la apertura de la siguiente vela.
+- Si la apertura ya está más allá del stop, se descarta la entrada. Solo una operación simultánea; si una vela toca stop y objetivo, se considera stop primero.
+
+Es una definición inicial explícita para probar la hipótesis de ruptura, no una estrategia validada ni una promesa de rentabilidad. No incorpora comisiones, financiación ni deslizamiento. El comando rechaza filtros heredados que no forman parte de estas reglas.
+
 ## 3. Comandos de Telegram
 
 ### 3.1 Comandos generales
@@ -117,6 +140,7 @@ Formato por cantidad de velas:
 /backtest SIMBOLO INTERVALO NUM_VELAS [HORIZONTE]
 /backtest_keltner SIMBOLO INTERVALO NUM_VELAS [HORIZONTE]
 /backtest_reversion SIMBOLO INTERVALO NUM_VELAS [HORIZONTE] [--recuperacion-banda]
+/backtest_squeeze SIMBOLO INTERVALO NUM_VELAS [HORIZONTE]
 ```
 
 Formato por fechas UTC inclusivas:
@@ -125,12 +149,15 @@ Formato por fechas UTC inclusivas:
 /backtest SIMBOLO INTERVALO AAAA-MM-DD AAAA-MM-DD [HORIZONTE]
 /backtest_keltner SIMBOLO INTERVALO AAAA-MM-DD AAAA-MM-DD [HORIZONTE]
 /backtest_reversion SIMBOLO INTERVALO AAAA-MM-DD AAAA-MM-DD [HORIZONTE] [--recuperacion-banda]
+/backtest_squeeze SIMBOLO INTERVALO AAAA-MM-DD AAAA-MM-DD [HORIZONTE]
 ```
 
 Ejemplos:
 
 ```text
 /backtest_reversion BTCUSDT 4h 1000
+/backtest_squeeze BTCUSDT 1h 1000
+/backtest_squeeze ETHUSDT 4h 2025-01-01 2025-06-30
 /backtest_reversion ETHUSDT 15m 2025-01-01 2025-03-31
 /backtest_reversion BTCUSDT 4h 500 20
 /backtest_keltner BTCUSDT 4h 500 --solo-bandas-limite --filtro-banda 2
@@ -275,7 +302,7 @@ El bot también puede iniciarse con `python bot.py` si las variables de entorno 
 La intención de investigación es desarrollar y comparar tres enfoques independientes:
 
 1. **Reversión:** Bollinger + Estocástico. Es el primer módulo experimental actual (`/backtest_reversion`).
-2. **Ruptura de volatilidad (Squeeze):** Bollinger + Keltner, buscando compresión seguida de ruptura. Aún no está implementada como estrategia separada en este paquete.
+2. **Ruptura de volatilidad (Squeeze):** Bollinger + Keltner, implementada en `/backtest_squeeze`; hipótesis aún no validada.
 3. **Continuación de tendencia:** retroceso en Keltner + Estocástico. Aún no está implementada como estrategia separada en este paquete.
 
 La siguiente tarea es evaluar la estrategia de reversión con datos históricos y mejorar la calidad del backtest antes de desarrollar las otras dos. Se recomienda que toda nueva estrategia tenga su propio módulo `strategy_*.py`, motor `backtest_*.py` y exportador `xlsx_export_*.py`, reutilizando las utilidades comunes cuando la semántica coincida.
