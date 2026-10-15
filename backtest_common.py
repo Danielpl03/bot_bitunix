@@ -171,3 +171,32 @@ def filter_signals_by_opposite_band(results, min_ratio: float | None = None):
         else:
             rejected.append(signal)
     return accepted, rejected
+
+
+
+def filter_signals_by_channel_width(results, min_width_pct: float | None = None):
+    """Rechaza señales cuyo canal (Upper-Lower) sea demasiado estrecho.
+
+    Anchura porcentual = (upper - lower) / precio de entrada * 100.
+    Se acepta cuando la anchura es mayor o igual al mínimo configurado.
+    Devuelve (aceptadas, rechazadas).
+    """
+    if min_width_pct is None:
+        return list(results), []
+    if min_width_pct <= 0:
+        raise ValueError("El porcentaje mínimo de anchura del canal debe ser mayor que cero.")
+
+    accepted, rejected = [], []
+    for signal in results:
+        entry = float(signal.close)
+        lower = float(signal.lower)
+        upper = float(signal.upper)
+        if entry <= 0 or upper < lower:
+            rejected.append(signal)
+            continue
+        width_pct = (upper - lower) / entry * 100.0
+        if width_pct >= min_width_pct:
+            accepted.append(signal)
+        else:
+            rejected.append(signal)
+    return accepted, rejected

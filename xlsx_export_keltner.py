@@ -243,6 +243,15 @@ def build_keltner_workbook(symbol: str, interval: str, horizon: int | None,
         filter_ws.append(["Ratio mínimo de espacio hasta banda contraria", band_ratio])
         filter_ws.append(["Señales rechazadas por banda dentro del período", signal_filter.get("band_rejected", 0)])
         filter_ws.append(["Regla de banda", "LONG: Upper - entrada > ratio × riesgo. SHORT: entrada - Lower > ratio × riesgo. La desigualdad es estricta."])
+    only_outer_bands = bool(signal_filter and signal_filter.get("only_outer_bands"))
+    filter_ws.append(["Entradas solo en bandas límite", "Activado" if only_outer_bands else "Desactivado"])
+    filter_ws.append(["Regla de entrada", "LONG: cruce al alza de la banda inferior; SHORT: cruce a la baja de la banda superior." if only_outer_bands else "Keltner: se permite cruce al alza de banda inferior o media para LONG y cruce a la baja de banda superior o media para SHORT."])
+    width_pct = signal_filter.get("channel_width_pct") if signal_filter else None
+    filter_ws.append(["Filtro de anchura del canal", "Activado" if width_pct is not None else "Desactivado"])
+    if width_pct is not None:
+        filter_ws.append(["Anchura mínima del canal (% del precio de entrada)", width_pct])
+        filter_ws.append(["Señales rechazadas por anchura dentro del período", signal_filter.get("width_rejected", 0)])
+        filter_ws.append(["Regla de anchura", "Se acepta si (Upper - Lower) / precio de entrada × 100 es mayor o igual al mínimo configurado."])
     filter_ws.column_dimensions["A"].width = 45
     filter_ws.column_dimensions["B"].width = 100
     for ws in wb.worksheets:

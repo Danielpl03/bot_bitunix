@@ -95,6 +95,7 @@ def evaluate_conditions(
     ema_period: int = 20,
     atr_period: int = 10,
     multiplier: float = 2.0,
+    only_outer_bands: bool = False,
 ) -> KeltnerStatus | None:
     """
     Evalúa la última vela cerrada. Devuelve el estado de cada condición de
@@ -117,20 +118,24 @@ def evaluate_conditions(
     up_crossed = tuple(name for name, v in bands.items() if _crossed_up(open_, close, v))
     down_crossed = tuple(name for name, v in bands.items() if _crossed_down(open_, close, v))
 
-    long_ok = any(b in up_crossed for b in LONG_BANDS)
-    short_ok = any(b in down_crossed for b in SHORT_BANDS)
+    long_bands = ("lower",) if only_outer_bands else LONG_BANDS
+    short_bands = ("upper",) if only_outer_bands else SHORT_BANDS
+    long_ok = any(b in up_crossed for b in long_bands)
+    short_ok = any(b in down_crossed for b in short_bands)
 
     candle = f"apertura {open_:.6g} → cierre {close:.6g}"
+    long_rule = "Cruce al alza de banda inferior (límite)" if only_outer_bands else "Cruce al alza de banda inferior o media"
+    short_rule = "Cruce a la baja de banda superior (límite)" if only_outer_bands else "Cruce a la baja de banda superior o media"
     long_conditions = [
         Condition(
-            "Cruce al alza de banda inferior o media",
+            long_rule,
             long_ok,
             f"{candle} · inf {lower:.6g} · media {middle:.6g}",
         ),
     ]
     short_conditions = [
         Condition(
-            "Cruce a la baja de banda superior o media",
+            short_rule,
             short_ok,
             f"{candle} · sup {upper:.6g} · media {middle:.6g}",
         ),
@@ -153,12 +158,15 @@ def detect_signal(
     ema_period: int = 20,
     atr_period: int = 10,
     multiplier: float = 2.0,
+    only_outer_bands: bool = False,
 ) -> KeltnerSignal | None:
     """
     Devuelve la señal de la última vela cerrada (closes[-1] / opens[-1] /
     highs[-1] / lows[-1]) o None si no hay cruce válido (o faltan velas).
     Se apoya en `evaluate_conditions`, así que señal y resumen coinciden.
     """
-    status = evaluate_conditions(closes, highs, lows, opens, ema_period, atr_period, multiplier)
+    status = evaluate_conditions(
+        closes, highs, lows, opens, ema_period, atr_period, multiplier, only_outer_bands
+    )
     return status.signal if status is not None else None
     

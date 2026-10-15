@@ -154,6 +154,7 @@ def run_backtest(
     ema_period: int = 20,
     atr_period: int = 10,
     multiplier: float = 2.0,
+    only_outer_bands: bool = False,
 ) -> list[KeltnerBacktestSignal]:
     """
     Recorre el histórico vela a vela aplicando `detect_signal` solo con las
@@ -175,6 +176,7 @@ def run_backtest(
             ema_period=ema_period,
             atr_period=atr_period,
             multiplier=multiplier,
+            only_outer_bands=only_outer_bands,
         )
         if signal is None:
             continue

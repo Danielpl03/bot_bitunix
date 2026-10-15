@@ -354,6 +354,12 @@ def _write_signal_filter_sheet(ws, signal_filter: dict | None) -> None:
         ws.append(["Ratio mínimo de espacio hasta banda contraria", band_ratio])
         ws.append(["Señales rechazadas por banda dentro del período", signal_filter.get("band_rejected", 0)])
         ws.append(["Regla de banda", "LONG: Upper - entrada > ratio × riesgo. SHORT: entrada - Lower > ratio × riesgo. La desigualdad es estricta."])
+    width_pct = signal_filter.get("channel_width_pct") if signal_filter else None
+    ws.append(["Filtro de anchura del canal", "Activado" if width_pct is not None else "Desactivado"])
+    if width_pct is not None:
+        ws.append(["Anchura mínima del canal (% del precio de entrada)", width_pct])
+        ws.append(["Señales rechazadas por anchura dentro del período", signal_filter.get("width_rejected", 0)])
+        ws.append(["Regla de anchura", "Se acepta si (Upper - Lower) / precio de entrada × 100 es mayor o igual al mínimo configurado."])
     ws.column_dimensions["A"].width = 45
     ws.column_dimensions["B"].width = 100
     for cell in ws[1]:
