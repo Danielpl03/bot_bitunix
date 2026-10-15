@@ -60,6 +60,8 @@ from backtest_kelner import (
     summarize as summarize_keltner,
 )
 from xlsx_export_keltner import build_keltner_workbook
+from backtest_reversion import run_backtest as run_reversion_backtest, summarize as summarize_reversion, TP as REVERSION_TP, SL as REVERSION_SL, HORIZON as REVERSION_HORIZON, PENDING as REVERSION_PENDING
+from xlsx_export_reversion import build_reversion_workbook
 from backtest_common import (parse_backtest_request, load_backtest_klines, filter_signals_to_period, filter_signals_by_density, filter_signals_by_opposite_band, filter_signals_by_channel_width)
 from risk_management import RiskConfig
 
@@ -79,6 +81,7 @@ BOT_COMMANDS = [
     BotCommand("alerts", "Monedas vigiladas por la estrategia en 4h y 1h (add/remove/check)"),
     BotCommand("backtest", "Backtest Bollinger por velas o fechas"),
     BotCommand("backtest_keltner", "Backtest Keltner por velas o fechas"),
+    BotCommand("backtest_reversion", "Backtest reversión Bollinger + Estocástico"),
     BotCommand("balance", "Balance de tu cuenta de futuros (/balance USDT)"),
     BotCommand("positions", "Ver posiciones abiertas (/positions BTCUSDT)"),
     BotCommand("open", "Abrir posición (/open BTCUSDT BUY 0.01)"),
@@ -233,7 +236,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/indicators SIMBOLO [INTERVALO] - estocástico y Bandas de Bollinger\n"
         "/alerts - monedas vigiladas por la estrategia en 4h y 1h (add/remove/check)\n"
         "/backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE] - backtest por cantidad de velas\n"
-        "/backtest SIMBOLO [INTERVALO] AAAA-MM-DD AAAA-MM-DD [HORIZONTE] - backtest por fechas UTC\n\n"
+        "/backtest SIMBOLO [INTERVALO] AAAA-MM-DD AAAA-MM-DD [HORIZONTE] - backtest por fechas UTC\n"
+        "/backtest_keltner ... - backtest con Canal Keltner\n"
+        "/backtest_reversion ... - reversión a la media con Bollinger + Estocástico\n\n"
         "Cuenta (requieren autorización):\n"
         "/balance [MONEDA] - balance de futuros (default USDT)\n"
         "/positions [SIMBOLO] - posiciones abiertas\n"
@@ -577,6 +582,119 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     filename = f"backtest_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
     await update.message.reply_document(document=workbook_buffer, filename=filename, caption=f"📊 Detalle: {len(results)} señales operables; rechazos por agrupación {len(rejected_in_period)}, por banda {len(rejected_band_in_period)}, por anchura {len(rejected_width_in_period)}; {len(klines)} velas de {symbol} ({interval}).")
+
+
+async def backtest_reversion_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Backtest de reversión a la media: Bollinger + Estocástico."""
+    try:
+        args, risk_config, filter_window, filter_limit, band_ratio, channel_width_pct, only_outer_bands = _parse_backtest_args(context.args)
+    except ValueError as exc:
+        await update.message.reply_text(f"⚠️ {exc}")
+        return
+    if filter_window is not None or band_ratio is not None or channel_width_pct is not None or only_outer_bands:
+        await update.message.reply_text(
+            "⚠️ Los filtros de la estrategia anterior no se aplican a /backtest_reversion. "
+            "Este backtest usa sus propias reglas de entrada y salida."
+        )
+        return
+    if not args:
+        await update.message.reply_text(
+            "Estrategia de reversión a la media: Bollinger (20, 2) + Estocástico lento (14, 3, 3).\n\n"
+            "Uso por cantidad: /backtest_reversion BTCUSDT 4h 500 [HORIZONTE]\n"
+            "Uso por período: /backtest_reversion BTCUSDT 15m 2025-01-01 2025-01-31 [HORIZONTE]\n\n"
+            "LONG: cierre bajo la banda inferior + cruce alcista de %K/%D con ambos < 20.\n"
+            "SHORT: cierre sobre la banda superior + cruce bajista con ambos > 80.\n"
+            "Una sola posición simultánea por símbolo. Entrada a la apertura de la vela siguiente; stop en el extremo de las últimas 10 velas; "
+            "objetivo en la banda media calculada en la vela de señal.\n"
+            "HORIZONTE es opcional. Riesgo: --riesgo fijo 10 | --riesgo porcentaje 1 1000. "
+            "No incluye comisiones, funding ni deslizamiento."
+        )
+        return
+    try:
+        request = parse_backtest_request(args, normalize_symbol=_normalize_symbol, default_interval="4h", max_candles=BACKTEST_MAX_CANDLES)
+    except ValueError as exc:
+        await update.message.reply_text(f"⚠️ {exc}")
+        return
+    symbol, interval, horizon = request.symbol, request.interval, request.horizon
+    if interval not in VALID_INTERVALS:
+        await update.message.reply_text(f"Intervalo {interval} no válido. Usa uno de: {' '.join(sorted(VALID_INTERVALS, key=len))}")
+        return
+    period_text = (
+        f"período {datetime.fromtimestamp(request.start_ms / 1000, tz=timezone.utc):%Y-%m-%d} → "
+        f"{datetime.fromtimestamp(request.end_ms / 1000, tz=timezone.utc):%Y-%m-%d} UTC"
+        if request.is_date_range else f"hasta {request.candle_count} velas recientes"
+    )
+    await update.message.reply_text(f"Descargando histórico de {symbol} ({interval}, {period_text}) y ejecutando reversión Bollinger + Estocástico…")
+    try:
+        klines, signal_start, signal_end = load_backtest_klines(
+            bitunix, request, warmup_candles=100, followup_candles=200
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error consultando histórico para backtest de reversión")
+        await update.message.reply_text(f"⚠️ Error consultando histórico de Bitunix: {exc}")
+        return
+    if len(klines) < 40:
+        await update.message.reply_text(f"Solo hay {len(klines)} velas para {symbol} en {interval}; no es suficiente para el backtest.")
+        return
+    closes = [float(k["close"]) for k in klines]
+    highs = [float(k["high"]) for k in klines]
+    lows = [float(k["low"]) for k in klines]
+    opens = [float(k["open"]) for k in klines]
+    times = [int(k["time"]) for k in klines]
+    try:
+        all_trades = run_reversion_backtest(closes, highs, lows, opens, times, horizon=horizon)
+        trades = filter_signals_to_period(all_trades, signal_start, signal_end)
+        stats = summarize_reversion(trades)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Error calculando backtest de reversión")
+        await update.message.reply_text(f"⚠️ Error calculando el backtest de reversión: {exc}")
+        return
+    first_date = datetime.fromtimestamp(times[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    last_date = datetime.fromtimestamp(times[-1] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    period = (f"señales entre {datetime.fromtimestamp(signal_start / 1000, tz=timezone.utc):%Y-%m-%d} → "
+              f"{datetime.fromtimestamp(signal_end / 1000, tz=timezone.utc):%Y-%m-%d} UTC"
+              if signal_start is not None else f"{len(klines)} velas ({first_date} → {last_date})")
+    header = (
+        f"*Backtest Reversión Bollinger + Estocástico — {symbol} · {interval}*\n"
+        f"Gestión de riesgo: {risk_config.label}.\n{period}; velas cargadas: {len(klines)}; "
+        + (f"horizonte: {horizon} velas.\n" if horizon is not None else "sin límite de duración por operación.\n")
+        + "Entrada: apertura de la vela siguiente; objetivo: banda media fijada en la señal; máximo una posición simultánea.\n"
+        + "Costes de trading no incluidos.\n\n"
+    )
+    if not trades:
+        await update.message.reply_text(header + "No se generaron operaciones válidas en el período con las reglas actuales.")
+        return
+    groups = []
+    for label, key in (("TOTAL", "total"), ("LONG", "long"), ("SHORT", "short")):
+        st = stats[key]
+        wr = f"{st['win_rate']:.1f}%" if st["win_rate"] is not None else "N/D"
+        avg = f"{st['r_medio']:+.2f}R" if st["r_medio"] is not None else "N/D"
+        total_r = f"{st['r_total']:+.2f}R" if st["r_total"] is not None else "N/D"
+        pf = "∞" if st["profit_factor"] == float("inf") else (f"{st['profit_factor']:.2f}" if st["profit_factor"] is not None else "N/D")
+        dd = f"{st['max_drawdown_r']:.2f}R" if st["max_drawdown_r"] is not None else "N/D"
+        groups.append(
+            f"*{label}*: {st['total']} operaciones · {st['tp']} TP · {st['sl']} SL · "
+            f"{st['horizonte']} horizonte · {st['pendientes']} pendientes\n"
+            f"  Acierto: {wr} · R total: {total_r} · R medio: {avg}\n"
+            f"  Profit factor: {pf} · drawdown máximo: {dd}"
+        )
+    recent = trades[-6:]
+    recent_lines = []
+    for t in recent:
+        dt = datetime.fromtimestamp(t.entry_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        icon = "🟢" if t.side == "LONG" else "🔴"
+        result = f"{t.r_multiple:+.2f}R" if t.r_multiple is not None else t.outcome
+        recent_lines.append(f"{icon} `{dt}` {t.side} entrada `{t.entry:.6g}` · SL `{t.stop_loss:.6g}` · TP `{t.target:.6g}` · {result}")
+    await update.message.reply_text(header + "\n\n".join(groups) + "\n\n_Últimas operaciones:_\n" + "\n".join(recent_lines), parse_mode="Markdown")
+    try:
+        workbook = build_reversion_workbook(symbol, interval, horizon, klines, trades, stats, risk_config)
+    except Exception:  # noqa: BLE001
+        logger.exception("Error generando Excel del backtest de reversión")
+        await update.message.reply_text("⚠️ El backtest terminó, pero no se pudo generar el Excel.")
+        return
+    filename = f"backtest_reversion_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
+    await update.message.reply_document(document=workbook, filename=filename,
+        caption=f"📊 Reversión Bollinger + Estocástico: {len(trades)} operaciones; {symbol} ({interval}).")
 
 
 async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1295,6 +1413,7 @@ def main() -> None:
     application.add_handler(CommandHandler("alerts", alerts_command))
     application.add_handler(CommandHandler("backtest", backtest_command))
     application.add_handler(CommandHandler("backtest_keltner", backtest_keltner_command))
+    application.add_handler(CommandHandler("backtest_reversion", backtest_reversion_command))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("positions", positions))
     application.add_handler(CommandHandler("open", open_position))
