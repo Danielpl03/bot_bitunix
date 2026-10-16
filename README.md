@@ -107,19 +107,30 @@ Implementada de forma independiente en `strategy_dual_thrust.py`, `backtest_dual
 - `BuyTrack = Open_actual + K1 × Range`; `SellTrack = Open_actual - K2 × Range`.
 - Una ruptura intrabar alcista abre largo; una ruptura bajista abre corto. Si existe posición opuesta, se cierra y se invierte.
 - Valores iniciales: N=4, K1=0.6, K2=0.7. Son valores de partida dentro de los rangos sugeridos, no una optimización ni una garantía de rentabilidad.
-- Si una misma vela alcanza ambos niveles, se omite esa señal porque el OHLC no permite conocer el orden de los movimientos.
-- El trailing stop de 1.5 × ATR(14) se deja desactivado en la variante base porque la investigación lo plantea como protección opcional.
-- No se modelan comisiones, financiación ni deslizamiento. La variante base no define stop-loss, por lo que reporta retornos porcentuales y no calcula tamaño de posición por riesgo.
+- Si una misma vela alcanza ambos niveles, se omite la señal de ruptura porque OHLC no permite conocer el orden intrabar. Si vence un horizonte externo, la posición se cierra en la apertura de esa vela, incluso si la vela resulta ambigua.
+- Los precios de entrada/salida incluyen deslizamiento adverso configurable por lado. Las comisiones se descuentan del PnL neto de cada operación. Las tasas reales dependen de la cuenta y deben configurarse; no se inventa una tarifa Bitunix.
+- La financiación/funding no se modela porque requiere las tasas históricas aplicables al contrato y a cada instante.
+- El Excel incorpora PnL bruto (ya afectado por slippage), comisiones, deslizamiento estimado, PnL neto, rentabilidad compuesta y una hoja de curva de capital con drawdown calculado sobre máximos previos. La curva teórica supone reinvertir el 100% del capital por operación, sin apalancamiento; no es un cálculo de margen ni una simulación del saldo real de futuros.
+- Las posiciones abiertas al final se muestran como pendientes y no se incluyen en la rentabilidad realizada ni en la curva de capital.
+- El trailing stop de 1.5 × ATR(14) se deja desactivado en la variante base porque la investigación lo plantea como protección opcional. La estrategia tampoco define stop-loss ni tamaño de posición por riesgo.
 
 **Uso:**
 
 ```text
 /backtest_dual_thrust BTCUSDT 4h 1000
-/backtest_dual_thrust BTCUSDT 4h 1000 50 --n 4 --k1 0.6 --k2 0.7
-/backtest_dual_thrust BTCUSDT 4h 2025-01-01 2025-06-30 --n 4 --k1 0.6 --k2 0.7
+/backtest_dual_thrust BTCUSDT 4h 1000 50 --n 4 --k1 0.6 --k2 0.7 --fee-bps 5 --slippage-bps 2
+/backtest_dual_thrust BTCUSDT 4h 2025-01-01 2025-06-30 --n 4 --k1 0.6 --k2 0.7 --fee-bps 5 --slippage-bps 2
 ```
 
+`--fee-bps` y `--slippage-bps` son puntos básicos **por lado** (1 bp = 0,01 %); ambos valen 0 por defecto porque debes indicar una estimación acorde a tu cuenta y mercado. El ejemplo 5/2 es solo un escenario de prueba, no una afirmación sobre las tarifas de Bitunix.
+
 Los parámetros aceptan N entre 2 y 10, y K1/K2 entre 0.3 y 1.8, conforme a los rangos de búsqueda del documento. La estrategia utiliza su propio motor y no aplica los filtros genéricos de las demás estrategias.
+
+**Validación y comparación:**
+- Compara activos y temporalidades sobre exactamente las mismas fechas UTC, no sobre el mismo número de velas (1000 velas de 1h y 4h cubren horizontes distintos).
+- Reserva un tramo cronológico posterior como fuera de muestra. No ajustes parámetros usando ese tramo; ejecuta el mismo comando sobre ese rango solo después de fijar N/K1/K2.
+- Ejecuta primero sin costes para compararlo con resultados anteriores y luego con comisiones/deslizamiento realistas. Las estadísticas netas son las relevantes para valorar viabilidad.
+- Las pruebas automatizadas del motor están en `test_dual_thrust.py` y se ejecutan con `python -m unittest -v test_dual_thrust`.
 
 ### 2.4 Squeeze Bollinger + Keltner: `/backtest_squeeze`
 

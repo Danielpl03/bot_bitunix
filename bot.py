@@ -64,7 +64,7 @@ from backtest_reversion import run_backtest as run_reversion_backtest, summarize
 from xlsx_export_reversion import build_reversion_workbook
 from backtest_squeeze import run_backtest as run_squeeze_backtest, summarize as summarize_squeeze, TP as SQUEEZE_TP, SL as SQUEEZE_SL, HORIZON as SQUEEZE_HORIZON, PENDING as SQUEEZE_PENDING
 from xlsx_export_squeeze import build_squeeze_workbook
-from backtest_dual_thrust import run_backtest as run_dual_thrust_backtest, summarize as summarize_dual_thrust, PENDING as DUAL_THRUST_PENDING
+from backtest_dual_thrust import run_backtest as run_dual_thrust_backtest, summarize as summarize_dual_thrust, build_equity_curve as build_dual_thrust_equity_curve, PENDING as DUAL_THRUST_PENDING
 from xlsx_export_dual_thrust import build_dual_thrust_workbook
 from backtest_common import (parse_backtest_request, load_backtest_klines, filter_signals_to_period, filter_signals_by_density, filter_signals_by_opposite_band, filter_signals_by_channel_width)
 from risk_management import RiskConfig
@@ -794,18 +794,21 @@ async def backtest_dual_thrust_command(update: Update, context: ContextTypes.DEF
     """Backtest Dual Thrust con ruptura intrabar y reversión ante señal opuesta."""
     raw = list(context.args)
     lookback, k1, k2 = 4, 0.6, 0.7
+    fee_bps, slippage_bps = 0.0, 0.0
     positional = []
     i = 0
     try:
         while i < len(raw):
             token = raw[i].lower()
-            if token in ("--n", "--k1", "--k2"):
+            if token in ("--n", "--k1", "--k2", "--fee-bps", "--slippage-bps"):
                 if i + 1 >= len(raw):
                     raise ValueError(f"Falta el valor de {token}.")
                 value = raw[i + 1]
                 if token == "--n": lookback = int(value)
                 elif token == "--k1": k1 = float(value)
-                else: k2 = float(value)
+                elif token == "--k2": k2 = float(value)
+                elif token == "--fee-bps": fee_bps = float(value)
+                else: slippage_bps = float(value)
                 i += 2
             else:
                 positional.append(raw[i]); i += 1
@@ -816,6 +819,8 @@ async def backtest_dual_thrust_command(update: Update, context: ContextTypes.DEF
             raise ValueError("Dual Thrust no utiliza los filtros genéricos de otras estrategias.")
         if lookback < 2 or lookback > 10:
             raise ValueError("La ventana --n debe estar entre 2 y 10 según la investigación.")
+        if fee_bps < 0 or slippage_bps < 0:
+            raise ValueError("--fee-bps y --slippage-bps deben ser valores no negativos.")
         if not 0.3 <= k1 <= 1.8 or not 0.3 <= k2 <= 1.8:
             raise ValueError("K1 y K2 deben estar entre 0.3 y 1.8 según el rango de investigación.")
     except (ValueError, TypeError) as exc:
@@ -824,12 +829,12 @@ async def backtest_dual_thrust_command(update: Update, context: ContextTypes.DEF
     if not args:
         await update.message.reply_text(
             "Dual Thrust Breakout (según la investigación).\n\n"
-            "Uso por cantidad: /backtest_dual_thrust BTCUSDT 4h 1000 [HORIZONTE] [--n 4] [--k1 0.6] [--k2 0.7]\n"
-            "Uso por fechas: /backtest_dual_thrust BTCUSDT 4h 2025-01-01 2025-06-30 [HORIZONTE] [--n 4] [--k1 0.6] [--k2 0.7]\n\n"
+            "Uso por cantidad: /backtest_dual_thrust BTCUSDT 4h 1000 [HORIZONTE] [--n 4] [--k1 0.6] [--k2 0.7] [--fee-bps 5] [--slippage-bps 2]\n"
+            "Uso por fechas: /backtest_dual_thrust BTCUSDT 4h 2025-01-01 2025-06-30 [HORIZONTE] [--n 4] [--k1 0.6] [--k2 0.7] [--fee-bps 5] [--slippage-bps 2]\n\n"
             "Range = max(HH−LC, HC−LL), calculado con las N velas anteriores. BuyTrack = Open + K1×Range; SellTrack = Open − K2×Range. "
             "Rupturas intrabar; una ruptura contraria cierra e invierte la posición.\n"
             "Valores iniciales: N=4, K1=0.6, K2=0.7; son valores de partida dentro de los rangos investigados, no parámetros óptimos demostrados.\n"
-            "No incluye comisiones, financiación ni deslizamiento. El stop ATR de 1.5×ATR(14) queda desactivado en la variante base, ya que la investigación lo plantea como opcional."
+            "--fee-bps y --slippage-bps se aplican por lado; por defecto son 0 porque la tarifa real depende de tu cuenta. No incluye financiación. El stop ATR de 1.5×ATR(14) queda desactivado en la variante base."
         )
         return
     try:
@@ -855,7 +860,7 @@ async def backtest_dual_thrust_command(update: Update, context: ContextTypes.DEF
     closes=[float(k["close"]) for k in klines]; highs=[float(k["high"]) for k in klines]
     lows=[float(k["low"]) for k in klines]; opens=[float(k["open"]) for k in klines]; times=[int(k["time"]) for k in klines]
     try:
-        all_trades = run_dual_thrust_backtest(closes, highs, lows, opens, times, horizon=horizon, lookback=lookback, k1=k1, k2=k2)
+        all_trades = run_dual_thrust_backtest(closes, highs, lows, opens, times, horizon=horizon, lookback=lookback, k1=k1, k2=k2, fee_bps=fee_bps, slippage_bps=slippage_bps)
         trades = filter_signals_to_period(all_trades, signal_start, signal_end)
         stats = summarize_dual_thrust(trades)
     except Exception as exc:
@@ -864,11 +869,12 @@ async def backtest_dual_thrust_command(update: Update, context: ContextTypes.DEF
         return
     first_date=datetime.fromtimestamp(times[0]/1000,tz=timezone.utc).strftime("%Y-%m-%d"); last_date=datetime.fromtimestamp(times[-1]/1000,tz=timezone.utc).strftime("%Y-%m-%d")
     period=(f"señales entre {datetime.fromtimestamp(signal_start/1000,tz=timezone.utc):%Y-%m-%d} → {datetime.fromtimestamp(signal_end/1000,tz=timezone.utc):%Y-%m-%d} UTC" if signal_start is not None else f"{len(klines)} velas ({first_date} → {last_date})")
-    header=(f"*Backtest Dual Thrust Breakout — {symbol} · {interval}*\n" f"Parámetros: N={lookback}, K1={k1:g}, K2={k2:g}.\n{period}; velas cargadas: {len(klines)}; " + (f"horizonte externo: {horizon} velas.\n" if horizon is not None else "sin horizonte máximo.\n") + "Entrada por ruptura intrabar; reversión ante ruptura opuesta.\nCostes no incluidos; sin stop-loss en la variante base.\n\n")
+    header=(f"*Backtest Dual Thrust Breakout — {symbol} · {interval}*\n" f"Parámetros: N={lookback}, K1={k1:g}, K2={k2:g}.\n{period}; velas cargadas: {len(klines)}; " + (f"horizonte externo: {horizon} velas.\n" if horizon is not None else "sin horizonte máximo.\n") + f"Entrada por ruptura intrabar; reversión ante ruptura opuesta.\nComisión: {fee_bps:g} bps/lado; deslizamiento: {slippage_bps:g} bps/lado; financiación no incluida.\nSin stop-loss en la variante base.\n\n")
     groups=[]
     for label,key in (("TOTAL","total"),("LONG","long"),("SHORT","short")):
         st=stats[key]; wr=f"{st['win_rate']:.1f}%" if st['win_rate'] is not None else "N/D"; pnl=f"{st['pnl_pct_total']:+.2f}%" if st['pnl_pct_total'] is not None else "N/D"; avg=f"{st['pnl_pct_medio']:+.2f}%" if st['pnl_pct_medio'] is not None else "N/D"; pf="∞" if st['profit_factor']==float('inf') else (f"{st['profit_factor']:.2f}" if st['profit_factor'] is not None else "N/D"); dd=f"{st['max_drawdown_pct']:.2f}%" if st['max_drawdown_pct'] is not None else "N/D"
-        groups.append(f"*{label}*: {st['total']} operaciones · {st['reversiones']} reversiones · {st['horizonte']} horizonte · {st['pendientes']} pendientes\nAcierto: {wr} · PnL porcentual sumado: {pnl} · promedio: {avg}\nProfit factor: {pf} · drawdown máx. aproximado: {dd}")
+        comp=f"{st['pnl_pct_compuesto']:+.2f}%" if st['pnl_pct_compuesto'] is not None else "N/D"; costs=f"{st['costes_pct']:.2f}%" if st['costes_pct'] is not None else "N/D"; slipcost=f"{st['deslizamiento_pct']:.2f}%" if st['deslizamiento_pct'] is not None else "N/D"
+        groups.append(f"*{label}*: {st['total']} operaciones · {st['reversiones']} reversiones · {st['horizonte']} horizonte · {st['pendientes']} pendientes\nAcierto: {wr} · PnL neto sumado: {pnl} · compuesto: {comp} · comisiones: {costs} · deslizamiento estimado: {slipcost}\nPromedio: {avg} · Profit factor: {pf} · drawdown máx. sobre capital: {dd}")
     recent=[]
     for t in trades[-6:]:
         dt = datetime.fromtimestamp(t.entry_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
@@ -881,7 +887,7 @@ async def backtest_dual_thrust_command(update: Update, context: ContextTypes.DEF
         recent.append(f"{icon} `{dt}` {t.side} entrada `{t.entry:.6g}` · salida {exit_text} · {result}")
     await update.message.reply_text(header+"\n\n".join(groups)+("\n\n_Últimas operaciones:_\n"+"\n".join(recent) if recent else "\n\nNo se generaron operaciones."),parse_mode="Markdown")
     try:
-        workbook=build_dual_thrust_workbook(symbol,interval,horizon,klines,trades,stats,lookback,k1,k2)
+        workbook=build_dual_thrust_workbook(symbol,interval,horizon,klines,trades,stats,lookback,k1,k2,fee_bps=fee_bps,slippage_bps=slippage_bps, equity_curve=build_dual_thrust_equity_curve(trades))
     except Exception:
         logger.exception("Error generando Excel Dual Thrust")
         await update.message.reply_text("⚠️ El backtest terminó, pero no se pudo generar el Excel.")
