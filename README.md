@@ -18,6 +18,7 @@ Hay cuatro backtests registrados como comandos separados:
 2. `/backtest_keltner`: estrategia de cruces del Canal de Keltner.
 3. `/backtest_reversion`: estrategia experimental de reversión a la media con Bollinger + Estocástico.
 4. `/backtest_squeeze`: ruptura tras compresión de volatilidad con Bollinger + Keltner.
+5. `/backtest_dual_thrust`: ruptura de rango Dual Thrust con reversión ante señal opuesta.
 
 Las cuatro estrategias comparten cliente de datos de Bitunix, utilidades de carga de velas y parte de la infraestructura de gestión de riesgo/exportación, pero mantienen lógicas de entrada y simulación distintas.
 
@@ -94,6 +95,31 @@ Esta estrategia **no acepta los filtros heredados** `--filtro-rango`, `--filtro-
 
 No se debe describir esta estrategia como rentable hasta medirla con costes y en datos fuera de muestra.
 
+
+### 2.5 Dual Thrust Breakout: `/backtest_dual_thrust`
+
+Implementada de forma independiente en `strategy_dual_thrust.py`, `backtest_dual_thrust.py` y `xlsx_export_dual_thrust.py`, siguiendo el primer sistema de la investigación adjunta.
+
+**Reglas base:**
+- `HH`/`LL`: máximo/mínimo de los máximos/mínimos de las N velas anteriores.
+- `HC`/`LC`: máximo/mínimo de los cierres de las N velas anteriores.
+- `Range = max(HH - LC, HC - LL)`.
+- `BuyTrack = Open_actual + K1 × Range`; `SellTrack = Open_actual - K2 × Range`.
+- Una ruptura intrabar alcista abre largo; una ruptura bajista abre corto. Si existe posición opuesta, se cierra y se invierte.
+- Valores iniciales: N=4, K1=0.6, K2=0.7. Son valores de partida dentro de los rangos sugeridos, no una optimización ni una garantía de rentabilidad.
+- Si una misma vela alcanza ambos niveles, se omite esa señal porque el OHLC no permite conocer el orden de los movimientos.
+- El trailing stop de 1.5 × ATR(14) se deja desactivado en la variante base porque la investigación lo plantea como protección opcional.
+- No se modelan comisiones, financiación ni deslizamiento. La variante base no define stop-loss, por lo que reporta retornos porcentuales y no calcula tamaño de posición por riesgo.
+
+**Uso:**
+
+```text
+/backtest_dual_thrust BTCUSDT 4h 1000
+/backtest_dual_thrust BTCUSDT 4h 1000 50 --n 4 --k1 0.6 --k2 0.7
+/backtest_dual_thrust BTCUSDT 4h 2025-01-01 2025-06-30 --n 4 --k1 0.6 --k2 0.7
+```
+
+Los parámetros aceptan N entre 2 y 10, y K1/K2 entre 0.3 y 1.8, conforme a los rangos de búsqueda del documento. La estrategia utiliza su propio motor y no aplica los filtros genéricos de las demás estrategias.
 
 ### 2.4 Squeeze Bollinger + Keltner: `/backtest_squeeze`
 

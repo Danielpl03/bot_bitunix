@@ -64,6 +64,8 @@ from backtest_reversion import run_backtest as run_reversion_backtest, summarize
 from xlsx_export_reversion import build_reversion_workbook
 from backtest_squeeze import run_backtest as run_squeeze_backtest, summarize as summarize_squeeze, TP as SQUEEZE_TP, SL as SQUEEZE_SL, HORIZON as SQUEEZE_HORIZON, PENDING as SQUEEZE_PENDING
 from xlsx_export_squeeze import build_squeeze_workbook
+from backtest_dual_thrust import run_backtest as run_dual_thrust_backtest, summarize as summarize_dual_thrust, PENDING as DUAL_THRUST_PENDING
+from xlsx_export_dual_thrust import build_dual_thrust_workbook
 from backtest_common import (parse_backtest_request, load_backtest_klines, filter_signals_to_period, filter_signals_by_density, filter_signals_by_opposite_band, filter_signals_by_channel_width)
 from risk_management import RiskConfig
 
@@ -85,6 +87,7 @@ BOT_COMMANDS = [
     BotCommand("backtest_keltner", "Backtest Keltner por velas o fechas"),
     BotCommand("backtest_reversion", "Backtest reversión Bollinger + Estocástico"),
     BotCommand("backtest_squeeze", "Backtest Squeeze Bollinger + Keltner"),
+    BotCommand("backtest_dual_thrust", "Backtest ruptura de rango Dual Thrust"),
     BotCommand("balance", "Balance de tu cuenta de futuros (/balance USDT)"),
     BotCommand("positions", "Ver posiciones abiertas (/positions BTCUSDT)"),
     BotCommand("open", "Abrir posición (/open BTCUSDT BUY 0.01)"),
@@ -242,7 +245,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/backtest SIMBOLO [INTERVALO] AAAA-MM-DD AAAA-MM-DD [HORIZONTE] - backtest por fechas UTC\n"
         "/backtest_keltner ... - backtest con Canal Keltner\n"
         "/backtest_reversion ... - reversión a la media con Bollinger + Estocástico\n"
-        "/backtest_squeeze ... - ruptura Squeeze con Bollinger + Keltner\n\n"
+        "/backtest_squeeze ... - ruptura Squeeze con Bollinger + Keltner\n"
+        "/backtest_dual_thrust ... - ruptura de rango Dual Thrust\n\n"
         "Cuenta (requieren autorización):\n"
         "/balance [MONEDA] - balance de futuros (default USDT)\n"
         "/positions [SIMBOLO] - posiciones abiertas\n"
@@ -784,6 +788,100 @@ async def backtest_squeeze_command(update: Update, context: ContextTypes.DEFAULT
         return
     filename=f"backtest_squeeze_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
     await update.message.reply_document(document=workbook,filename=filename,caption=f"📊 Squeeze Bollinger + Keltner: {len(trades)} operaciones; {symbol} ({interval}).")
+
+
+async def backtest_dual_thrust_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Backtest Dual Thrust con ruptura intrabar y reversión ante señal opuesta."""
+    raw = list(context.args)
+    lookback, k1, k2 = 4, 0.6, 0.7
+    positional = []
+    i = 0
+    try:
+        while i < len(raw):
+            token = raw[i].lower()
+            if token in ("--n", "--k1", "--k2"):
+                if i + 1 >= len(raw):
+                    raise ValueError(f"Falta el valor de {token}.")
+                value = raw[i + 1]
+                if token == "--n": lookback = int(value)
+                elif token == "--k1": k1 = float(value)
+                else: k2 = float(value)
+                i += 2
+            else:
+                positional.append(raw[i]); i += 1
+        if "--riesgo" in [x.lower() for x in positional]:
+            raise ValueError("La variante base de Dual Thrust no define stop-loss; por eso no admite --riesgo para dimensionar posiciones. Se informa PnL porcentual.")
+        args, risk_config, filter_window, filter_limit, band_ratio, channel_width_pct, only_outer_bands = _parse_backtest_args(positional)
+        if filter_window is not None or band_ratio is not None or channel_width_pct is not None or only_outer_bands:
+            raise ValueError("Dual Thrust no utiliza los filtros genéricos de otras estrategias.")
+        if lookback < 2 or lookback > 10:
+            raise ValueError("La ventana --n debe estar entre 2 y 10 según la investigación.")
+        if not 0.3 <= k1 <= 1.8 or not 0.3 <= k2 <= 1.8:
+            raise ValueError("K1 y K2 deben estar entre 0.3 y 1.8 según el rango de investigación.")
+    except (ValueError, TypeError) as exc:
+        await update.message.reply_text(f"⚠️ {exc}")
+        return
+    if not args:
+        await update.message.reply_text(
+            "Dual Thrust Breakout (según la investigación).\n\n"
+            "Uso por cantidad: /backtest_dual_thrust BTCUSDT 4h 1000 [HORIZONTE] [--n 4] [--k1 0.6] [--k2 0.7]\n"
+            "Uso por fechas: /backtest_dual_thrust BTCUSDT 4h 2025-01-01 2025-06-30 [HORIZONTE] [--n 4] [--k1 0.6] [--k2 0.7]\n\n"
+            "Range = max(HH−LC, HC−LL), calculado con las N velas anteriores. BuyTrack = Open + K1×Range; SellTrack = Open − K2×Range. "
+            "Rupturas intrabar; una ruptura contraria cierra e invierte la posición.\n"
+            "Valores iniciales: N=4, K1=0.6, K2=0.7; son valores de partida dentro de los rangos investigados, no parámetros óptimos demostrados.\n"
+            "No incluye comisiones, financiación ni deslizamiento. El stop ATR de 1.5×ATR(14) queda desactivado en la variante base, ya que la investigación lo plantea como opcional."
+        )
+        return
+    try:
+        request = parse_backtest_request(args, normalize_symbol=_normalize_symbol, default_interval="4h", max_candles=BACKTEST_MAX_CANDLES)
+    except ValueError as exc:
+        await update.message.reply_text(f"⚠️ {exc}")
+        return
+    symbol, interval, horizon = request.symbol, request.interval, request.horizon
+    if interval not in VALID_INTERVALS:
+        await update.message.reply_text(f"Intervalo {interval} no válido. Usa uno de: {' '.join(sorted(VALID_INTERVALS, key=len))}")
+        return
+    period_text = (f"período {datetime.fromtimestamp(request.start_ms/1000, tz=timezone.utc):%Y-%m-%d} → {datetime.fromtimestamp(request.end_ms/1000, tz=timezone.utc):%Y-%m-%d} UTC" if request.is_date_range else f"hasta {request.candle_count} velas recientes")
+    await update.message.reply_text(f"Descargando histórico de {symbol} ({interval}, {period_text}) y ejecutando Dual Thrust…")
+    try:
+        klines, signal_start, signal_end = load_backtest_klines(bitunix, request, warmup_candles=max(lookback + 5, 20), followup_candles=200)
+    except Exception as exc:
+        logger.exception("Error consultando histórico para Dual Thrust")
+        await update.message.reply_text(f"⚠️ Error consultando histórico de Bitunix: {exc}")
+        return
+    if len(klines) < lookback + 2:
+        await update.message.reply_text(f"Solo hay {len(klines)} velas para {symbol} en {interval}; no es suficiente para Dual Thrust.")
+        return
+    closes=[float(k["close"]) for k in klines]; highs=[float(k["high"]) for k in klines]
+    lows=[float(k["low"]) for k in klines]; opens=[float(k["open"]) for k in klines]; times=[int(k["time"]) for k in klines]
+    try:
+        all_trades = run_dual_thrust_backtest(closes, highs, lows, opens, times, horizon=horizon, lookback=lookback, k1=k1, k2=k2)
+        trades = filter_signals_to_period(all_trades, signal_start, signal_end)
+        stats = summarize_dual_thrust(trades)
+    except Exception as exc:
+        logger.exception("Error calculando backtest Dual Thrust")
+        await update.message.reply_text(f"⚠️ Error calculando el backtest Dual Thrust: {exc}")
+        return
+    first_date=datetime.fromtimestamp(times[0]/1000,tz=timezone.utc).strftime("%Y-%m-%d"); last_date=datetime.fromtimestamp(times[-1]/1000,tz=timezone.utc).strftime("%Y-%m-%d")
+    period=(f"señales entre {datetime.fromtimestamp(signal_start/1000,tz=timezone.utc):%Y-%m-%d} → {datetime.fromtimestamp(signal_end/1000,tz=timezone.utc):%Y-%m-%d} UTC" if signal_start is not None else f"{len(klines)} velas ({first_date} → {last_date})")
+    header=(f"*Backtest Dual Thrust Breakout — {symbol} · {interval}*\n" f"Parámetros: N={lookback}, K1={k1:g}, K2={k2:g}.\n{period}; velas cargadas: {len(klines)}; " + (f"horizonte externo: {horizon} velas.\n" if horizon is not None else "sin horizonte máximo.\n") + "Entrada por ruptura intrabar; reversión ante ruptura opuesta.\nCostes no incluidos; sin stop-loss en la variante base.\n\n")
+    groups=[]
+    for label,key in (("TOTAL","total"),("LONG","long"),("SHORT","short")):
+        st=stats[key]; wr=f"{st['win_rate']:.1f}%" if st['win_rate'] is not None else "N/D"; pnl=f"{st['pnl_pct_total']:+.2f}%" if st['pnl_pct_total'] is not None else "N/D"; avg=f"{st['pnl_pct_medio']:+.2f}%" if st['pnl_pct_medio'] is not None else "N/D"; pf="∞" if st['profit_factor']==float('inf') else (f"{st['profit_factor']:.2f}" if st['profit_factor'] is not None else "N/D"); dd=f"{st['max_drawdown_pct']:.2f}%" if st['max_drawdown_pct'] is not None else "N/D"
+        groups.append(f"*{label}*: {st['total']} operaciones · {st['reversiones']} reversiones · {st['horizonte']} horizonte · {st['pendientes']} pendientes\nAcierto: {wr} · PnL porcentual sumado: {pnl} · promedio: {avg}\nProfit factor: {pf} · drawdown máx. aproximado: {dd}")
+    recent=[]
+    for t in trades[-6:]:
+        dt=datetime.fromtimestamp(t.entry_time/1000,tz=timezone.utc).strftime("%Y-%m-%d %H:%M"); icon="🟢" if t.side=="LONG" else "🔴"; result=f"{t.pnl_pct:+.2f}%" if t.pnl_pct is not None else t.exit_reason
+        recent.append(f"{icon} `{dt}` {t.side} entrada `{t.entry:.6g}` · salida `{t.exit_price:.6g}` · {result}")
+    await update.message.reply_text(header+"\n\n".join(groups)+("\n\n_Últimas operaciones:_\n"+"\n".join(recent) if recent else "\n\nNo se generaron operaciones."),parse_mode="Markdown")
+    try:
+        workbook=build_dual_thrust_workbook(symbol,interval,horizon,klines,trades,stats,lookback,k1,k2)
+    except Exception:
+        logger.exception("Error generando Excel Dual Thrust")
+        await update.message.reply_text("⚠️ El backtest terminó, pero no se pudo generar el Excel.")
+        return
+    filename=f"backtest_dual_thrust_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
+    await update.message.reply_document(document=workbook,filename=filename,caption=f"📊 Dual Thrust: {len(trades)} operaciones; {symbol} ({interval}).")
 
 
 async def backtest_keltner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1504,6 +1602,7 @@ def main() -> None:
     application.add_handler(CommandHandler("backtest_keltner", backtest_keltner_command))
     application.add_handler(CommandHandler("backtest_reversion", backtest_reversion_command))
     application.add_handler(CommandHandler("backtest_squeeze", backtest_squeeze_command))
+    application.add_handler(CommandHandler("backtest_dual_thrust", backtest_dual_thrust_command))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("positions", positions))
     application.add_handler(CommandHandler("open", open_position))
