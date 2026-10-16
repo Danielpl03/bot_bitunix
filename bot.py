@@ -871,8 +871,14 @@ async def backtest_dual_thrust_command(update: Update, context: ContextTypes.DEF
         groups.append(f"*{label}*: {st['total']} operaciones · {st['reversiones']} reversiones · {st['horizonte']} horizonte · {st['pendientes']} pendientes\nAcierto: {wr} · PnL porcentual sumado: {pnl} · promedio: {avg}\nProfit factor: {pf} · drawdown máx. aproximado: {dd}")
     recent=[]
     for t in trades[-6:]:
-        dt=datetime.fromtimestamp(t.entry_time/1000,tz=timezone.utc).strftime("%Y-%m-%d %H:%M"); icon="🟢" if t.side=="LONG" else "🔴"; result=f"{t.pnl_pct:+.2f}%" if t.pnl_pct is not None else t.exit_reason
-        recent.append(f"{icon} `{dt}` {t.side} entrada `{t.entry:.6g}` · salida `{t.exit_price:.6g}` · {result}")
+        dt = datetime.fromtimestamp(t.entry_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        icon = "🟢" if t.side == "LONG" else "🔴"
+        if t.exit_price is None:
+            exit_text = "— (posición abierta)"
+        else:
+            exit_text = f"`{t.exit_price:.6g}`"
+        result = f"{t.pnl_pct:+.2f}%" if t.pnl_pct is not None else t.exit_reason
+        recent.append(f"{icon} `{dt}` {t.side} entrada `{t.entry:.6g}` · salida {exit_text} · {result}")
     await update.message.reply_text(header+"\n\n".join(groups)+("\n\n_Últimas operaciones:_\n"+"\n".join(recent) if recent else "\n\nNo se generaron operaciones."),parse_mode="Markdown")
     try:
         workbook=build_dual_thrust_workbook(symbol,interval,horizon,klines,trades,stats,lookback,k1,k2)
