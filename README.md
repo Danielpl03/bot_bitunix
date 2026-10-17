@@ -119,10 +119,17 @@ Implementada de forma independiente en `strategy_dual_thrust.py`, `backtest_dual
 ```text
 /backtest_dual_thrust BTCUSDT 4h 1000
 /backtest_dual_thrust BTCUSDT 4h 1000 50 --n 4 --k1 0.6 --k2 0.7 --fee-bps 5 --slippage-bps 2
-/backtest_dual_thrust BTCUSDT 4h 2025-01-01 2025-06-30 --n 4 --k1 0.6 --k2 0.7 --fee-bps 5 --slippage-bps 2
+/backtest_dual_thrust BTCUSDT 4h 1000 --subintervalo 1h --n 4 --k1 0.6 --k2 0.7 --fee-bps 5 --slippage-bps 2
+/backtest_dual_thrust BTCUSDT 4h 2025-01-01 2025-06-30 --subintervalo 1h --n 4 --k1 0.6 --k2 0.7 --fee-bps 5 --slippage-bps 2
 ```
 
 `--fee-bps` y `--slippage-bps` son puntos básicos **por lado** (1 bp = 0,01 %); ambos valen 0 por defecto porque debes indicar una estimación acorde a tu cuenta y mercado. El ejemplo 5/2 es solo un escenario de prueba, no una afirmación sobre las tarifas de Bitunix.
+
+#### Ejecución con subvelas (`--subintervalo`)
+
+Se puede mantener la temporalidad de la estrategia y usar una temporalidad menor para reconstruir la secuencia intrabar. Por ejemplo, con `4h --subintervalo 1h`, los niveles Dual Thrust se calculan usando velas de 4h y cada vela de 4h se construye a partir de cuatro velas de 1h completas; las velas de 1h se recorren cronológicamente para ejecutar entradas y reversiones. Se admiten intervalos inferiores que dividan exactamente la temporalidad objetivo (por ejemplo, `4h` con `1h`, `30m` o `15m`). Las velas objetivo incompletas o con subvelas faltantes se descartan.
+
+Si una misma subvela inferior toca ambos niveles, el orden sigue siendo desconocido y esa subvela se omite; las subvelas posteriores de la misma vela objetivo se procesan normalmente. Si la subvela abre más allá del nivel de ruptura, la ejecución se simula en su apertura para reflejar el gap. Los timestamps de las operaciones corresponden a la temporalidad de ejecución, mientras que los niveles y el horizonte se calculan en la temporalidad objetivo.
 
 Los parámetros aceptan N entre 2 y 10, y K1/K2 entre 0.3 y 1.8, conforme a los rangos de búsqueda del documento. La estrategia utiliza su propio motor y no aplica los filtros genéricos de las demás estrategias.
 
@@ -130,7 +137,7 @@ Los parámetros aceptan N entre 2 y 10, y K1/K2 entre 0.3 y 1.8, conforme a los 
 - Compara activos y temporalidades sobre exactamente las mismas fechas UTC, no sobre el mismo número de velas (1000 velas de 1h y 4h cubren horizontes distintos).
 - Reserva un tramo cronológico posterior como fuera de muestra. No ajustes parámetros usando ese tramo; ejecuta el mismo comando sobre ese rango solo después de fijar N/K1/K2.
 - Ejecuta primero sin costes para compararlo con resultados anteriores y luego con comisiones/deslizamiento realistas. Las estadísticas netas son las relevantes para valorar viabilidad.
-- Las pruebas automatizadas del motor están en `test_dual_thrust.py` y se ejecutan con `python -m unittest -v test_dual_thrust`.
+- Las pruebas automatizadas están en `test_dual_thrust.py` y `test_dual_thrust_multitimeframe.py`; ejecuta `python -m unittest -v test_dual_thrust test_dual_thrust_multitimeframe`.
 
 ### 2.4 Squeeze Bollinger + Keltner: `/backtest_squeeze`
 

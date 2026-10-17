@@ -12,7 +12,7 @@ TITLE = Font(bold=True, size=14)
 
 
 def build_dual_thrust_workbook(symbol, interval, horizon, klines, trades, stats, lookback, k1, k2,
-                               *, fee_bps=0.0, slippage_bps=0.0, equity_curve=None):
+                               *, fee_bps=0.0, slippage_bps=0.0, equity_curve=None, execution_interval=None):
     wb = Workbook(); ws = wb.active; ws.title = "Resumen"
     ws["A1"] = f"Dual Thrust Breakout — {symbol} {interval}"; ws["A1"].font = TITLE; ws.merge_cells("A1:D1")
     first = datetime.fromtimestamp(int(klines[0]["time"])/1000, timezone.utc)
@@ -26,8 +26,8 @@ def build_dual_thrust_workbook(symbol, interval, horizon, klines, trades, stats,
         ("Financiación", "No incluida; requiere tasas históricas de funding"),
         ("Fórmula Range", "max(HH - LC, HC - LL) usando las N velas anteriores"),
         ("Niveles", "BuyTrack = Open actual + K1×Range; SellTrack = Open actual − K2×Range"),
-        ("Ejecución", "Ruptura intrabar; reversión ante ruptura opuesta; costes aplicados a cada ejecución"),
-        ("Barras ambiguas", "Si High alcanza BuyTrack y Low alcanza SellTrack, se ignora la señal de ruptura"),
+        ("Ejecución", (f"Niveles en {interval}; ejecución cronológica con subvelas {execution_interval}; reversión ante ruptura opuesta; costes aplicados por ejecución" if execution_interval else "Ruptura intrabar con OHLC de la vela objetivo; reversión ante ruptura opuesta; costes aplicados a cada ejecución")),
+        ("Barras ambiguas", (f"Si ambos niveles se tocan dentro de una misma subvela {execution_interval}, no se conoce el orden y esa subvela se omite; otras subvelas de la vela objetivo sí se procesan" if execution_interval else "Si High alcanza BuyTrack y Low alcanza SellTrack en la misma vela objetivo, se omite la señal por ambigüedad OHLC")),
         ("Capital / drawdown", "Curva teórica compuesta; supone 100% del capital por operación, sin apalancamiento; drawdown sobre máximos previos"),
         ("Posición pendiente", "Se excluye de retornos realizados y de la curva; no se marca a mercado"),
         ("Limitación", "OHLC no permite reconstruir la secuencia intrabar ni el libro de órdenes"),
