@@ -51,7 +51,7 @@ from backtest import (
     summarize,
 )
 from bitunix_client import DEFAULT_WATCHLIST, BitunixAPIError, BitunixClient
-from indicators import bollinger_bands, stochastic_oscillator
+from indicators import bollinger_bands, stochastic_oscillator, rsi_indicator
 from strategy import StrategyStatus, evaluate_conditions
 from xlsx_export import build_backtest_workbook
 from backtest_kelner import (
@@ -84,7 +84,7 @@ BOT_COMMANDS = [
     BotCommand("start", "Ver ayuda y todos los comandos"),
     BotCommand("price", "Precio de monedas (/price BTCUSDT)"),
     BotCommand("watchlist", "Ver o editar la watchlist de /price"),
-    BotCommand("indicators", "Estocástico y Bandas de Bollinger (/indicators BTCUSDT 1h)"),
+    BotCommand("indicators", "RSI, media RSI, Estocástico y Bandas de Bollinger (/indicators BTCUSDT 1h)"),
     BotCommand("alerts", "Monedas vigiladas por la estrategia en 4h y 1h (add/remove/check)"),
     BotCommand("backtest", "Backtest Bollinger por velas o fechas"),
     BotCommand("backtest_keltner", "Backtest Keltner por velas o fechas"),
@@ -243,7 +243,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/price - tu watchlist\n"
         "/price BTCUSDT - un par específico\n"
         "/watchlist - ver o editar tu watchlist (add/remove/reset)\n"
-        "/indicators SIMBOLO [INTERVALO] - estocástico y Bandas de Bollinger\n"
+        "/indicators SIMBOLO [INTERVALO] - RSI, media RSI, estocástico y Bandas de Bollinger\n"
         "/alerts - monedas vigiladas por la estrategia en 4h y 1h (add/remove/check)\n"
         "/backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE] - backtest por cantidad de velas\n"
         "/backtest SIMBOLO [INTERVALO] AAAA-MM-DD AAAA-MM-DD [HORIZONTE] - backtest por fechas UTC\n"
@@ -1436,13 +1436,17 @@ async def indicators_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     highs = [float(k["high"]) for k in klines]
     lows = [float(k["low"]) for k in klines]
 
+    volumes = [float(k.get("volume", 0) or 0) for k in klines]
     try:
         k_value, d_value = stochastic_oscillator(closes, highs, lows)
         lower, middle, upper = bollinger_bands(closes)
+        rsi_data = rsi_indicator(closes, rsi_period=14, ma_type="SMA", ma_period=14)
     except ValueError as exc:
         await update.message.reply_text(f"⚠️ {exc}")
         return
 
+    rsi_value = rsi_data["rsi"][-1]
+    rsi_ma_value = rsi_data["ma"][-1]
     last_close = closes[-1]
     stoch_emoji = "🟢" if k_value < 20 else "🔴" if k_value > 80 else "⚪"
     if last_close > upper:
@@ -1452,8 +1456,13 @@ async def indicators_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         bb_position = "dentro de las bandas"
 
+    rsi_emoji = "🔴" if rsi_value is not None and rsi_value >= 70 else "🟢" if rsi_value is not None and rsi_value <= 30 else "⚪"
     message = (
         f"*{symbol}* — {interval}\n\n"
+        f"*RSI (14, Wilder/RMA)*\n"
+        f"  RSI: `{rsi_value:.2f}` {rsi_emoji}\n"
+        f"  Media RSI (SMA 14): `{rsi_ma_value:.2f}`\n"
+        f"  Niveles: sobrecompra 70 · centro 50 · sobreventa 30\n\n"
         f"*Estocástico (14, 3, 3)*\n"
         f"  %K: `{k_value:.2f}`  %D: `{d_value:.2f}` {stoch_emoji}\n\n"
         f"*Bandas de Bollinger (20, 2σ)*\n"

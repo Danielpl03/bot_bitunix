@@ -5,6 +5,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 from risk_management import RiskConfig, calculate_position, scenario_pnl_usdt
+from indicators import rsi_indicator
 
 DARK=PatternFill('solid', fgColor='1F2937'); WHITE=Font(bold=True, color='FFFFFF'); BOLD=Font(bold=True); TITLE=Font(bold=True, size=14)
 
@@ -45,11 +46,18 @@ def build_rsi_workbook(symbol, interval, horizon, klines, trades, stats, risk_co
     for r in range(2,op.max_row+1):
         for c in (1,2,12): op.cell(r,c).number_format='yyyy-mm-dd hh:mm'
     candles=wb.create_sheet('Velas')
-    for c,h in enumerate(['Hora UTC','Open','High','Low','Close','Volumen'],1): candles.cell(1,c,h).fill=DARK; candles.cell(1,c).font=WHITE
-    for r,k in enumerate(klines,2):
-        vals=[datetime.fromtimestamp(int(k['time'])/1000,timezone.utc).replace(tzinfo=None),float(k['open']),float(k['high']),float(k['low']),float(k['close']),float(k.get('volume',0) or 0)]
+    candle_closes=[float(k['close']) for k in klines]
+    candle_volumes=[float(k.get('volume',0) or 0) for k in klines]
+    rsi_data=rsi_indicator(candle_closes, rsi_period=rsi_period, ma_type=ma_type, ma_period=ma_period, volume=candle_volumes)
+    headers=['Hora UTC','Open','High','Low','Close','Volumen','RSI','Media RSI','Banda RSI superior','Banda RSI inferior']
+    for c,h in enumerate(headers,1): candles.cell(1,c,h).fill=DARK; candles.cell(1,c).font=WHITE
+    for i,k in enumerate(klines):
+        r=i+2
+        vals=[datetime.fromtimestamp(int(k['time'])/1000,timezone.utc).replace(tzinfo=None),float(k['open']),float(k['high']),float(k['low']),float(k['close']),candle_volumes[i],rsi_data['rsi'][i],rsi_data['ma'][i],rsi_data['bb_upper'][i],rsi_data['bb_lower'][i]]
         for c,v in enumerate(vals,1): candles.cell(r,c,v)
         candles.cell(r,1).number_format='yyyy-mm-dd hh:mm'
+        for c in range(7,11):
+            candles.cell(r,c).number_format='0.00'
     candles.freeze_panes='A2'; candles.auto_filter.ref=candles.dimensions
-    for c,w in enumerate([20,16,16,16,16,18],1): candles.column_dimensions[get_column_letter(c)].width=w
+    for c,w in enumerate([20,16,16,16,16,18,12,14,20,20],1): candles.column_dimensions[get_column_letter(c)].width=w
     out=BytesIO(); wb.save(out); out.seek(0); return out
