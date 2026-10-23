@@ -191,13 +191,26 @@ Es una definición inicial explícita para probar la hipótesis de ruptura, no u
 - `/price [SIMBOLO]`: consulta precio/ticker.
 - `/watchlist`: ver o editar la lista de símbolos para `/price`.
 - `/indicators SIMBOLO [INTERVALO]`: muestra valores de indicadores.
-- `/alerts`: administra o consulta símbolos vigilados por alertas.
+- `/alerts`: administra o consulta símbolos vigilados por alertas de la estrategia clásica y RSI.
 - `/balance [MONEDA]`: consulta balance privado de futuros.
 - `/positions [SIMBOLO]`: consulta posiciones abiertas.
 - `/open SIMBOLO BUY|SELL CANTIDAD`: solicita abrir una posición; revisar cuidadosamente antes de usar.
 - `/close POSITION_ID`: solicita cerrar una posición; revisar cuidadosamente antes de usar.
 
 Los comandos privados requieren credenciales de Bitunix. El bot puede enviar botones de confirmación para las acciones de apertura/cierre; son operaciones potencialmente reales, no un simulador.
+
+#### Suscripciones del Job de alertas
+
+El Job programado revisa las estrategias al cierre de las velas de 1h y 4h. Las suscripciones de la estrategia clásica y RSI son independientes:
+
+- `/alerts add BTCUSDT` / `/alerts remove BTCUSDT`: estrategia clásica existente.
+- `/alerts rsi add BTCUSDT`: suscribe BTCUSDT a la estrategia RSI por regímenes en 1h y 4h.
+- `/alerts rsi remove BTCUSDT`: elimina esa suscripción RSI.
+- `/alerts rsi`: lista las monedas suscritas a RSI.
+- `/alerts rsi check [BTCUSDT] [1h|4h]`: consulta RSI/media y si hay una señal reciente.
+- `/alerts rsi reset`: vacía únicamente la lista RSI.
+
+La alerta RSI se evalúa sobre la última vela cerrada. Incluye LONG/SHORT, tipo de señal (giro RSI o cruce de la media), RSI, media, stop sugerido y objetivo teórico 2R. La entrada es de referencia para la apertura de la vela siguiente; el Job alerta, no ejecuta órdenes. Se guarda el último cierre procesado por símbolo e intervalo para evitar repetir la alerta de una misma vela.
 
 ### 3.2 Formato de backtests
 
@@ -309,7 +322,9 @@ Genera el Excel del backtest de reversión con los resultados y operaciones de e
 ### Archivos de estado creados en ejecución
 
 - `watchlist.json`: lista de símbolos para la función de watchlist; la ruta puede cambiar con `WATCHLIST_FILE`.
-- `alerts_watchlist.json`: lista de símbolos para alertas; la ruta puede cambiar con `ALERTS_FILE`.
+- `alerts_watchlist.json`: lista de símbolos de la estrategia clásica; ruta configurable con `ALERTS_FILE`.
+- `rsi_alerts_watchlist.json`: lista de símbolos suscritos a alertas RSI; ruta configurable con `RSI_ALERTS_FILE`.
+- `rsi_alert_state.json`: última vela procesada por símbolo/intervalo para evitar alertas RSI duplicadas; ruta configurable con `RSI_ALERT_STATE_FILE`.
 - `.env`: configuración local de secretos/variables de entorno. No debe subirse al control de versiones ni compartirse con una IA si contiene credenciales.
 
 Estos archivos no están incluidos necesariamente en el ZIP de código; se crean o configuran según la instalación.
@@ -323,7 +338,9 @@ Variables de entorno utilizadas:
 - `BITUNIX_API_KEY`: clave API privada de Bitunix para operaciones de cuenta.
 - `BITUNIX_API_SECRET`: secreto API privado de Bitunix.
 - `WATCHLIST_FILE`: ruta opcional para la lista de símbolos de precio.
-- `ALERTS_FILE`: ruta opcional para la lista de alertas.
+- `ALERTS_FILE`: ruta opcional para la lista de alertas de la estrategia clásica.
+- `RSI_ALERTS_FILE`: ruta opcional para la lista de suscripciones RSI.
+- `RSI_ALERT_STATE_FILE`: ruta opcional para el estado de deduplicación de alertas RSI.
 - `PORT` y `RENDER_EXTERNAL_URL`: variables usadas para el despliegue en Render/webhook cuando corresponda.
 
 El ZIP actual no contiene `requirements.txt`. Por los imports del código, las dependencias externas principales son `python-telegram-bot`, `requests`, `python-dotenv` y `openpyxl`; la versión exacta compatible no está fijada en este README. Antes de preparar un despliegue reproducible conviene crear un `requirements.txt` con versiones probadas.

@@ -53,6 +53,7 @@ from backtest import (
 from bitunix_client import DEFAULT_WATCHLIST, BitunixAPIError, BitunixClient
 from indicators import bollinger_bands, stochastic_oscillator, rsi_indicator
 from strategy import StrategyStatus, evaluate_conditions
+from strategy_rsi import generate_rsi_signals
 from xlsx_export import build_backtest_workbook
 from backtest_kelner import (
     KELTNER_TP_RATIOS,
@@ -85,7 +86,7 @@ BOT_COMMANDS = [
     BotCommand("price", "Precio de monedas (/price BTCUSDT)"),
     BotCommand("watchlist", "Ver o editar la watchlist de /price"),
     BotCommand("indicators", "RSI, media RSI, Estocástico y Bandas de Bollinger (/indicators BTCUSDT 1h)"),
-    BotCommand("alerts", "Monedas vigiladas por la estrategia en 4h y 1h (add/remove/check)"),
+    BotCommand("alerts", "Suscripciones de alertas Keltner y RSI (add/remove/check)"),
     BotCommand("backtest", "Backtest Bollinger por velas o fechas"),
     BotCommand("backtest_keltner", "Backtest Keltner por velas o fechas"),
     BotCommand("backtest_reversion", "Backtest reversión Bollinger + Estocástico"),
@@ -192,6 +193,54 @@ def _save_alerts_watchlist(symbols: list[str]) -> None:
 
 alerts_watchlist: list[str] = _load_alerts_watchlist()
 
+# Suscripción independiente para la estrategia RSI por regímenes.
+RSI_ALERTS_FILE = os.environ.get("RSI_ALERTS_FILE", "rsi_alerts_watchlist.json")
+RSI_ALERT_STATE_FILE = os.environ.get("RSI_ALERT_STATE_FILE", "rsi_alert_state.json")
+
+
+def _load_symbol_list(path: str) -> list[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list) and all(isinstance(s, str) for s in data):
+                return data
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return []
+
+
+def _save_symbol_list(path: str, symbols: list[str]) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(symbols, f)
+    except OSError:
+        logger.exception("No se pudo guardar la watchlist %s", path)
+
+
+rsi_alerts_watchlist: list[str] = _load_symbol_list(RSI_ALERTS_FILE)
+
+
+def _load_rsi_alert_state() -> dict[str, int]:
+    try:
+        with open(RSI_ALERT_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): int(v) for k, v in data.items()}
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return {}
+
+
+def _save_rsi_alert_state(state: dict[str, int]) -> None:
+    try:
+        with open(RSI_ALERT_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except OSError:
+        logger.exception("No se pudo guardar el estado de alertas RSI")
+
+
+rsi_alert_state: dict[str, int] = _load_rsi_alert_state()
+
 
 def _to_float(value) -> float | None:
     try:
@@ -244,7 +293,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/price BTCUSDT - un par específico\n"
         "/watchlist - ver o editar tu watchlist (add/remove/reset)\n"
         "/indicators SIMBOLO [INTERVALO] - RSI, media RSI, estocástico y Bandas de Bollinger\n"
-        "/alerts - monedas vigiladas por la estrategia en 4h y 1h (add/remove/check)\n"
+        "/alerts - suscripciones de alertas Keltner y RSI (4h y 1h)\n"
         "/backtest SIMBOLO [INTERVALO] [N_VELAS] [HORIZONTE] - backtest por cantidad de velas\n"
         "/backtest SIMBOLO [INTERVALO] AAAA-MM-DD AAAA-MM-DD [HORIZONTE] - backtest por fechas UTC\n"
         "/backtest_keltner ... - backtest con Canal Keltner\n"
@@ -287,6 +336,71 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     args = context.args
+
+    if args and args[0].lower() == "rsi":
+        subargs = args[1:]
+        if not subargs:
+            if rsi_alerts_watchlist:
+                message = "*Monedas suscritas a alertas RSI (1h y 4h):*\n" + "\n".join(
+                    f"• `{symbol}`" for symbol in rsi_alerts_watchlist
+                )
+            else:
+                message = "No hay monedas suscritas a la estrategia RSI.\nUsa `/alerts rsi add BTCUSDT`."
+            message += "\n\nComandos: `/alerts rsi add SIMBOLO`, `/alerts rsi remove SIMBOLO`, `/alerts rsi reset`, `/alerts rsi check [SIMBOLO] [1h|4h]`."
+            await update.message.reply_text(message, parse_mode="Markdown")
+            return
+
+        rsi_action = subargs[0].lower()
+        if rsi_action == "reset":
+            rsi_alerts_watchlist.clear()
+            _save_symbol_list(RSI_ALERTS_FILE, rsi_alerts_watchlist)
+            await update.message.reply_text("Watchlist de alertas RSI vaciada.")
+            return
+        if rsi_action == "check":
+            rest = [x.lower() if x.lower() in ALERT_INTERVALS else x for x in subargs[1:]]
+            intervals = [x for x in rest if x in ALERT_INTERVALS] or list(ALERT_INTERVALS)
+            symbols = [_normalize_symbol(x) for x in rest if x not in ALERT_INTERVALS]
+            symbols = symbols[:1] if symbols else list(rsi_alerts_watchlist)
+            if not symbols:
+                await update.message.reply_text("No hay monedas suscritas. Usa `/alerts rsi add BTCUSDT`.", parse_mode="Markdown")
+                return
+            for interval in intervals:
+                lines = [f"📊 *Estado RSI — {interval}*"]
+                for symbol in symbols:
+                    try:
+                        signal, candle_time, latest_rsi, latest_ma = _evaluate_rsi_alert_symbol(symbol, interval)
+                        line = f"*{symbol}*: RSI `{latest_rsi:.2f}` / media `{latest_ma:.2f}`" if latest_ma is not None else f"*{symbol}*: RSI `{latest_rsi:.2f}` / media no disponible"
+                        if signal:
+                            line += f" — señal *{signal.side}* ({signal.signal_type})"
+                        lines.append(line)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception("Error comprobando RSI para %s (%s)", symbol, interval)
+                        lines.append(f"⚠️ *{symbol}*: {_md_safe(exc)}")
+                await _send_chunks(update.message.reply_text, lines)
+            return
+        if rsi_action in ("add", "remove", "del") and len(subargs) < 2:
+            await update.message.reply_text(f"Uso: /alerts rsi {rsi_action} SIMBOLO")
+            return
+        if rsi_action == "add":
+            symbol = _normalize_symbol(subargs[1])
+            if symbol in rsi_alerts_watchlist:
+                await update.message.reply_text(f"`{symbol}` ya está suscrita a RSI.", parse_mode="Markdown")
+                return
+            rsi_alerts_watchlist.append(symbol)
+            _save_symbol_list(RSI_ALERTS_FILE, rsi_alerts_watchlist)
+            await update.message.reply_text(f"✅ RSI vigilará `{symbol}` en 1h y 4h y avisará cuando cierre una vela con señal.", parse_mode="Markdown")
+            return
+        if rsi_action in ("remove", "del"):
+            symbol = _normalize_symbol(subargs[1])
+            if symbol not in rsi_alerts_watchlist:
+                await update.message.reply_text(f"`{symbol}` no estaba suscrita a RSI.", parse_mode="Markdown")
+                return
+            rsi_alerts_watchlist.remove(symbol)
+            _save_symbol_list(RSI_ALERTS_FILE, rsi_alerts_watchlist)
+            await update.message.reply_text(f"🗑 RSI dejará de vigilar `{symbol}`.", parse_mode="Markdown")
+            return
+        await update.message.reply_text("Uso: /alerts rsi [add|remove|reset|check] [SIMBOLO] [1h|4h]")
+        return
 
     if not args:
         message = "*Watchlist actual:*\n" + "\n".join(f"• `{s}`" for s in watchlist)
@@ -1351,6 +1465,85 @@ def _build_status_blocks(symbols: list[str], interval: str) -> tuple[list[str], 
     return blocks, signals
 
 
+_INTERVAL_MILLISECONDS = {"1h": 60 * 60 * 1000, "4h": 4 * 60 * 60 * 1000}
+
+
+def _evaluate_rsi_alert_symbol(symbol: str, interval: str = "4h"):
+    """Evalúa la estrategia RSI en la última vela cerrada, no en la vela en curso."""
+    klines = bitunix.get_kline(symbol, interval=interval, limit=150)
+    if not klines:
+        raise ValueError("Bitunix no devolvió velas")
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    duration_ms = _INTERVAL_MILLISECONDS.get(interval)
+    closed = []
+    for candle in klines:
+        stamp = candle.get("time")
+        if stamp is None or duration_ms is None:
+            continue
+        stamp = int(stamp)
+        if stamp < 100_000_000_000:  # tolera timestamps Unix en segundos
+            stamp *= 1000
+        if stamp + duration_ms <= now_ms:
+            closed.append(candle)
+    if len(closed) < 40:
+        raise ValueError("no hay suficientes velas cerradas para calcular RSI y su media")
+
+    closes = [float(k["close"]) for k in closed]
+    highs = [float(k["high"]) for k in closed]
+    lows = [float(k["low"]) for k in closed]
+    signals = generate_rsi_signals(
+        closes, highs, lows, rsi_period=14, ma_type="SMA", ma_period=14,
+        sl_lookback=10, stop_mode="lookback", ignore_first_ma_cross=False,
+    )
+    indicator = rsi_indicator(closes, rsi_period=14, ma_type="SMA", ma_period=14)
+    latest_rsi = indicator["rsi"][-1]
+    latest_ma = indicator["ma"][-1]
+    if latest_rsi is None:
+        raise ValueError("RSI aún no está disponible")
+    stamp = int(closed[-1]["time"])
+    if stamp < 100_000_000_000:
+        stamp *= 1000
+    return signals[-1], stamp, float(latest_rsi), float(latest_ma) if latest_ma is not None else None
+
+
+def _format_rsi_signal_message(symbol: str, interval: str, signal) -> str:
+    side_label = "🟢 LONG" if signal.side == "LONG" else "🔴 SHORT"
+    stop_desc = "debajo del mínimo local" if signal.side == "LONG" else "encima del máximo local"
+    risk_pct = abs(signal.signal_close - signal.stop_loss) / signal.signal_close * 100 if signal.signal_close else 0
+    return (
+        f"🔔 *Señal RSI — {symbol}* ({side_label})\n\n"
+        f"Vela de {interval} cerrada. Tipo: *{signal.signal_type}*.\n"
+        f"RSI: `{signal.rsi:.2f}` · Media RSI: `{signal.rsi_ma:.2f}`\n"
+        f"Cierre de señal: `{signal.signal_close:.6g}`\n"
+        f"Stop sugerido ({stop_desc}): `{signal.stop_loss:.6g}` (riesgo aprox. {risk_pct:.2f}%).\n"
+        f"Objetivo teórico 2R: `{signal.target:.6g}`. Entrada de referencia: apertura de la vela siguiente."
+    )
+
+
+async def _check_rsi_alerts_job(context: ContextTypes.DEFAULT_TYPE, interval: str, send) -> None:
+    """Procesa las suscripciones RSI y evita repetir alertas de una misma vela."""
+    if not rsi_alerts_watchlist:
+        return
+    state_changed = False
+    for symbol in list(rsi_alerts_watchlist):
+        state_key = f"{symbol}|{interval}"
+        try:
+            signal, candle_time, latest_rsi, latest_ma = _evaluate_rsi_alert_symbol(symbol, interval)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Error evaluando alerta RSI para %s (%s)", symbol, interval)
+            continue
+        previous_time = rsi_alert_state.get(state_key)
+        if previous_time is not None and candle_time <= previous_time:
+            continue
+        # Marcamos la vela procesada aunque no haya señal, para no alertar tarde por velas antiguas.
+        rsi_alert_state[state_key] = candle_time
+        state_changed = True
+        if signal is not None:
+            await _send_chunks(send, [_format_rsi_signal_message(symbol, interval, signal)])
+    if state_changed:
+        _save_rsi_alert_state(rsi_alert_state)
+
+
 async def check_alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Se ejecuta al cierre de cada vela del plazo indicado en `job.data`
@@ -1360,7 +1553,7 @@ async def check_alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     interval = context.job.data if context.job is not None and context.job.data else "4h"
 
-    if not alerts_watchlist:
+    if not alerts_watchlist and not rsi_alerts_watchlist:
         return
     if ALLOWED_USER_ID is None:
         logger.warning("check_alerts_job: TELEGRAM_ALLOWED_USER_ID no está definido, no se puede avisar a nadie.")
@@ -1368,16 +1561,17 @@ async def check_alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     send = lambda **kw: context.bot.send_message(chat_id=ALLOWED_USER_ID, **kw)  # noqa: E731
 
-    blocks, signals = _build_status_blocks(list(alerts_watchlist), interval)
+    # Estrategia clásica ya suscrita mediante /alerts add.
+    if alerts_watchlist:
+        blocks, signals = _build_status_blocks(list(alerts_watchlist), interval)
+        for symbol, signal in signals:
+            await _send_chunks(send, [_format_signal_message(symbol, signal, interval)])
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        header = f"📊 *Resumen {interval}* — {now}"
+        await _send_chunks(send, [header] + blocks)
 
-    # 1) Alertas de señal, como antes (mensaje propio por moneda).
-    for symbol, signal in signals:
-        await _send_chunks(send, [_format_signal_message(symbol, signal, interval)])
-
-    # 2) Resumen del estado de todas las monedas, haya señal o no.
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    header = f"📊 *Resumen {interval}* — {now}"
-    await _send_chunks(send, [header] + blocks)
+    # Estrategia RSI por regímenes, suscripción independiente.
+    await _check_rsi_alerts_job(context, interval, send)
 
 
 def _next_boundary_utc(interval_hours: int) -> datetime:
