@@ -192,3 +192,180 @@ def keltner_channel(
     lower, middle, upper = keltner_series(closes, highs, lows, ema_period, atr_period, multiplier)
     return lower[-1], middle[-1], upper[-1]
     
+
+# --- RSI de TradingView (Pine Script v6) y medias sobre el RSI ---
+
+RSI_MA_TYPES = ("None", "SMA", "SMA + Bollinger Bands", "EMA", "SMMA (RMA)", "WMA", "VWMA")
+
+
+def _rma_aligned(values: list[float | None], period: int) -> list[float | None]:
+    """RMA de Wilder estilo ta.rma: semilla SMA y luego recurrencia de Wilder."""
+    if period < 1:
+        raise ValueError("El período de RMA debe ser >= 1.")
+    out: list[float | None] = [None] * len(values)
+    valid: list[float] = []
+    seed_index = None
+    for i, value in enumerate(values):
+        if value is None:
+            continue
+        valid.append(float(value))
+        if len(valid) == period:
+            seed_index = i
+            seed = sum(valid[-period:]) / period
+            out[i] = seed
+            previous = seed
+            break
+    if seed_index is None:
+        return out
+    for i in range(seed_index + 1, len(values)):
+        value = values[i]
+        if value is None:
+            out[i] = previous
+        else:
+            previous = (previous * (period - 1) + float(value)) / period
+            out[i] = previous
+    return out
+
+
+def rsi_series(source: list[float], period: int = 14) -> list[float | None]:
+    """
+    Calcula RSI como el indicador Relative Strength Index de TradingView/Pine:
+    change = ta.change(source); up/down suavizados con ta.rma (Wilder).
+
+    Devuelve una serie del mismo largo que source, alineada por vela. Los
+    primeros valores sin calentamiento son None. Con period=14, el primer
+    RSI válido aparece tras disponer de 14 cambios (normalmente índice 14).
+    """
+    if period < 1:
+        raise ValueError("RSI Length debe ser >= 1.")
+    if not source:
+        return []
+    changes: list[float | None] = [None]
+    for i in range(1, len(source)):
+        changes.append(float(source[i]) - float(source[i - 1]))
+    gains = [None if x is None else max(x, 0.0) for x in changes]
+    losses = [None if x is None else max(-x, 0.0) for x in changes]
+    avg_up = _rma_aligned(gains, period)
+    avg_down = _rma_aligned(losses, period)
+    out: list[float | None] = [None] * len(source)
+    for i, (up, down) in enumerate(zip(avg_up, avg_down)):
+        if up is None or down is None:
+            continue
+        # Mantiene el orden de condiciones del Pine de referencia.
+        if down == 0:
+            out[i] = 100.0
+        elif up == 0:
+            out[i] = 0.0
+        else:
+            out[i] = 100.0 - (100.0 / (1.0 + up / down))
+    return out
+
+
+def moving_average_series(
+    values: list[float | None],
+    period: int = 14,
+    ma_type: str = "SMA",
+    volume: list[float] | None = None,
+) -> list[float | None]:
+    """
+    Media móvil alineada sobre una serie (por ejemplo, el RSI), siguiendo las
+    opciones del Pine de referencia. Los valores iniciales no disponibles se
+    representan como None. VWMA requiere volumen alineado con values.
+    """
+    if period < 1:
+        raise ValueError("El período de la media móvil debe ser >= 1.")
+    if ma_type not in RSI_MA_TYPES:
+        raise ValueError(f"Tipo de media no válido: {ma_type}. Opciones: {', '.join(RSI_MA_TYPES)}")
+    if ma_type == "None":
+        return [None] * len(values)
+    if ma_type == "VWMA":
+        if volume is None or len(volume) != len(values):
+            raise ValueError("VWMA requiere una serie de volumen del mismo largo que el RSI.")
+
+    out: list[float | None] = [None] * len(values)
+    valid_indices: list[int] = []
+    valid_values: list[float] = []
+    ema_previous: float | None = None
+    rma_previous: float | None = None
+    alpha = 2.0 / (period + 1.0)
+    for i, value in enumerate(values):
+        if value is None:
+            continue
+        valid_indices.append(i)
+        valid_values.append(float(value))
+        n = len(valid_values)
+        if n < period:
+            continue
+        if ma_type in ("SMA", "SMA + Bollinger Bands"):
+            out[i] = sum(valid_values[-period:]) / period
+        elif ma_type == "WMA":
+            window = valid_values[-period:]
+            denom = period * (period + 1) / 2
+            out[i] = sum(v * weight for weight, v in enumerate(window, 1)) / denom
+        elif ma_type == "VWMA":
+            # Los valores None al inicio del RSI no entran a la ventana válida.
+            idx_window = valid_indices[-period:]
+            weights = [float(volume[j]) for j in idx_window]
+            denom = sum(weights)
+            out[i] = (sum(float(values[j]) * w for j, w in zip(idx_window, weights)) / denom
+                      if denom != 0 else None)
+        elif ma_type == "EMA":
+            if n == period:
+                ema_previous = sum(valid_values[:period]) / period
+            else:
+                ema_previous = alpha * float(value) + (1 - alpha) * float(ema_previous)
+            out[i] = ema_previous
+        elif ma_type == "SMMA (RMA)":
+            if n == period:
+                rma_previous = sum(valid_values[:period]) / period
+            else:
+                rma_previous = (float(rma_previous) * (period - 1) + float(value)) / period
+            out[i] = rma_previous
+    return out
+
+
+def rsi_indicator(
+    source: list[float],
+    rsi_period: int = 14,
+    ma_type: str = "SMA",
+    ma_period: int = 14,
+    *,
+    volume: list[float] | None = None,
+    bb_mult: float = 2.0,
+) -> dict[str, list[float | None] | float | str]:
+    """
+    Calcula RSI, su media configurable y, cuando se elige SMA + Bollinger
+    Bands, bandas +/- desviación típica poblacional * bb_mult.
+
+    Las series RSI/MA/bandas quedan alineadas con source. Incluye los niveles
+    fijos de TradingView (70/50/30) en la respuesta.
+    """
+    if bb_mult < 0.001 or bb_mult > 50:
+        raise ValueError("BB StdDev debe estar entre 0.001 y 50.")
+    rsi = rsi_series(source, rsi_period)
+    ma = moving_average_series(rsi, ma_period, ma_type, volume)
+    upper: list[float | None] = [None] * len(rsi)
+    lower: list[float | None] = [None] * len(rsi)
+    if ma_type == "SMA + Bollinger Bands":
+        valid: list[float] = []
+        for i, value in enumerate(rsi):
+            if value is None:
+                continue
+            valid.append(float(value))
+            if len(valid) >= ma_period and ma[i] is not None:
+                window = valid[-ma_period:]
+                mean = sum(window) / ma_period
+                variance = sum((x - mean) ** 2 for x in window) / ma_period
+                stdev = variance ** 0.5
+                upper[i] = float(ma[i]) + stdev * bb_mult
+                lower[i] = float(ma[i]) - stdev * bb_mult
+    return {
+        "rsi": rsi,
+        "ma": ma,
+        "bb_upper": upper,
+        "bb_lower": lower,
+        "upper_level": 70.0,
+        "middle_level": 50.0,
+        "lower_level": 30.0,
+        "ma_type": ma_type,
+    }

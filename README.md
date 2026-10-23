@@ -2,6 +2,28 @@
 
 > **Documento de contexto para desarrolladores e IA.** Este README describe la arquitectura, la responsabilidad de cada archivo, las reglas conocidas de las estrategias, los comandos disponibles y las limitaciones que deben conservarse al modificar el proyecto. Debe leerse antes de proponer o implementar cambios.
 
+## Estrategia RSI + media móvil del RSI: `/backtest_rsi`
+
+La capa de indicador está en `indicators.py`; la regla de señal, el motor y la exportación están aislados en `strategy_rsi.py`, `backtest_rsi.py` y `xlsx_export_rsi.py`. El RSI sigue la fórmula del Pine Script v6 de TradingView (RMA de Wilder); la media se calcula sobre el RSI y puede ser SMA, SMA + Bollinger Bands, EMA, SMMA/RMA, WMA o VWMA. VWMA utiliza el volumen de las velas.
+
+Reglas actuales:
+- Al entrar en sobrecompra (RSI >= 70), se habilitan únicamente SHORT hasta que RSI entre en sobreventa (RSI <= 30); al entrar en sobreventa se habilitan únicamente LONG hasta sobrecompra.
+- La primera entrada de cada régimen se genera por giro del RSI. Las entradas adicionales se generan con cruces RSI/media: LONG si RSI termina por debajo de 55; SHORT si termina por encima de 45.
+- Opcionalmente, `--omitir-primer-cruce` descarta el primer cruce RSI/media válido de cada régimen y permite señales de cruce desde el segundo.
+- Si el RSI sale de un extremo y vuelve a entrar en ese mismo extremo sin haber tocado el opuesto, se reinicia el giro inicial y el contador de cruces. Las operaciones que ya estaban abiertas no se cancelan por este reinicio.
+- Entrada en la apertura de la vela siguiente. Se permiten varias operaciones simultáneas. TP fijo 2R.
+- Stop por defecto en el mínimo/máximo de las últimas 10 velas, incluida la señal. Opcionalmente `--stop-mode pivot` utiliza el último pivote local confirmado; `--pivot-left` y `--pivot-right` determinan las velas a cada lado y `--pivot-buffer` define el colchón porcentual (por defecto 0.1%). Si no hay pivote confirmado, usa el extremo de la ventana como alternativa.
+- Si una vela toca stop y objetivo, se considera stop primero. No se modelan comisiones, funding ni deslizamiento.
+
+Ejemplos:
+- `/backtest_rsi BTCUSDT 4h 500`
+- `/backtest_rsi BTCUSDT 15m 2025-01-01 2025-01-31 --rsi 14 --tipo-media EMA --media 9 --stop 10`
+- `/backtest_rsi BTCUSDT 1h 1000 --stop-mode pivot --pivot-left 2 --pivot-right 2 --pivot-buffer 0.1 --omitir-primer-cruce`
+
+Parámetros: `--rsi N`, `--tipo-media SMA|EMA|RMA|WMA|VWMA|BB`, `--media N`, `--stop N`, `--stop-mode lookback|pivot`, `--pivot-left N`, `--pivot-right N`, `--pivot-buffer PORCENTAJE`, `--omitir-primer-cruce`. `--zonas-extremas` se conserva por compatibilidad, pero el régimen 30/70 ya forma parte de la estrategia. El comando produce estadísticas y un Excel con resumen, operaciones y velas. Las estrategias anteriores permanecen en sus propios módulos y comandos.
+
+Pruebas unitarias: `pytest -q` (incluye pruebas del indicador, regímenes, reinicio de extremo, pivotes, cruces opcionales y operaciones simultáneas).
+
 ## 1. Objetivo del proyecto
 
 El proyecto es un bot de Telegram escrito en Python que consulta datos de mercado de Bitunix, calcula indicadores técnicos, informa sobre señales y permite ejecutar backtests de varias estrategias sobre velas históricas. También incluye funciones para consultar datos privados de la cuenta de futuros y abrir/cerrar posiciones mediante Bitunix.
@@ -12,13 +34,14 @@ El proyecto debe permitir probar símbolos y temporalidades distintas. Los inter
 
 ## 2. Estado funcional actual
 
-Hay cuatro backtests registrados como comandos separados:
+Hay backtests registrados como comandos separados:
 
 1. `/backtest`: estrategia original basada en Bollinger + Estocástico.
 2. `/backtest_keltner`: estrategia de cruces del Canal de Keltner.
 3. `/backtest_reversion`: estrategia experimental de reversión a la media con Bollinger + Estocástico.
 4. `/backtest_squeeze`: ruptura tras compresión de volatilidad con Bollinger + Keltner.
 5. `/backtest_dual_thrust`: ruptura de rango Dual Thrust con reversión ante señal opuesta.
+6. `/backtest_rsi`: estrategia RSI por regímenes 30/70, giro inicial y cruces RSI/media opcionales.
 
 Las cuatro estrategias comparten cliente de datos de Bitunix, utilidades de carga de velas y parte de la infraestructura de gestión de riesgo/exportación, pero mantienen lógicas de entrada y simulación distintas.
 

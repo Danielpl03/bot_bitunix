@@ -62,6 +62,8 @@ from backtest_kelner import (
 from xlsx_export_keltner import build_keltner_workbook
 from backtest_reversion import run_backtest as run_reversion_backtest, summarize as summarize_reversion, TP as REVERSION_TP, SL as REVERSION_SL, HORIZON as REVERSION_HORIZON, PENDING as REVERSION_PENDING
 from xlsx_export_reversion import build_reversion_workbook
+from backtest_rsi import run_backtest as run_rsi_backtest, summarize as summarize_rsi, TP as RSI_TP, SL as RSI_SL, HORIZON as RSI_HORIZON, PENDING as RSI_PENDING
+from xlsx_export_rsi import build_rsi_workbook
 from backtest_squeeze import run_backtest as run_squeeze_backtest, summarize as summarize_squeeze, TP as SQUEEZE_TP, SL as SQUEEZE_SL, HORIZON as SQUEEZE_HORIZON, PENDING as SQUEEZE_PENDING
 from xlsx_export_squeeze import build_squeeze_workbook
 from backtest_dual_thrust import run_backtest as run_dual_thrust_backtest, summarize as summarize_dual_thrust, build_equity_curve as build_dual_thrust_equity_curve, PENDING as DUAL_THRUST_PENDING
@@ -87,6 +89,7 @@ BOT_COMMANDS = [
     BotCommand("backtest", "Backtest Bollinger por velas o fechas"),
     BotCommand("backtest_keltner", "Backtest Keltner por velas o fechas"),
     BotCommand("backtest_reversion", "Backtest reversión Bollinger + Estocástico"),
+    BotCommand("backtest_rsi", "Backtest RSI por zonas extremas"),
     BotCommand("backtest_squeeze", "Backtest Squeeze Bollinger + Keltner"),
     BotCommand("backtest_dual_thrust", "Backtest ruptura de rango Dual Thrust"),
     BotCommand("balance", "Balance de tu cuenta de futuros (/balance USDT)"),
@@ -246,6 +249,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/backtest SIMBOLO [INTERVALO] AAAA-MM-DD AAAA-MM-DD [HORIZONTE] - backtest por fechas UTC\n"
         "/backtest_keltner ... - backtest con Canal Keltner\n"
         "/backtest_reversion ... - reversión a la media con Bollinger + Estocástico\n"
+        "/backtest_rsi ... - estrategia RSI por regímenes de sobrecompra/sobreventa\n"
         "/backtest_squeeze ... - ruptura Squeeze con Bollinger + Keltner\n"
         "/backtest_dual_thrust ... - ruptura de rango Dual Thrust\n\n"
         "Cuenta (requieren autorización):\n"
@@ -715,6 +719,110 @@ async def backtest_reversion_command(update: Update, context: ContextTypes.DEFAU
     filename = f"backtest_reversion_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
     await update.message.reply_document(document=workbook, filename=filename,
         caption=f"📊 Reversión Bollinger + Estocástico ({variant_label}): {len(trades)} operaciones; {symbol} ({interval}).")
+
+
+async def backtest_rsi_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Backtest independiente de cruce RSI + media del RSI."""
+    raw = list(context.args)
+    params = {"rsi_period": 14, "ma_period": 14, "ma_type": "SMA", "sl_lookback": 10, "stop_mode": "lookback", "pivot_left": 2, "pivot_right": 2, "pivot_buffer_pct": 0.1, "ignore_first_ma_cross": False}
+    use_extreme_filter = False
+    positional = []
+    i = 0
+    try:
+        while i < len(raw):
+            token = raw[i].lower()
+            if token == "--zonas-extremas":
+                use_extreme_filter = True; i += 1; continue
+            if token == "--omitir-primer-cruce":
+                params["ignore_first_ma_cross"] = True; i += 1; continue
+            if token in ("--rsi", "--media", "--tipo-media", "--stop", "--stop-mode", "--pivot-left", "--pivot-right", "--pivot-buffer"):
+                if i + 1 >= len(raw):
+                    raise ValueError(f"Falta el valor después de {raw[i]}.")
+                value = raw[i + 1]
+                if token == "--stop-mode":
+                    mode = value.lower()
+                    if mode not in ("pivot", "lookback"):
+                        raise ValueError("--stop-mode acepta pivot o lookback.")
+                    params["stop_mode"] = mode
+                elif token == "--tipo-media":
+                    ma_types = {"none":"None", "sma":"SMA", "ema":"EMA", "rma":"SMMA (RMA)", "smma":"SMMA (RMA)", "wma":"WMA", "vwma":"VWMA", "bb":"SMA + Bollinger Bands"}
+                    if value.lower() not in ma_types:
+                        raise ValueError("--tipo-media acepta SMA, EMA, RMA, WMA, VWMA, BB o None.")
+                    params["ma_type"] = ma_types[value.lower()]
+                else:
+                    key = {"--rsi":"rsi_period", "--media":"ma_period", "--stop":"sl_lookback", "--pivot-left":"pivot_left", "--pivot-right":"pivot_right", "--pivot-buffer":"pivot_buffer_pct"}[token]
+                    params[key] = float(value) if token == "--pivot-buffer" else int(value)
+                    if params[key] < 0 or (token != "--pivot-buffer" and params[key] < 1): raise ValueError(f"Valor inválido para {raw[i]}.")
+                i += 2; continue
+            positional.append(raw[i]); i += 1
+        args, risk_config, filter_window, filter_limit, band_ratio, channel_width_pct, only_outer_bands = _parse_backtest_args(positional)
+    except ValueError as exc:
+        await update.message.reply_text(f"⚠️ {exc}"); return
+    if filter_window is not None or band_ratio is not None or channel_width_pct is not None or only_outer_bands:
+        await update.message.reply_text("⚠️ Los filtros de otras estrategias no se aplican a /backtest_rsi."); return
+    if params["ma_type"] == "None":
+        await update.message.reply_text("⚠️ La estrategia necesita una media del RSI. Elige SMA, EMA, RMA, WMA, VWMA o BB."); return
+    if not args:
+        await update.message.reply_text(
+            "Backtest RSI + media del RSI (Pine Script/TradingView).\n\n"
+            "Uso por cantidad: /backtest_rsi BTCUSDT 4h 500 [HORIZONTE]\n"
+            "Uso por período: /backtest_rsi BTCUSDT 15m 2025-01-01 2025-01-31 [HORIZONTE]\n\n"
+            "Parámetros: --rsi 14 --tipo-media SMA --media 14 --stop 10 --stop-mode lookback|pivot --pivot-left 2 --pivot-right 2 --pivot-buffer 0.1 --omitir-primer-cruce.\n"
+            "Tipos de media: SMA, EMA, RMA, WMA, VWMA, BB (SMA + Bollinger Bands), None.\n"
+            "Al alcanzar RSI 70 se buscan SHORT hasta RSI 30; al alcanzar RSI 30 se buscan LONG hasta RSI 70. "
+            "Primera entrada por giro del RSI; entradas adicionales por cruce de media (LONG RSI < 55; SHORT RSI > 45).\n"
+            "Entrada en apertura siguiente; SL por ventana --stop o último pivote local confirmado (--stop-mode pivot; --pivot-left/--pivot-right; colchón --pivot-buffer 0.1%). "
+            "Con --omitir-primer-cruce se descarta el primer cruce RSI/media válido de cada régimen y se considera desde el segundo. "
+            "Se permiten varias operaciones simultáneas. Costes no incluidos.")
+        return
+    try:
+        request = parse_backtest_request(args, normalize_symbol=_normalize_symbol, default_interval="4h", max_candles=BACKTEST_MAX_CANDLES)
+    except ValueError as exc:
+        await update.message.reply_text(f"⚠️ {exc}"); return
+    symbol, interval, horizon = request.symbol, request.interval, request.horizon
+    if interval not in VALID_INTERVALS:
+        await update.message.reply_text(f"Intervalo {interval} no válido. Usa uno de: {' '.join(sorted(VALID_INTERVALS, key=len))}"); return
+    period_text = (f"período {datetime.fromtimestamp(request.start_ms/1000,tz=timezone.utc):%Y-%m-%d} → {datetime.fromtimestamp(request.end_ms/1000,tz=timezone.utc):%Y-%m-%d} UTC" if request.is_date_range else f"hasta {request.candle_count} velas recientes")
+    await update.message.reply_text(f"Descargando histórico de {symbol} ({interval}, {period_text}) y ejecutando backtest RSI + media…")
+    try:
+        klines, signal_start, signal_end = load_backtest_klines(bitunix, request, warmup_candles=max(100, params["rsi_period"] + params["ma_period"] + 10), followup_candles=200)
+    except Exception as exc:
+        logger.exception("Error consultando histórico para backtest RSI")
+        await update.message.reply_text(f"⚠️ Error consultando histórico de Bitunix: {exc}"); return
+    if len(klines) < params["rsi_period"] + params["ma_period"] + 2:
+        await update.message.reply_text(f"Solo hay {len(klines)} velas para {symbol} en {interval}; no es suficiente para RSI + media."); return
+    closes=[float(k["close"]) for k in klines]; highs=[float(k["high"]) for k in klines]
+    lows=[float(k["low"]) for k in klines]; opens=[float(k["open"]) for k in klines]; times=[int(k["time"]) for k in klines]; volumes=[float(k.get("volume",0) or 0) for k in klines]
+    try:
+        all_trades=run_rsi_backtest(closes,highs,lows,opens,times,horizon=horizon,**params,use_extreme_filter=use_extreme_filter,volumes=volumes)
+        trades=filter_signals_to_period(all_trades,signal_start,signal_end)
+        stats=summarize_rsi(trades)
+    except Exception as exc:
+        logger.exception("Error calculando backtest RSI")
+        await update.message.reply_text(f"⚠️ Error calculando el backtest RSI: {exc}"); return
+    first_date=datetime.fromtimestamp(times[0]/1000,tz=timezone.utc).strftime("%Y-%m-%d"); last_date=datetime.fromtimestamp(times[-1]/1000,tz=timezone.utc).strftime("%Y-%m-%d")
+    period=(f"señales entre {datetime.fromtimestamp(signal_start/1000,tz=timezone.utc):%Y-%m-%d} → {datetime.fromtimestamp(signal_end/1000,tz=timezone.utc):%Y-%m-%d} UTC" if signal_start is not None else f"{len(klines)} velas ({first_date} → {last_date})")
+    header=(f"*Backtest RSI + Media RSI — {symbol} · {interval}*\nRSI: {params['rsi_period']} · Media: {params['ma_type']} ({params['ma_period']}) · Stop: {params['sl_lookback']} velas · Objetivo: 2R.\n"
+      f"Regímenes RSI 30/70 · entradas MA LONG < 55 / SHORT > 45 · SL: {params['stop_mode']} · omitir primer cruce: {params['ignore_first_ma_cross']} · Riesgo: {risk_config.label}.\n{period}; velas cargadas: {len(klines)}; " + (f"horizonte: {horizon} velas.\n" if horizon is not None else "sin límite de duración.\n") + "Entrada en apertura siguiente; varias posiciones simultáneas permitidas. Costes no incluidos.\n\n")
+    groups=[]
+    for label,key in (("TOTAL","total"),("LONG","long"),("SHORT","short")):
+        st=stats[key]; wr=f"{st['win_rate']:.1f}%" if st['win_rate'] is not None else "N/D"; avg=f"{st['r_medio']:+.2f}R" if st['r_medio'] is not None else "N/D"; total_r=f"{st['r_total']:+.2f}R" if st['r_total'] is not None else "N/D"
+        pf="∞" if st['profit_factor']==float('inf') else (f"{st['profit_factor']:.2f}" if st['profit_factor'] is not None else "N/D"); dd=f"{st['max_drawdown_r']:.2f}R" if st['max_drawdown_r'] is not None else "N/D"
+        groups.append(f"*{label}*: {st['total']} operaciones · {st['tp']} TP · {st['sl']} SL · {st['horizonte']} horizonte · {st['pendientes']} pendientes\nAcierto: {wr} · R total: {total_r} · R medio: {avg}\nProfit factor: {pf} · drawdown máximo: {dd}")
+    if not trades:
+        await update.message.reply_text(header+"No se generaron operaciones válidas en el período con las reglas actuales."); return
+    recent=[]
+    for t in trades[-6:]:
+        dt=datetime.fromtimestamp(t.entry_time/1000,tz=timezone.utc).strftime("%Y-%m-%d %H:%M"); icon="🟢" if t.side=="LONG" else "🔴"; result=f"{t.r_multiple:+.2f}R" if t.r_multiple is not None else t.outcome
+        recent.append(f"{icon} `{dt}` {t.side} entrada `{t.entry:.6g}` · SL `{t.stop_loss:.6g}` · TP `{t.target:.6g}` · RSI `{t.rsi:.2f}` / media `{t.rsi_ma:.2f}` · {result}")
+    await update.message.reply_text(header+"\n\n".join(groups)+"\n\n_Últimas operaciones:_\n"+"\n".join(recent),parse_mode="Markdown")
+    try:
+        workbook=build_rsi_workbook(symbol,interval,horizon,klines,trades,stats,risk_config,**params,use_extreme_filter=use_extreme_filter)
+    except Exception:
+        logger.exception("Error generando Excel del backtest RSI")
+        await update.message.reply_text("⚠️ El backtest terminó, pero no se pudo generar el Excel."); return
+    filename=f"backtest_rsi_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
+    await update.message.reply_document(document=workbook,filename=filename,caption=f"📊 Backtest RSI + media: {len(trades)} operaciones; {symbol} ({interval}).")
 
 
 async def backtest_squeeze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1638,6 +1746,7 @@ def main() -> None:
     application.add_handler(CommandHandler("backtest", backtest_command))
     application.add_handler(CommandHandler("backtest_keltner", backtest_keltner_command))
     application.add_handler(CommandHandler("backtest_reversion", backtest_reversion_command))
+    application.add_handler(CommandHandler("backtest_rsi", backtest_rsi_command))
     application.add_handler(CommandHandler("backtest_squeeze", backtest_squeeze_command))
     application.add_handler(CommandHandler("backtest_dual_thrust", backtest_dual_thrust_command))
     application.add_handler(CommandHandler("balance", balance))
