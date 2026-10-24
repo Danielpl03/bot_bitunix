@@ -38,3 +38,6 @@ python api_server.py
 ```
 
 La API queda en `http://localhost:8000`.
+
+
+**Importante para las alertas programadas:** `requirements.txt` instala `python-telegram-bot` con los extras `webhooks` y `job-queue`. Si despliegas el bot en Render, usa `pip install -r requirements.txt` y verifica en los logs que se programen `check_alerts_1h` y `check_alerts_4h`; no debe aparecer `JobQueue no disponible`.
