@@ -1275,6 +1275,12 @@ async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     args = context.args
 
+    # Redirige los subcomandos RSI al manejador que ya implementa su lógica.
+    # Así funcionan /alerts rsi add BTCUSDT, remove, reset y check.
+    if args and args[0].lower() == "rsi":
+        await watchlist_command(update, context)
+        return
+
     if not args:
         if not alerts_watchlist:
             message = (
