@@ -1307,6 +1307,14 @@ async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if action == "check":
+        # Evita consultar símbolos ficticios cuando se mezcla el orden de los subcomandos RSI.
+        if len(args) > 1 and args[1].lower() in {"rsi", "add", "remove", "del", "reset"}:
+            await update.message.reply_text(
+                "Para RSI usa `/alerts rsi add BTCUSDT` o `/alerts rsi check BTCUSDT 1h`. "
+                "El formato `/alerts check rsi add BTCUSDT` no es válido.",
+                parse_mode="Markdown",
+            )
+            return
         # /alerts check [SIMBOLO] [4h|1h]; los argumentos pueden ir en cualquier orden
         rest = [x.lower() if x.lower() in ALERT_INTERVALS else x for x in args[1:]]
         intervals = [x for x in rest if x in ALERT_INTERVALS] or list(ALERT_INTERVALS)
@@ -1474,23 +1482,29 @@ def _build_status_blocks(symbols: list[str], interval: str) -> tuple[list[str], 
 _INTERVAL_MILLISECONDS = {"1h": 60 * 60 * 1000, "4h": 4 * 60 * 60 * 1000}
 
 
-def _evaluate_rsi_alert_symbol(symbol: str, interval: str = "4h"):
-    """Evalúa la estrategia RSI en la última vela cerrada, no en la vela en curso."""
+def _evaluate_rsi_alert_history(symbol: str, interval: str = "4h"):
+    """Calcula RSI para todas las velas cerradas y devuelve cada resultado con su timestamp."""
     klines = bitunix.get_kline(symbol, interval=interval, limit=150)
     if not klines:
         raise ValueError("Bitunix no devolvió velas")
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     duration_ms = _INTERVAL_MILLISECONDS.get(interval)
+    if duration_ms is None:
+        raise ValueError(f"intervalo RSI no válido: {interval}")
     closed = []
     for candle in klines:
-        stamp = candle.get("time")
-        if stamp is None or duration_ms is None:
+        raw_stamp = candle.get("time")
+        if raw_stamp is None:
             continue
-        stamp = int(stamp)
-        if stamp < 100_000_000_000:  # tolera timestamps Unix en segundos
+        stamp = int(raw_stamp)
+        if stamp < 100_000_000_000:
             stamp *= 1000
         if stamp + duration_ms <= now_ms:
-            closed.append(candle)
+            # La copia evita modificar los objetos que mantiene el cliente.
+            item = dict(candle)
+            item["time"] = stamp
+            closed.append(item)
+    closed.sort(key=lambda candle: int(candle["time"]))
     if len(closed) < 40:
         raise ValueError("no hay suficientes velas cerradas para calcular RSI y su media")
 
@@ -1502,14 +1516,22 @@ def _evaluate_rsi_alert_symbol(symbol: str, interval: str = "4h"):
         sl_lookback=10, stop_mode="lookback", ignore_first_ma_cross=False,
     )
     indicator = rsi_indicator(closes, rsi_period=14, ma_type="SMA", ma_period=14)
-    latest_rsi = indicator["rsi"][-1]
-    latest_ma = indicator["ma"][-1]
-    if latest_rsi is None:
+    rows = []
+    for i, candle in enumerate(closed):
+        value = indicator["rsi"][i]
+        average = indicator["ma"][i]
+        if value is None:
+            continue
+        rows.append((int(candle["time"]), signals[i], float(value), float(average) if average is not None else None))
+    if not rows:
         raise ValueError("RSI aún no está disponible")
-    stamp = int(closed[-1]["time"])
-    if stamp < 100_000_000_000:
-        stamp *= 1000
-    return signals[-1], stamp, float(latest_rsi), float(latest_ma) if latest_ma is not None else None
+    return rows
+
+
+def _evaluate_rsi_alert_symbol(symbol: str, interval: str = "4h"):
+    """Evalúa la última vela cerrada, útil para el comando manual /alerts rsi check."""
+    candle_time, signal, latest_rsi, latest_ma = _evaluate_rsi_alert_history(symbol, interval)[-1]
+    return signal, candle_time, latest_rsi, latest_ma
 
 
 def _format_rsi_signal_message(symbol: str, interval: str, signal) -> str:
@@ -1527,27 +1549,73 @@ def _format_rsi_signal_message(symbol: str, interval: str, signal) -> str:
 
 
 async def _check_rsi_alerts_job(context: ContextTypes.DEFAULT_TYPE, interval: str, send) -> None:
-    """Procesa las suscripciones RSI y evita repetir alertas de una misma vela."""
+    """Envía un resumen del estado RSI en cada ejecución y alertas separadas al detectar entradas.
+
+    El resumen incluye incluso cuando no hay señal, para que el usuario pueda ver que
+    la tarea se ejecutó, qué vela cerrada se evaluó y por qué no hubo entrada.
+    """
     if not rsi_alerts_watchlist:
         return
     state_changed = False
+    status_blocks: list[str] = []
     for symbol in list(rsi_alerts_watchlist):
         state_key = f"{symbol}|{interval}"
         try:
-            signal, candle_time, latest_rsi, latest_ma = _evaluate_rsi_alert_symbol(symbol, interval)
+            history = _evaluate_rsi_alert_history(symbol, interval)
         except Exception as exc:  # noqa: BLE001
-            logger.exception("Error evaluando alerta RSI para %s (%s)", symbol, interval)
+            logger.exception("Error evaluando estado RSI para %s (%s); se reintentará", symbol, interval)
+            status_blocks.append(f"⚠️ *{symbol}* · {interval}: error consultando velas ({_md_safe(exc)})")
             continue
+
+        candle_time, latest_signal, latest_rsi, latest_ma = history[-1]
+        candle_label = datetime.fromtimestamp(candle_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         previous_time = rsi_alert_state.get(state_key)
-        if previous_time is not None and candle_time <= previous_time:
-            continue
-        # Marcamos la vela procesada aunque no haya señal, para no alertar tarde por velas antiguas.
-        rsi_alert_state[state_key] = candle_time
-        state_changed = True
-        if signal is not None:
-            await _send_chunks(send, [_format_rsi_signal_message(symbol, interval, signal)])
+        if previous_time is None:
+            # En el primer ciclo no enviamos señales históricas, pero sí mostramos el estado actual.
+            new_rows = []
+            rsi_alert_state[state_key] = candle_time
+            state_changed = True
+        else:
+            new_rows = [row for row in history if row[0] > previous_time]
+
+        # Estado descriptivo, independientemente de que se produzca una entrada.
+        if latest_rsi <= 30:
+            regime = "sobreventa / régimen LONG"
+        elif latest_rsi >= 70:
+            regime = "sobrecompra / régimen SHORT"
+        elif latest_ma is not None and latest_rsi > latest_ma:
+            regime = "RSI por encima de su media"
+        elif latest_ma is not None and latest_rsi < latest_ma:
+            regime = "RSI por debajo de su media"
+        else:
+            regime = "sin régimen confirmado"
+        status = (
+            f"📈 *Estado RSI — {symbol} · {interval}*\n"
+            f"Vela cerrada: `{candle_label}`\n"
+            f"RSI(14): `{latest_rsi:.2f}` · Media SMA(14): `{latest_ma:.2f}`\n"
+            f"Estado: *{regime}*\n"
+            f"Entrada en esta vela: {'*' + latest_signal.side + ' — ' + latest_signal.signal_type + '*' if latest_signal else 'no'}"
+        )
+        status_blocks.append(status)
+        logger.info(
+            "RSI_STATUS symbol=%s interval=%s candle_utc=%s rsi=%.4f ma=%s regime=%s signal=%s previous_state=%s",
+            symbol, interval, candle_label, latest_rsi,
+            f"{latest_ma:.4f}" if latest_ma is not None else "n/a", regime,
+            f"{latest_signal.side}:{latest_signal.signal_type}" if latest_signal else "none",
+            previous_time,
+        )
+
+        for row_time, signal, row_rsi, row_ma in new_rows:
+            if signal is not None:
+                await _send_chunks(send, [_format_rsi_signal_message(symbol, interval, signal)])
+            rsi_alert_state[state_key] = row_time
+            state_changed = True
+
     if state_changed:
         _save_rsi_alert_state(rsi_alert_state)
+    if status_blocks:
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        await _send_chunks(send, [f"📊 *Resumen del estado RSI {interval}* — {now}"] + status_blocks)
 
 
 async def check_alerts_job(context: ContextTypes.DEFAULT_TYPE) -> None:
