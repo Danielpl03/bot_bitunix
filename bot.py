@@ -71,6 +71,7 @@ from backtest_dual_thrust import run_backtest as run_dual_thrust_backtest, summa
 from backtest_dual_thrust_multitimeframe import (load_multitimeframe_candles, run_backtest_multitimeframe, validate_timeframes)
 from backtest_trend_trader_remastered import run_backtest as run_ttr_backtest
 from xlsx_export_dual_thrust import build_dual_thrust_workbook
+from xlsx_export_ttr import build_ttr_workbook
 from backtest_common import (parse_backtest_request, load_backtest_klines, filter_signals_to_period, filter_signals_by_density, filter_signals_by_opposite_band, filter_signals_by_channel_width)
 from risk_management import RiskConfig
 
@@ -1046,16 +1047,37 @@ async def backtest_ttr_command(update: Update, context: ContextTypes.DEFAULT_TYP
         result=run_ttr_backtest([float(k["close"]) for k in klines],[float(k["high"]) for k in klines],[float(k["low"]) for k in klines],[float(k["open"]) for k in klines],[int(k["time"]) for k in klines],
             pos_dir=opts["--dir"],enter_on_reentry=opts["--re-entry"].lower()=="true",tp_percentages=tp,fee_pct=fee,slippage_pct=slip)
         trades=[t for t in result["trades"] if signal_start<=t["entry_time"]<=signal_end]
-        sm=result["summary"]
-        msg=(f"📊 TTR · {request.symbol} · {request.interval}\nOperaciones: {len(trades)} · Acierto: {sm['win_rate_pct']:.2f}%\n"
-             f"PnL compuesto: {sm['net_pnl_pct_compounded']:+.2f}% · Profit factor: {sm['profit_factor'] if sm['profit_factor'] is not None else 'N/D'}\n"
+        # Recalcular métricas con el mismo subconjunto de operaciones que se muestra/exporta.
+        wins=[t for t in trades if float(t.get('pnl_pct') or 0)>0]
+        losses=[t for t in trades if float(t.get('pnl_pct') or 0)<0]
+        gross_win=sum(float(t['pnl_pct']) for t in wins)
+        gross_loss=abs(sum(float(t['pnl_pct']) for t in losses))
+        equity=100.0
+        for t in sorted(trades,key=lambda x:x.get('exit_time') or x.get('entry_time') or 0):
+            equity*=max(0.0,1.0+float(t.get('pnl_pct') or 0)/100.0)
+        win_rate=len(wins)/len(trades)*100 if trades else 0.0
+        pf=gross_win/gross_loss if gross_loss else None
+        result_for_export={**result,'summary':{**result['summary'],'trades':len(trades),'wins':len(wins),'losses':len(losses),'win_rate_pct':win_rate,'net_pnl_pct_compounded':(equity/100.0-1)*100,'profit_factor':pf},'events':[e for e in result.get('events',[]) if signal_start<=e.get('time',0)<=signal_end]}
+        msg=(f"📊 TTR · {request.symbol} · {request.interval}\nOperaciones: {len(trades)} · Acierto: {win_rate:.2f}%\n"
+             f"PnL compuesto: {(equity/100.0-1)*100:+.4f}% · Profit factor: {pf if pf is not None else 'N/D'}\n"
              f"Dirección: {opts['--dir']} · Reentrada: {opts['--re-entry']} · TP: {','.join(map(str,tp))}%\nStop: trailing PSAR lagging actualizado al cierre; se aplica desde la vela siguiente.\n"
+             "El PnL de cada operación incluye los cierres parciales TP realizados antes del stop/reversión. El Excel adjunto desglosa cada cierre parcial.\n"
              "Nota: los fractales y señales TP/RE son una aproximación Python, no una equivalencia validada vela por vela con TradingView.")
         await update.message.reply_text(msg)
         if trades:
             lines=[]
-            for t in trades[-8:]: lines.append(f"{t['side'].upper()} {datetime.fromtimestamp(t['entry_time']/1000,tz=timezone.utc):%Y-%m-%d %H:%M} · entrada {t['entry_price']:.6g} · salida {t['exit_price']:.6g} · {t['exit_reason']} · PnL {t['pnl_pct']:+.2f}%")
-            await update.message.reply_text("Últimas operaciones:\n"+"\n".join(lines))
+            for t in trades[-8:]:
+                pieces=t.get('partial_exits') or []
+                tp_pnl=sum(float(x.get('pnl_pct_position') or 0) for x in pieces if x.get('reason')=='TP')
+                lines.append(f"{t['side'].upper()} {datetime.fromtimestamp(t['entry_time']/1000,tz=timezone.utc):%Y-%m-%d %H:%M} · entrada {t['entry_price']:.6g} · salida {t['exit_price']:.6g} · {t['exit_reason']} · TP acumulado {tp_pnl:+.4f}% · PnL total {t['pnl_pct']:+.4f}%")
+            await update.message.reply_text("Últimas operaciones (PnL con 4 decimales):\n"+"\n".join(lines))
+        try:
+            workbook=build_ttr_workbook(request.symbol,request.interval,klines,result_for_export,trades,result.get('parameters',{}))
+            filename=f"backtest_ttr_{request.symbol}_{request.interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
+            await update.message.reply_document(document=workbook,filename=filename,caption=f"📊 Excel TTR: {len(trades)} operaciones, cierres TP parciales, stops/reversiones, señales y curva de capital.")
+        except Exception:
+            logger.exception("Error generando/enviando Excel TTR")
+            await update.message.reply_text("⚠️ El resumen se calculó, pero no pude generar o enviar el Excel TTR.")
     except Exception as exc:
         logger.exception("Error en backtest TTR")
         await update.message.reply_text(f"⚠️ No se pudo ejecutar TTR: {exc}")
