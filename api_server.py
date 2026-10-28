@@ -19,6 +19,7 @@ from backtest_reversion import run_backtest as run_reversion, summarize as summa
 from backtest_rsi import run_backtest as run_rsi, summarize as summarize_rsi
 from backtest_squeeze import run_backtest as run_squeeze, summarize as summarize_squeeze
 from backtest_dual_thrust import run_backtest as run_dual, summarize as summarize_dual
+from backtest_trend_trader_remastered import run_backtest as run_ttr
 
 PORT = int(os.environ.get('PORT', '8000'))
 API_KEY = os.environ.get('BACKTEST_API_KEY', '').strip()
@@ -63,7 +64,7 @@ def equity_curve(trades):
 
 def run(payload):
     strategy = str(payload.get('strategy','keltner')).lower()
-    if strategy not in {'keltner','bollinger','rsi','reversion','squeeze','dual_thrust'}: raise ValueError('Estrategia no soportada.')
+    if strategy not in {'keltner','bollinger','rsi','reversion','squeeze','dual_thrust','trend_trader_remastered'}: raise ValueError('Estrategia no soportada.')
     symbol=normalize_symbol(payload.get('symbol','BTCUSDT')); interval=str(payload.get('interval','1h'))
     if interval not in VALID_INTERVALS: raise ValueError('Temporalidad no válida.')
     candles_count=max(100,min(int(payload.get('candles') or 500),MAX_CANDLES))
@@ -77,6 +78,23 @@ def run(payload):
     if len(klines)<40: raise ValueError(f'Solo se encontraron {len(klines)} velas; no hay suficiente histórico.')
     closes=[float(k['close']) for k in klines]; highs=[float(k['high']) for k in klines]; lows=[float(k['low']) for k in klines]; opens=[float(k['open']) for k in klines]; times=[int(k['time']) for k in klines]
     p=payload.get('params') or {}
+    if strategy=='trend_trader_remastered':
+        result=run_ttr(closes,highs,lows,opens,times,
+            psar_start=float(p.get('psar_start',0.02)), psar_increment=float(p.get('psar_increment',0.02)), psar_max=float(p.get('psar_max',0.025)),
+            frac_lb_high=int(p.get('frac_lb_high',2)), frac_lb_low=int(p.get('frac_lb_low',2)),
+            sig_re_min_proximity=float(p.get('sig_re_min_proximity',0)),
+            sig_re_buy_no_tp=bool(p.get('sig_re_buy_no_tp',False)), sig_re_sell_no_tp=bool(p.get('sig_re_sell_no_tp',False)),
+            pos_dir=str(p.get('pos_dir','Buy & Sell')),
+            show_entry_buy=bool(p.get('show_entry_buy',True)), show_tp_buy=bool(p.get('show_tp_buy',True)),
+            show_re_buy=bool(p.get('show_re_buy',True)), show_exit_buy=bool(p.get('show_exit_buy',False)),
+            show_entry_sell=bool(p.get('show_entry_sell',True)), show_tp_sell=bool(p.get('show_tp_sell',True)),
+            show_re_sell=bool(p.get('show_re_sell',True)), show_exit_sell=bool(p.get('show_exit_sell',False)),
+            fee_pct=float(p.get('fee_pct',0)), slippage_pct=float(p.get('slippage_pct',0)))
+        events=[e for e in result['events'] if signal_start <= e['time'] <= signal_end]
+        trades=[t for t in result['trades'] if signal_start <= t['entry_time'] <= signal_end]
+        return clean({'strategy':strategy,'symbol':symbol,'interval':interval,'candles':len(klines),
+            'summary':{'total':result['summary']},'trades':trades,'events':events,'equity':result['equity'],
+            'indicators':result['indicators'],'parameters':result['parameters'],'note':result['note']})
     if strategy=='keltner':
         all_results=run_keltner(closes,highs,lows,opens,times,horizon=horizon,ema_period=int(p.get('ema_period',20)),atr_period=int(p.get('atr_period',10)),multiplier=float(p.get('multiplier',2.0)),only_outer_bands=bool(p.get('only_outer_bands',False)))
         all_results=filter_signals_to_period(all_results,signal_start,signal_end)
@@ -127,7 +145,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self): self.send_json(204,{})
     def do_GET(self):
         path=urlparse(self.path).path
-        if path=='/api/health': return self.send_json(200,{'ok':True,'service':'backtest-lab-python-api','strategies':['keltner','bollinger','rsi','reversion','squeeze','dual_thrust']})
+        if path=='/api/health': return self.send_json(200,{'ok':True,'service':'backtest-lab-python-api','strategies':['keltner','bollinger','rsi','reversion','squeeze','dual_thrust','trend_trader_remastered']})
         return self.send_json(404,{'error':'Ruta no encontrada.'})
     def do_POST(self):
         if urlparse(self.path).path!='/api/backtest': return self.send_json(404,{'error':'Ruta no encontrada.'})
