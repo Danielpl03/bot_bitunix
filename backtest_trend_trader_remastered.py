@@ -10,6 +10,7 @@ class Trade:
     entry_index: int
     entry_time: int
     entry_price: float
+    avg_entry_price: Optional[float] = None
     exit_index: Optional[int] = None
     exit_time: Optional[int] = None
     exit_price: Optional[float] = None
@@ -74,7 +75,10 @@ def run_backtest(closes, highs, lows, opens, times, *, psar_start=.02, psar_incr
         pct=min(float(pct),trade.remaining_pct)
         if pct<=1e-9:return
         direction=1 if trade.side=='buy' else -1
-        raw=(price/trade.entry_price-1)*100*direction
+        # Use the weighted average cost of the currently open exposure. Keep entry_price
+        # immutable as the original signal price for reporting; re-entries only change avg_entry_price.
+        cost = trade.avg_entry_price if trade.avg_entry_price is not None else trade.entry_price
+        raw=(price/cost-1)*100*direction
         net=raw-fee_pct*2-slippage_pct*2
         weighted=net*pct/100.0
         realized_pnl += weighted
@@ -106,7 +110,7 @@ def run_backtest(closes, highs, lows, opens, times, *, psar_start=.02, psar_incr
             old_side=current.side; close_all(current,float(closes[i]),i,'REVERSAL'); events.append({'type':'EXIT','side':old_side,'index':i,'time':int(times[i]),'price':float(closes[i])})
             current=None; last_tp=last_re=None; last_tp_pct=0.0; marks_tp.clear(); marks_re.clear()
         if enter:
-            current=Trade(enter,i,int(times[i]),float(closes[i]),stop_price=float(lag[i]))
+            current=Trade(enter,i,int(times[i]),float(closes[i]),avg_entry_price=float(closes[i]),stop_price=float(lag[i]))
             last_tp=last_re=None; last_tp_pct=0.0; marks_tp.clear(); marks_re.clear()
             events.append({'type':'ENTRY','side':enter,'index':i,'time':int(times[i]),'price':float(closes[i]),'psar_lagging':float(lag[i]),'stop_price':float(lag[i]),'entry_kind':'MAIN'})
         if not current: continue
@@ -136,7 +140,8 @@ def run_backtest(closes, highs, lows, opens, times, *, psar_start=.02, psar_incr
                     add_pct=min(last_tp_pct or tps[0],100.0-current.remaining_pct)
                     if add_pct>0:
                         old_qty=current.remaining_pct; new_qty=old_qty+add_pct
-                        current.entry_price=((current.entry_price*old_qty)+(float(closes[i])*add_pct))/new_qty if new_qty else current.entry_price
+                        old_avg = current.avg_entry_price if current.avg_entry_price is not None else current.entry_price
+                        current.avg_entry_price=((old_avg*old_qty)+(float(closes[i])*add_pct))/new_qty if new_qty else old_avg
                         current.remaining_pct=new_qty
                         current.partial_exits.append({'index':i,'time':int(times[i]),'price':float(closes[i]),'percent':add_pct,'reason':'RE_ADD','pnl_pct_position':0.0})
                     events.append({'type':'RE_ENTRY','side':side,'index':i,'time':int(times[i]),'price':float(closes[i]),'percent_added':add_pct,'remaining_pct':current.remaining_pct})
