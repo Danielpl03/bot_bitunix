@@ -69,6 +69,7 @@ from backtest_squeeze import run_backtest as run_squeeze_backtest, summarize as 
 from xlsx_export_squeeze import build_squeeze_workbook
 from backtest_dual_thrust import run_backtest as run_dual_thrust_backtest, summarize as summarize_dual_thrust, build_equity_curve as build_dual_thrust_equity_curve, PENDING as DUAL_THRUST_PENDING
 from backtest_dual_thrust_multitimeframe import (load_multitimeframe_candles, run_backtest_multitimeframe, validate_timeframes)
+from backtest_trend_trader_remastered import run_backtest as run_ttr_backtest
 from xlsx_export_dual_thrust import build_dual_thrust_workbook
 from backtest_common import (parse_backtest_request, load_backtest_klines, filter_signals_to_period, filter_signals_by_density, filter_signals_by_opposite_band, filter_signals_by_channel_width)
 from risk_management import RiskConfig
@@ -93,6 +94,7 @@ BOT_COMMANDS = [
     BotCommand("backtest_rsi", "Backtest RSI por zonas extremas"),
     BotCommand("backtest_squeeze", "Backtest Squeeze Bollinger + Keltner"),
     BotCommand("backtest_dual_thrust", "Backtest ruptura de rango Dual Thrust"),
+    BotCommand("backtest_ttr", "Backtest Trend Trader-Remastered con TP parciales y stop PSAR"),
     BotCommand("balance", "Balance de tu cuenta de futuros (/balance USDT)"),
     BotCommand("positions", "Ver posiciones abiertas (/positions BTCUSDT)"),
     BotCommand("open", "Abrir posición (/open BTCUSDT BUY 0.01)"),
@@ -300,7 +302,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/backtest_reversion ... - reversión a la media con Bollinger + Estocástico\n"
         "/backtest_rsi ... - estrategia RSI por regímenes de sobrecompra/sobreventa\n"
         "/backtest_squeeze ... - ruptura Squeeze con Bollinger + Keltner\n"
-        "/backtest_dual_thrust ... - ruptura de rango Dual Thrust\n\n"
+        "/backtest_dual_thrust ... - ruptura de rango Dual Thrust\n"
+        " /backtest_ttr SIMBOLO INTERVALO VELAS [--re-entry true|false] [--tp 25,25,25,25] [--dir Buy & Sell|Buy Only|Sell Only]\n\n"
         "Cuenta (requieren autorización):\n"
         "/balance [MONEDA] - balance de futuros (default USDT)\n"
         "/positions [SIMBOLO] - posiciones abiertas\n"
@@ -1011,6 +1014,51 @@ async def backtest_squeeze_command(update: Update, context: ContextTypes.DEFAULT
         return
     filename=f"backtest_squeeze_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
     await update.message.reply_document(document=workbook,filename=filename,caption=f"📊 Squeeze Bollinger + Keltner: {len(trades)} operaciones; {symbol} ({interval}).")
+
+
+async def backtest_ttr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Backtest TTR con TP parciales, reentrada opcional y stop PSAR trailing."""
+    raw=list(context.args)
+    if not raw:
+        await update.message.reply_text("Uso: /backtest_ttr BTCUSDT 1h 1000 [--re-entry true|false] [--tp 25,25,25,25] [--dir Buy & Sell|Buy Only|Sell Only] [--fee 0.05] [--slippage 0.02]\nLos TP son porcentajes de la posición restante por cada señal TP; la suma debe ser <=100. La reversión cierra lo restante y abre la dirección contraria.")
+        return
+    opts={"--re-entry":"true","--tp":"25,25,25,25","--dir":"Buy & Sell","--fee":"0","--slippage":"0"}; positional=[]; i=0
+    try:
+        while i<len(raw):
+            if raw[i] in opts:
+                if i+1>=len(raw): raise ValueError(f"Falta valor para {raw[i]}")
+                opts[raw[i]]=raw[i+1]; i+=2
+            else: positional.append(raw[i]); i+=1
+        request=parse_backtest_request(positional,normalize_symbol=_normalize_symbol,default_interval="1h",max_candles=BACKTEST_MAX_CANDLES)
+        if request.interval not in VALID_INTERVALS: raise ValueError("Intervalo no válido.")
+        tp=[float(x.strip()) for x in opts["--tp"].split(",") if x.strip()]
+        if not tp or sum(tp)>100 or any(x<=0 or x>100 for x in tp): raise ValueError("--tp debe ser una lista, p. ej. 40,30,30; suma máxima 100.")
+        if opts["--re-entry"].lower() not in ("true","false"): raise ValueError("--re-entry admite true o false.")
+        direction_alias={"BuyOnly":"Buy Only","SellOnly":"Sell Only","Both":"Buy & Sell"}
+        opts["--dir"]=direction_alias.get(opts["--dir"],opts["--dir"])
+        fee=float(opts["--fee"]); slip=float(opts["--slippage"])
+    except (ValueError,TypeError) as exc:
+        await update.message.reply_text(f"⚠️ {exc}"); return
+    await update.message.reply_text(f"Descargando histórico de {request.symbol} ({request.interval}) y ejecutando TTR…")
+    try:
+        klines, signal_start, signal_end=load_backtest_klines(bitunix,request,warmup_candles=100,followup_candles=200)
+        if len(klines)<40: raise ValueError(f"Solo se encontraron {len(klines)} velas.")
+        result=run_ttr_backtest([float(k["close"]) for k in klines],[float(k["high"]) for k in klines],[float(k["low"]) for k in klines],[float(k["open"]) for k in klines],[int(k["time"]) for k in klines],
+            pos_dir=opts["--dir"],enter_on_reentry=opts["--re-entry"].lower()=="true",tp_percentages=tp,fee_pct=fee,slippage_pct=slip)
+        trades=[t for t in result["trades"] if signal_start<=t["entry_time"]<=signal_end]
+        sm=result["summary"]
+        msg=(f"📊 TTR · {request.symbol} · {request.interval}\nOperaciones: {len(trades)} · Acierto: {sm['win_rate_pct']:.2f}%\n"
+             f"PnL compuesto: {sm['net_pnl_pct_compounded']:+.2f}% · Profit factor: {sm['profit_factor'] if sm['profit_factor'] is not None else 'N/D'}\n"
+             f"Dirección: {opts['--dir']} · Reentrada: {opts['--re-entry']} · TP: {','.join(map(str,tp))}%\nStop: trailing PSAR lagging actualizado al cierre; se aplica desde la vela siguiente.\n"
+             "Nota: los fractales y señales TP/RE son una aproximación Python, no una equivalencia validada vela por vela con TradingView.")
+        await update.message.reply_text(msg)
+        if trades:
+            lines=[]
+            for t in trades[-8:]: lines.append(f"{t['side'].upper()} {datetime.fromtimestamp(t['entry_time']/1000,tz=timezone.utc):%Y-%m-%d %H:%M} · entrada {t['entry_price']:.6g} · salida {t['exit_price']:.6g} · {t['exit_reason']} · PnL {t['pnl_pct']:+.2f}%")
+            await update.message.reply_text("Últimas operaciones:\n"+"\n".join(lines))
+    except Exception as exc:
+        logger.exception("Error en backtest TTR")
+        await update.message.reply_text(f"⚠️ No se pudo ejecutar TTR: {exc}")
 
 
 async def backtest_dual_thrust_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2026,6 +2074,7 @@ def main() -> None:
     application.add_handler(CommandHandler("backtest_rsi", backtest_rsi_command))
     application.add_handler(CommandHandler("backtest_squeeze", backtest_squeeze_command))
     application.add_handler(CommandHandler("backtest_dual_thrust", backtest_dual_thrust_command))
+    application.add_handler(CommandHandler("backtest_ttr", backtest_ttr_command))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("positions", positions))
     application.add_handler(CommandHandler("open", open_position))

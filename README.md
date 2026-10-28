@@ -409,3 +409,8 @@ Al continuar el desarrollo:
 ---
 
 **Fin del documento de contexto.** Este archivo explica el propósito y las responsabilidades de los módulos; el código fuente sigue siendo la fuente definitiva para el comportamiento exacto.
+
+
+## Trend Trader-Remastered (TTR)
+
+Comando Telegram: `/backtest_ttr BTCUSDT 1h 1000 --re-entry true --tp 40,30,30 --dir BuyOnly --fee 0.05 --slippage 0.02`. `--re-entry false` ignora las entradas RE; `--tp` asigna el porcentaje de posición por cada señal TP y su suma no puede superar 100. En reversión se cierra la posición restante y se abre la dirección contraria. El stop trailing usa el lagging PSAR calculado al cierre y se aplica desde la siguiente vela.

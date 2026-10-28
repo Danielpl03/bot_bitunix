@@ -59,3 +59,6 @@ Ejemplo de `params`:
 ```
 
 **Limitación de fidelidad:** el Pine original importa `ToolsFluent`, `ToolsPos` y `Tac`; el código fuente de esas bibliotecas no viene incluido en el script compartido. El motor implementa PSAR, pivotes fractales confirmados, entradas/salidas por cruce del PSAR lagging y reglas visibles de TP/RE, pero algunas semánticas internas de `Tac.sar`, `Tac.BWFractals` y `ToolsPos.PosInfo/PosAction` se han aproximado. Para garantizar coincidencia vela a vela con TradingView habría que contrastar con el código de esas librerías o una exportación de señales de referencia.
+
+### Trend Trader-Remastered (TTR) — gestión de posición
+Para `strategy: "trend_trader_remastered"`, `params` admite `enter_on_reentry` (booleano), `tp_percentages` (lista, por ejemplo `[40,30,30]`), `fee_pct`, `slippage_pct` y los parámetros PSAR/fractales previos. La suma de `tp_percentages` no puede superar 100. Cada señal TP consume el siguiente porcentaje configurado; la reversión cierra el porcentaje restante y abre la dirección permitida. El stop sigue el lagging PSAR actualizado al cierre de cada vela y se aplica desde la siguiente. Los datos de fractales/TP/RE siguen siendo aproximados frente a las bibliotecas Pine privadas/publicadas externas.

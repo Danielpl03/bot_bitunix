@@ -24,3 +24,18 @@ def test_direction_validation():
 def test_optional_inputs_accepted():
     r=run_backtest(*sample(),pos_dir='Buy Only',sig_re_buy_no_tp=True,frac_lb_high=3,frac_lb_low=3)
     assert r['parameters']['pos_dir']=='Buy Only'
+
+def test_tp_percentages_validation():
+    args=sample()
+    try:
+        run_backtest(*args,tp_percentages=[60,50])
+    except ValueError as exc:
+        assert '100%' in str(exc)
+    else:
+        assert False, 'TP allocation over 100% should fail'
+
+def test_reentry_and_trailing_stop_parameters_are_reported():
+    r=run_backtest(*sample(),enter_on_reentry=False,tp_percentages=[40,30,30])
+    assert r['parameters']['enter_on_reentry'] is False
+    assert r['parameters']['tp_percentages']==[40.0,30.0,30.0]
+    assert r['parameters']['stop_mode']=='trailing_lagging_psar'
