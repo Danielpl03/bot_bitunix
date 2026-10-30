@@ -7,7 +7,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from backtest_trend_trader_remastered import _psar
 
-DB_PATH = os.environ.get('TTR_LIVE_DB', 'ttr_live.sqlite3')
+DATABASE_URL = os.environ.get('SUPABASE_DB_URL') or os.environ.get('DATABASE_URL')
+DB_BACKEND = os.environ.get('TTR_DB_BACKEND', 'auto').strip().lower()
+if DB_BACKEND == 'auto':
+    DB_BACKEND = 'postgres' if DATABASE_URL else 'sqlite'
+DB_PATH = os.environ.get('TTR_LIVE_DB', '/tmp/ttr_live.sqlite3')
 TF_MS = 15 * 60 * 1000
 DEFAULT_POLL_SECONDS = max(2, int(os.environ.get('TTR_POLL_SECONDS', '5')))
 
@@ -16,52 +20,111 @@ def poll_seconds(config=None):
     return max(2, min(30, int(config.get('poll_seconds', DEFAULT_POLL_SECONDS))))
 
 class TTRLiveStore:
-    def __init__(self, path=DB_PATH):
-        self.path=path
-        with self._db() as c:
-            c.execute('''CREATE TABLE IF NOT EXISTS ttr_live_config (
-              symbol TEXT PRIMARY KEY, chat_id INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
-              config TEXT NOT NULL, last_bar_time INTEGER, state TEXT NOT NULL DEFAULT '{}', updated_at INTEGER NOT NULL)''')
-            c.execute('''CREATE TABLE IF NOT EXISTS ttr_live_events (
-              id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, event_time INTEGER NOT NULL,
-              event_type TEXT NOT NULL, side TEXT, price REAL, payload TEXT NOT NULL)''')
-            c.execute('''CREATE TABLE IF NOT EXISTS ttr_live_trades (
-              id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, side TEXT NOT NULL,
-              entry_time INTEGER NOT NULL, entry_price REAL NOT NULL, exit_time INTEGER, exit_price REAL,
-              exit_reason TEXT, status TEXT NOT NULL, stop_price REAL, realized_pnl_pct REAL NOT NULL DEFAULT 0,
-              remaining_pct REAL NOT NULL DEFAULT 100, payload TEXT NOT NULL DEFAULT '{}')''')
-    def _db(self):
-        c=sqlite3.connect(self.path, timeout=20); c.row_factory=sqlite3.Row; return c
-    def subscribe(self,symbol,chat_id,config):
-        with self._db() as c:
-            c.execute('INSERT INTO ttr_live_config(symbol,chat_id,enabled,config,last_bar_time,state,updated_at) VALUES(?,?,1,?,NULL,?,?) ON CONFLICT(symbol) DO UPDATE SET chat_id=excluded.chat_id,enabled=1,config=excluded.config,updated_at=excluded.updated_at',
-                      (symbol,chat_id,json.dumps(config),json.dumps({'position':None}),int(time.time()*1000)))
-    def unsubscribe(self,symbol):
-        with self._db() as c: c.execute('UPDATE ttr_live_config SET enabled=0,updated_at=? WHERE symbol=?',(int(time.time()*1000),symbol))
-    def configs(self):
-        with self._db() as c: return [dict(x) for x in c.execute('SELECT * FROM ttr_live_config WHERE enabled=1')]
-    def get_config(self,symbol):
-        with self._db() as c:
-            x=c.execute('SELECT * FROM ttr_live_config WHERE symbol=?',(symbol,)).fetchone(); return dict(x) if x else None
-    def save_state(self,symbol,state,last_bar_time=None):
-        with self._db() as c:
-            if last_bar_time is None: c.execute('UPDATE ttr_live_config SET state=?,updated_at=? WHERE symbol=?',(json.dumps(state),int(time.time()*1000),symbol))
-            else: c.execute('UPDATE ttr_live_config SET state=?,last_bar_time=?,updated_at=? WHERE symbol=?',(json.dumps(state),last_bar_time,int(time.time()*1000),symbol))
-    def event(self,symbol,etype,side,price,ts,payload=None):
-        with self._db() as c: c.execute('INSERT INTO ttr_live_events(symbol,event_time,event_type,side,price,payload) VALUES(?,?,?,?,?,?)',(symbol,ts,etype,side,price,json.dumps(payload or {})))
-    def open_trade(self,symbol,side,ts,price,stop):
-        with self._db() as c:
-            cur=c.execute('INSERT INTO ttr_live_trades(symbol,side,entry_time,entry_price,status,stop_price) VALUES(?,?,?,?,?,?)',(symbol,side,ts,price,'OPEN',stop)); return cur.lastrowid
-    def update_trade(self,trade_id,**fields):
-        if not fields:return
-        with self._db() as c: c.execute('UPDATE ttr_live_trades SET '+','.join(f'{k}=?' for k in fields)+' WHERE id=?',(*fields.values(),trade_id))
-    def history(self,symbol,limit=50):
-        with self._db() as c: return [dict(x) for x in c.execute('SELECT * FROM ttr_live_trades WHERE symbol=? ORDER BY id DESC LIMIT ?',(symbol,limit))]
-    def events(self,symbol,limit=100):
-        with self._db() as c: return [dict(x) for x in c.execute('SELECT * FROM ttr_live_events WHERE symbol=? ORDER BY id DESC LIMIT ?',(symbol,limit))]
-    def status(self):
-        with self._db() as c: return [dict(x) for x in c.execute('SELECT symbol,enabled,config,state,last_bar_time,updated_at FROM ttr_live_config ORDER BY symbol')]
+    """SQLite/PostgreSQL persistence adapter. SQLite on Render Free is ephemeral."""
+    def __init__(self, path=None, backend=None, database_url=None):
+        self.backend = (backend or DB_BACKEND).lower()
+        self.path = path or DB_PATH
+        self.database_url = database_url or DATABASE_URL
+        if self.backend not in ('sqlite', 'postgres'):
+            raise ValueError(f'Unsupported TTR_DB_BACKEND: {self.backend}')
+        if self.backend == 'postgres' and not self.database_url:
+            raise RuntimeError('TTR_DB_BACKEND=postgres requiere DATABASE_URL o SUPABASE_DB_URL')
+        self._init_schema()
 
+    def _db(self):
+        if self.backend == 'sqlite':
+            Path(self.path).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+            c = sqlite3.connect(self.path, timeout=20)
+            c.row_factory = sqlite3.Row
+            return c
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError('Falta psycopg[binary]; instala requirements.txt') from exc
+        url = self.database_url
+        if 'sslmode=' not in url:
+            url += ('&' if '?' in url else '?') + 'sslmode=require'
+        return psycopg.connect(url, row_factory=dict_row, connect_timeout=15)
+
+    def _sql(self, query):
+        return query.replace('?', '%s') if self.backend == 'postgres' else query
+
+    def _execute(self, conn, query, params=()):
+        return conn.execute(self._sql(query), params)
+
+    def _init_schema(self):
+        if self.backend == 'sqlite':
+            ddl = [
+                "CREATE TABLE IF NOT EXISTS ttr_live_config (symbol TEXT PRIMARY KEY, chat_id INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, config TEXT NOT NULL, last_bar_time INTEGER, state TEXT NOT NULL DEFAULT '{}', updated_at INTEGER NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS ttr_live_events (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, event_time INTEGER NOT NULL, event_type TEXT NOT NULL, side TEXT, price REAL, payload TEXT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS ttr_live_trades (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_time INTEGER NOT NULL, entry_price REAL NOT NULL, exit_time INTEGER, exit_price REAL, exit_reason TEXT, status TEXT NOT NULL, stop_price REAL, realized_pnl_pct REAL NOT NULL DEFAULT 0, remaining_pct REAL NOT NULL DEFAULT 100, payload TEXT NOT NULL DEFAULT '{}')"
+            ]
+        else:
+            ddl = [
+                "CREATE TABLE IF NOT EXISTS ttr_live_config (symbol TEXT PRIMARY KEY, chat_id BIGINT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, config TEXT NOT NULL, last_bar_time BIGINT, state TEXT NOT NULL DEFAULT '{}', updated_at BIGINT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS ttr_live_events (id BIGSERIAL PRIMARY KEY, symbol TEXT NOT NULL, event_time BIGINT NOT NULL, event_type TEXT NOT NULL, side TEXT, price DOUBLE PRECISION, payload TEXT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS ttr_live_trades (id BIGSERIAL PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_time BIGINT NOT NULL, entry_price DOUBLE PRECISION NOT NULL, exit_time BIGINT, exit_price DOUBLE PRECISION, exit_reason TEXT, status TEXT NOT NULL, stop_price DOUBLE PRECISION, realized_pnl_pct DOUBLE PRECISION NOT NULL DEFAULT 0, remaining_pct DOUBLE PRECISION NOT NULL DEFAULT 100, payload TEXT NOT NULL DEFAULT '{}')"
+            ]
+        with self._db() as c:
+            for stmt in ddl:
+                self._execute(c, stmt)
+
+    def subscribe(self, symbol, chat_id, config):
+        with self._db() as c:
+            self._execute(c, 'INSERT INTO ttr_live_config(symbol,chat_id,enabled,config,last_bar_time,state,updated_at) VALUES(?,?,1,?,NULL,?,?) ON CONFLICT(symbol) DO UPDATE SET chat_id=excluded.chat_id,enabled=1,config=excluded.config,updated_at=excluded.updated_at', (symbol, chat_id, json.dumps(config), json.dumps({'position': None}), int(time.time()*1000)))
+
+    def unsubscribe(self, symbol):
+        with self._db() as c:
+            self._execute(c, 'UPDATE ttr_live_config SET enabled=0,updated_at=? WHERE symbol=?', (int(time.time()*1000), symbol))
+
+    def configs(self):
+        with self._db() as c:
+            return [dict(x) for x in self._execute(c, 'SELECT * FROM ttr_live_config WHERE enabled=1').fetchall()]
+
+    def get_config(self, symbol):
+        with self._db() as c:
+            x = self._execute(c, 'SELECT * FROM ttr_live_config WHERE symbol=?', (symbol,)).fetchone()
+            return dict(x) if x else None
+
+    def save_state(self, symbol, state, last_bar_time=None):
+        with self._db() as c:
+            if last_bar_time is None:
+                self._execute(c, 'UPDATE ttr_live_config SET state=?,updated_at=? WHERE symbol=?', (json.dumps(state), int(time.time()*1000), symbol))
+            else:
+                self._execute(c, 'UPDATE ttr_live_config SET state=?,last_bar_time=?,updated_at=? WHERE symbol=?', (json.dumps(state), last_bar_time, int(time.time()*1000), symbol))
+
+    def event(self, symbol, etype, side, price, ts, payload=None):
+        with self._db() as c:
+            self._execute(c, 'INSERT INTO ttr_live_events(symbol,event_time,event_type,side,price,payload) VALUES(?,?,?,?,?,?)', (symbol, ts, etype, side, price, json.dumps(payload or {})))
+
+    def open_trade(self, symbol, side, ts, price, stop):
+        with self._db() as c:
+            query = 'INSERT INTO ttr_live_trades(symbol,side,entry_time,entry_price,status,stop_price) VALUES(?,?,?,?,?,?)'
+            if self.backend == 'postgres':
+                return self._execute(c, query + ' RETURNING id', (symbol, side, ts, price, 'OPEN', stop)).fetchone()['id']
+            return self._execute(c, query, (symbol, side, ts, price, 'OPEN', stop)).lastrowid
+
+    def update_trade(self, trade_id, **fields):
+        allowed = {'exit_time', 'exit_price', 'exit_reason', 'status', 'stop_price', 'realized_pnl_pct', 'remaining_pct', 'payload'}
+        if not fields:
+            return
+        if set(fields) - allowed:
+            raise ValueError('Campo no permitido en update_trade')
+        with self._db() as c:
+            self._execute(c, 'UPDATE ttr_live_trades SET ' + ','.join(f'{k}=?' for k in fields) + ' WHERE id=?', (*fields.values(), trade_id))
+
+    def history(self, symbol, limit=50):
+        with self._db() as c:
+            return [dict(x) for x in self._execute(c, 'SELECT * FROM ttr_live_trades WHERE symbol=? ORDER BY id DESC LIMIT ?', (symbol, limit)).fetchall()]
+
+    def events(self, symbol, limit=100):
+        with self._db() as c:
+            return [dict(x) for x in self._execute(c, 'SELECT * FROM ttr_live_events WHERE symbol=? ORDER BY id DESC LIMIT ?', (symbol, limit)).fetchall()]
+
+    def status(self):
+        with self._db() as c:
+            return [dict(x) for x in self._execute(c, 'SELECT symbol,enabled,config,state,last_bar_time,updated_at FROM ttr_live_config ORDER BY symbol').fetchall()]
 STORE=TTRLiveStore()
 
 def _closed_candles(client,symbol):

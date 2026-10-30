@@ -452,7 +452,8 @@ El WebSocket usa `wss://fapi.bitunix.com/public/` y el canal público `trade`. A
 2. Confirmar que `requirements.txt` instala `websockets>=12,<16`.
 3. Mantener el servicio bot con Start Command `python bot.py`.
 4. Mantener el API como servicio independiente `python api_server.py` si se utiliza.
-5. Mantener el Persistent Disk y `TTR_LIVE_DB=/var/data/ttr_live.sqlite3`.
-6. Opcional: definir `TTR_WS_STALE_SECONDS=10` y `TTR_POLL_SECONDS=5`.
+5. **Render Free (prueba temporal):** no necesita Persistent Disk. Configura `TTR_DB_BACKEND=sqlite` y `TTR_LIVE_DB=/tmp/ttr_live.sqlite3`. La base funciona mientras la instancia siga viva, pero Render puede borrar `/tmp` al reiniciar, redeployar o reemplazar la instancia; no usar para conservar el historial a largo plazo.
+6. **Supabase PostgreSQL (persistencia definitiva):** configura `TTR_DB_BACKEND=postgres` y `DATABASE_URL` con la cadena PostgreSQL de Supabase (preferiblemente Session Pooler si Render no alcanza el host directo). También acepta `SUPABASE_DB_URL`. No subas esa URL al repositorio. El servicio crea las tres tablas automáticamente al arrancar; el SQL equivalente está en `supabase_ttr_schema.sql`. Añade `psycopg[binary]` (ya incluido en requirements.txt).
+7. `TTR_WS_STALE_SECONDS=10` y `TTR_POLL_SECONDS=5` siguen siendo opcionales.
 7. Tras desplegar, iniciar `/ttr_live start BTCUSDT --feed websocket --poll 5 --re-entry false` y verificar `/ttr_status`: fuente `websocket_trade`, WebSocket `CONECTADO`, datos recientes `True`.
 8. Simular una caída de WebSocket o bloquear temporalmente el acceso y verificar que fuente cambie a `rest_fallback`; al recuperar conexión debe volver a `websocket_trade`.

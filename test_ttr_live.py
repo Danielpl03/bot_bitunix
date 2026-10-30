@@ -37,3 +37,10 @@ def test_status_contains_indicator_and_live_quote_state(tmp_path):
     assert saved['market']['last_price']==2490
     assert saved['indicator']['psar']==2512
     assert saved['position']['stop']==2510
+
+def test_sqlite_store_creates_missing_parent_directory(tmp_path):
+    db_path = tmp_path / 'nested' / 'state' / 'live.sqlite'
+    store = TTRLiveStore(str(db_path))
+    store.subscribe('BTCUSDT', 1, {})
+    assert db_path.exists()
+    assert store.get_config('BTCUSDT')['symbol'] == 'BTCUSDT'

@@ -78,18 +78,18 @@ Rutas de consulta:
 - `GET /api/ttr/live/status`
 - `GET /api/ttr/live/history/BTCUSDT`
 
-Persistencia SQLite: por defecto `ttr_live.sqlite3` en el directorio de trabajo. En Render debe configurarse `TTR_LIVE_DB` a una ruta dentro de un Persistent Disk (por ejemplo `/var/data/ttr_live.sqlite3`) para conservar operaciones e historial tras reinicios/redeploys. Si no se monta disco persistente, el almacenamiento local puede perderse.
+Persistencia configurable: `TTR_DB_BACKEND=sqlite` usa SQLite en `/tmp/ttr_live.sqlite3` por defecto. Esto permite probar en Render Free sin Persistent Disk, pero es **efímero**: los datos pueden perderse en reinicios, redeploys o reemplazos de instancia. Para la persistencia definitiva usa Supabase PostgreSQL con `TTR_DB_BACKEND=postgres` y `DATABASE_URL` (o `SUPABASE_DB_URL`) igual a la URI PostgreSQL de Supabase. El esquema se crea automáticamente al iniciar; `supabase_ttr_schema.sql` contiene el DDL manual. La dependencia `psycopg[binary]` está en requirements.txt.
 
-El stop se actualiza con PSAR actual al cierre 15m y queda activo desde la siguiente vela. El monitor de un minuto consulta el último precio de Bitunix; un toque del stop cierra la posición simulada y abre la contraria en el registro. La ejecución exacta entre ticks depende de la frecuencia de consulta y de la disponibilidad del endpoint público.
+El stop se actualiza con PSAR actual al cierre 15m y queda activo desde la siguiente vela. Con `--feed websocket`, el monitor consume cada trade recibido; si el WebSocket queda inactivo usa REST como respaldo. Un toque del stop cierra la posición simulada y abre la contraria. La ejecución sigue siendo simulada.
 
 
 ## TTR Live: monitor de precio y estado
 
-El indicador se calcula exclusivamente con velas 15m cerradas. El monitor de precio consulta el ticker REST de Bitunix con una frecuencia configurable entre 2 y 30 segundos (por defecto 5s): `TTR_POLL_SECONDS=5` o `--poll 5` en `/ttr_live start`. La frecuencia de 2s es un sondeo REST rápido, no un flujo realmente instantáneo; para latencia inferior se recomienda integrar el WebSocket público de trades/ticker de Bitunix y conservar REST como reconciliación.
+El indicador se calcula exclusivamente con velas 15m cerradas. En modo WebSocket, `--poll 5` configura únicamente el intervalo del respaldo REST; en modo `--feed rest`, configura el sondeo REST entre 2 y 30 segundos.
 
 Ejemplo: `/ttr_live start BTCUSDT --dir Buy & Sell --tp 40,30,30 --re-entry false --poll 3`. Las reentradas siguen siendo opcionales mediante `--re-entry true|false`. `/ttr_status` muestra por cada suscripción activa precio consultado, intervalo de sondeo, PSAR y lagging PSAR de la última vela cerrada, hora de la vela, lado, entrada, stop, exposición restante, PnL realizado y configuración TP/reentrada. `GET /api/ttr/live/status` devuelve las mismas configuraciones y estado estructurado.
 
-El sondeo REST tiene límites de latencia y de rate limit; el stop intrabar se detecta en el primer sondeo cuyo precio observado haya cruzado el nivel, no necesariamente en el instante exacto del toque.
+En modo REST, el stop intrabar se detecta en el primer sondeo cuyo precio observado haya cruzado el nivel, no necesariamente en el instante exacto del toque.
 
 
 ## TTR Live WebSocket / REST
