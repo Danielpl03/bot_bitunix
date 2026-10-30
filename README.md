@@ -457,3 +457,13 @@ El WebSocket usa `wss://fapi.bitunix.com/public/` y el canal público `trade`. A
 7. `TTR_WS_STALE_SECONDS=10` y `TTR_POLL_SECONDS=5` siguen siendo opcionales.
 7. Tras desplegar, iniciar `/ttr_live start BTCUSDT --feed websocket --poll 5 --re-entry false` y verificar `/ttr_status`: fuente `websocket_trade`, WebSocket `CONECTADO`, datos recientes `True`.
 8. Simular una caída de WebSocket o bloquear temporalmente el acceso y verificar que fuente cambie a `rest_fallback`; al recuperar conexión debe volver a `websocket_trade`.
+
+### Persistencia PostgreSQL + recuperación de operaciones
+
+Para usar Supabase en Render configura `TTR_DB_BACKEND=postgres` y `DATABASE_URL` (o `SUPABASE_DB_URL`) con la URI PostgreSQL de Supabase. Mantén la URI como secreto de entorno, nunca en Git. El adaptador crea las tablas `ttr_live_config`, `ttr_live_events` y `ttr_live_trades` al arrancar. `psycopg[binary]` ya está incluido.
+
+Al iniciar cada ciclo, el monitor reconcilia la posición guardada con la tabla `ttr_live_trades`: si encuentra una operación `OPEN`, reconstruye lado, entrada, stop, porcentaje restante, PnL y estado de TP desde PostgreSQL; si la instantánea dice abierta pero el ledger dice cerrada, no la resucita. Volver a ejecutar `/ttr_live start SIMBOLO` actualiza configuración/chat sin borrar la posición ni `last_bar_time`. Las velas cerradas posteriores al último `last_bar_time` se recorren para recuperar señales TP/RE pendientes.
+
+**Migración única de SQLite a Supabase:** copia el archivo SQLite existente a un entorno donde puedas ejecutar Python, define `TTR_SQLITE_SOURCE=/ruta/ttr_live.sqlite3` y `DATABASE_URL`, instala `pip install -r requirements.txt` y ejecuta `python migrate_ttr_sqlite_to_postgres.py`. La migración conserva IDs, operaciones, eventos y suscripciones; puede reejecutarse sin duplicar IDs. No borres el SQLite hasta verificar `/ttr_history SIMBOLO` y `/ttr_status` contra PostgreSQL.
+
+Nota: el TP live usa la misma aproximación Python de fractales/engulfing que el backtest, no garantiza identidad exacta con TradingView mientras no tengamos el código fuente de las librerías Pine importadas. Ahora el cálculo se ejecuta sobre la posición real persistida y cada vela cerrada pendiente, en vez de reconstruir un backtest independiente y filtrar solo el evento de la última vela.

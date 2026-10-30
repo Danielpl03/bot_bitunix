@@ -44,3 +44,28 @@ def test_sqlite_store_creates_missing_parent_directory(tmp_path):
     store.subscribe('BTCUSDT', 1, {})
     assert db_path.exists()
     assert store.get_config('BTCUSDT')['symbol'] == 'BTCUSDT'
+
+
+def test_resubscribe_preserves_live_state_and_last_bar(tmp_path):
+    store=TTRLiveStore(str(tmp_path/'preserve.sqlite'))
+    store.subscribe('BTCUSDT',123,{'tp_percentages':[25,25,25,25]})
+    state={'position':{'side':'sell','trade_id':1,'remaining_pct':75,'stop':101}}
+    store.save_state('BTCUSDT',state,123456)
+    store.subscribe('BTCUSDT',999,{'tp_percentages':[40,30,30]})
+    cfg=store.get_config('BTCUSDT')
+    assert json.loads(cfg['state'])==state
+    assert cfg['last_bar_time']==123456
+    assert cfg['chat_id']==999
+
+
+def test_open_trade_ledger_can_restore_position(tmp_path):
+    store=TTRLiveStore(str(tmp_path/'restore.sqlite'))
+    store.subscribe('ETHUSDT',456,{'tp_percentages':[25,25,25,25]})
+    tid=store.open_trade('ETHUSDT','sell',900000,2500,2510)
+    store.update_trade(tid,remaining_pct=75,realized_pnl_pct=0.12,
+                       payload=json.dumps({'tp_count':1,'avg_entry':2500,'tp_marked_fractals':[8]}))
+    rows=store.open_trades('ETHUSDT')
+    assert len(rows)==1
+    assert rows[0]['id']==tid and rows[0]['status']=='OPEN'
+    assert rows[0]['remaining_pct']==75
+    assert json.loads(rows[0]['payload'])['tp_count']==1
