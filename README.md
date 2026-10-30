@@ -419,3 +419,40 @@ Comando Telegram: `/backtest_ttr BTCUSDT 1h 1000 --re-entry true --tp 40,30,30 -
 ### TTR: reporte de cierres parciales
 
 El comando `/backtest_ttr` adjunta un Excel con las hojas Resumen, Operaciones, Cierres parciales, Señales y Curva de capital. El resumen de Telegram muestra el PnL con cuatro decimales y separa el PnL acumulado de los TP del PnL del cierre final por stop/reversión. Esto permite distinguir un PnL pequeño que se redondeaba a `+0.00%` de un error de acumulación.
+
+## TTR paper trading en tiempo real
+
+Se añadió `/ttr_live` para seguimiento simulado (sin órdenes reales). El indicador se calcula sobre velas 15m cerradas y un JobQueue revisa el precio cada 60 segundos. El stop se actualiza al cierre 15m con PSAR actual y el monitor registra stop/reversión intrabar. Estado, operaciones y eventos se guardan en SQLite. Consulte `API_REST_README.md` para comandos, endpoints y configuración de disco persistente en Render.
+
+
+## TTR Live: monitor de precio y estado
+
+El indicador se calcula exclusivamente con velas 15m cerradas. El monitor de precio consulta el ticker REST de Bitunix con una frecuencia configurable entre 2 y 30 segundos (por defecto 5s): `TTR_POLL_SECONDS=5` o `--poll 5` en `/ttr_live start`. La frecuencia de 2s es un sondeo REST rápido, no un flujo realmente instantáneo; para latencia inferior se recomienda integrar el WebSocket público de trades/ticker de Bitunix y conservar REST como reconciliación.
+
+Ejemplo: `/ttr_live start BTCUSDT --dir Buy & Sell --tp 40,30,30 --re-entry false --poll 3`. Las reentradas siguen siendo opcionales mediante `--re-entry true|false`. `/ttr_status` muestra por cada suscripción activa precio consultado, intervalo de sondeo, PSAR y lagging PSAR de la última vela cerrada, hora de la vela, lado, entrada, stop, exposición restante, PnL realizado y configuración TP/reentrada. `GET /api/ttr/live/status` devuelve las mismas configuraciones y estado estructurado.
+
+El sondeo REST tiene límites de latencia y de rate limit; el stop intrabar se detecta en el primer sondeo cuyo precio observado haya cruzado el nivel, no necesariamente en el instante exacto del toque.
+
+
+## TTR Live: WebSocket + REST fallback
+
+- Feed predeterminado: WebSocket público Bitunix (`trade`), sin credenciales y sin enviar órdenes.
+- REST se conserva como respaldo automático si el WebSocket no entrega datos recientes (`TTR_WS_STALE_SECONDS`, predeterminado 10s).
+- El parámetro `--poll` controla la frecuencia de respaldo REST, no el WebSocket.
+- El PSAR se calcula exclusivamente al cierre de cada vela de 15m; el stream de trades solo vigila el stop ya confirmado.
+- Comandos: `/ttr_live start BTCUSDT --feed websocket --poll 5 --re-entry false`; para REST puro usar `--feed rest`.
+- `/ttr_status` informa fuente del último precio y salud/antigüedad del WebSocket.
+- No se envían órdenes reales.
+
+El WebSocket usa `wss://fapi.bitunix.com/public/` y el canal público `trade`. Ante desconexión se reconecta con backoff exponencial; mientras el stream esté obsoleto el monitor usa REST.
+
+
+### Despliegue WebSocket TTR
+1. Reemplazar el backend por esta versión completa.
+2. Confirmar que `requirements.txt` instala `websockets>=12,<16`.
+3. Mantener el servicio bot con Start Command `python bot.py`.
+4. Mantener el API como servicio independiente `python api_server.py` si se utiliza.
+5. Mantener el Persistent Disk y `TTR_LIVE_DB=/var/data/ttr_live.sqlite3`.
+6. Opcional: definir `TTR_WS_STALE_SECONDS=10` y `TTR_POLL_SECONDS=5`.
+7. Tras desplegar, iniciar `/ttr_live start BTCUSDT --feed websocket --poll 5 --re-entry false` y verificar `/ttr_status`: fuente `websocket_trade`, WebSocket `CONECTADO`, datos recientes `True`.
+8. Simular una caída de WebSocket o bloquear temporalmente el acceso y verificar que fuente cambie a `rest_fallback`; al recuperar conexión debe volver a `websocket_trade`.

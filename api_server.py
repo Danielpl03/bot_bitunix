@@ -20,6 +20,7 @@ from backtest_rsi import run_backtest as run_rsi, summarize as summarize_rsi
 from backtest_squeeze import run_backtest as run_squeeze, summarize as summarize_squeeze
 from backtest_dual_thrust import run_backtest as run_dual, summarize as summarize_dual
 from backtest_trend_trader_remastered import run_backtest as run_ttr
+from ttr_live import STORE as TTR_LIVE_STORE
 
 PORT = int(os.environ.get('PORT', '8000'))
 API_KEY = os.environ.get('BACKTEST_API_KEY', '').strip()
@@ -146,7 +147,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self): self.send_json(204,{})
     def do_GET(self):
         path=urlparse(self.path).path
-        if path=='/api/health': return self.send_json(200,{'ok':True,'service':'backtest-lab-python-api','strategies':['keltner','bollinger','rsi','reversion','squeeze','dual_thrust','trend_trader_remastered']})
+        if path=='/api/health': return self.send_json(200,{'ok':True,'service':'backtest-lab-python-api','strategies':['keltner','bollinger','rsi','reversion','squeeze','dual_thrust','trend_trader_remastered','trend_trader_remastered_live']})
+        if path=='/api/ttr/live/status':
+            rows=[r for r in TTR_LIVE_STORE.status() if r.get('enabled')]
+            for r in rows:
+                r['config']=json.loads(r.get('config') or '{}')
+                r['state']=json.loads(r.get('state') or '{}')
+            return self.send_json(200,{'subscriptions':rows,'count':len(rows)})
+        if path.startswith('/api/ttr/live/history/'):
+            symbol=path.rsplit('/',1)[-1].upper(); return self.send_json(200,{'symbol':symbol,'trades':TTR_LIVE_STORE.history(symbol,200),'events':TTR_LIVE_STORE.events(symbol,500)})
         return self.send_json(404,{'error':'Ruta no encontrada.'})
     def do_POST(self):
         if urlparse(self.path).path!='/api/backtest': return self.send_json(404,{'error':'Ruta no encontrada.'})

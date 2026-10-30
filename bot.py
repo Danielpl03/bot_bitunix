@@ -72,6 +72,7 @@ from backtest_dual_thrust_multitimeframe import (load_multitimeframe_candles, ru
 from backtest_trend_trader_remastered import run_backtest as run_ttr_backtest
 from xlsx_export_dual_thrust import build_dual_thrust_workbook
 from xlsx_export_ttr import build_ttr_workbook
+from ttr_live import STORE as TTR_LIVE_STORE, monitor_job as ttr_live_monitor_job
 from backtest_common import (parse_backtest_request, load_backtest_klines, filter_signals_to_period, filter_signals_by_density, filter_signals_by_opposite_band, filter_signals_by_channel_width)
 from risk_management import RiskConfig
 
@@ -96,6 +97,9 @@ BOT_COMMANDS = [
     BotCommand("backtest_squeeze", "Backtest Squeeze Bollinger + Keltner"),
     BotCommand("backtest_dual_thrust", "Backtest ruptura de rango Dual Thrust"),
     BotCommand("backtest_ttr", "Backtest Trend Trader-Remastered con TP parciales y stop PSAR"),
+    BotCommand("ttr_live", "Paper trading TTR en tiempo real (sin órdenes)"),
+    BotCommand("ttr_status", "Estado de operaciones TTR en seguimiento"),
+    BotCommand("ttr_history", "Historial de operaciones TTR"),
     BotCommand("balance", "Balance de tu cuenta de futuros (/balance USDT)"),
     BotCommand("positions", "Ver posiciones abiertas (/positions BTCUSDT)"),
     BotCommand("open", "Abrir posición (/open BTCUSDT BUY 0.01)"),
@@ -1015,6 +1019,73 @@ async def backtest_squeeze_command(update: Update, context: ContextTypes.DEFAULT
         return
     filename=f"backtest_squeeze_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
     await update.message.reply_document(document=workbook,filename=filename,caption=f"📊 Squeeze Bollinger + Keltner: {len(trades)} operaciones; {symbol} ({interval}).")
+
+
+async def ttr_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Suscribe/unsubscribe un símbolo a paper trading TTR; no envía órdenes."""
+    if not _is_authorized(update):
+        await update.message.reply_text("No autorizado."); return
+    args=list(context.args)
+    if not args:
+        await update.message.reply_text("Uso:\n/ttr_live start BTCUSDT [--dir Buy & Sell] [--tp 40,30,30] [--re-entry true|false] [--feed websocket|rest] [--poll 5]\n/ttr_live stop BTCUSDT\n/ttr_live list\nSolo alertas y simulación; nunca envía órdenes."); return
+    action=args[0].lower()
+    if action=='list':
+        rows=TTR_LIVE_STORE.status(); await update.message.reply_text("Seguimientos TTR:\n"+("\n".join(f"{r['symbol']}: {'ACTIVO' if r['enabled'] else 'DETENIDO'}" for r in rows) if rows else "Ninguno.")); return
+    if len(args)<2:
+        await update.message.reply_text("Indica el símbolo."); return
+    symbol=_normalize_symbol(args[1])
+    if action=='stop':
+        TTR_LIVE_STORE.unsubscribe(symbol); await update.message.reply_text(f"⏹ Seguimiento TTR detenido para {symbol}. El historial se conserva."); return
+    if action!='start':
+        await update.message.reply_text("Acción inválida: usa start, stop o list."); return
+    opts={'--dir':'Buy & Sell','--tp':'25,25,25,25','--re-entry':'false','--poll':'5','--feed':'websocket'}; i=2
+    while i<len(args):
+        k=args[i]
+        if k not in opts or i+1>=len(args): await update.message.reply_text(f"Parámetro inválido: {k}"); return
+        opts[k]=args[i+1]; i+=2
+    direction={'Both':'Buy & Sell','BuyOnly':'Buy Only','SellOnly':'Sell Only'}.get(opts['--dir'],opts['--dir'])
+    if direction not in ('Buy & Sell','Buy Only','Sell Only') or opts['--re-entry'].lower() not in ('true','false'):
+        await update.message.reply_text("Dirección o re-entry inválido."); return
+    try: tps=[float(x) for x in opts['--tp'].split(',')]; assert tps and all(x>0 for x in tps) and sum(tps)<=100
+    except Exception: await update.message.reply_text("TP inválido; ejemplo: --tp 40,30,30 (suma <=100)."); return
+    feed_mode=opts['--feed'].lower()
+    if feed_mode not in ('websocket','rest'): await update.message.reply_text('--feed debe ser websocket o rest.'); return
+    try: poll=int(opts['--poll']); assert 2 <= poll <= 30
+    except Exception: await update.message.reply_text('--poll debe estar entre 2 y 30 segundos.'); return
+    config={'interval':'15m','monitor_interval':f'{poll}s','poll_seconds':poll,'feed_mode':feed_mode,'pos_dir':direction,'tp_percentages':tps,'enter_on_reentry':opts['--re-entry'].lower()=='true','psar_start':.02,'psar_increment':.02,'psar_max':.025,'paper_only':True}
+    TTR_LIVE_STORE.subscribe(symbol,update.effective_chat.id,config)
+    await update.message.reply_text(f"✅ TTR paper trading activado para {symbol}.\nIndicador: 15m cerrado · feed: {feed_mode.upper()} (REST de respaldo; sondeo {poll}s) · stop: PSAR actual al cierre 15m.\nReentrada: {config['enter_on_reentry']} · TP: {tps}.\nNo se enviarán órdenes reales.")
+
+async def ttr_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update):
+        await update.message.reply_text("No autorizado."); return
+    rows=[r for r in TTR_LIVE_STORE.status() if r['enabled']]
+    if not rows:
+        await update.message.reply_text("No hay seguimientos TTR activos."); return
+    lines=["📡 *Seguimientos TTR activos*", ""]
+    for r in rows:
+        state=json.loads(r.get('state') or '{}'); pos=state.get('position'); market=state.get('market') or {}; ind=state.get('indicator') or {}; cfg=json.loads(r.get('config') or '{}')
+        lines.append(f"*{r['symbol']}* · {'🟢 '+pos['side'].upper() if pos else '⚪ SIN POSICIÓN'}")
+        feed=context.application.bot_data.get('ttr_ws_feed'); health=feed.health(r['symbol']) if feed else (market.get('feed_health') or {}); lines.append(f"Precio actual: `{market.get('last_price','N/D')}` · fuente: `{market.get('source','N/D')}` · REST: `{market.get('poll_seconds',cfg.get('poll_seconds',5))}s`")
+        lines.append(f"WebSocket: `{'CONECTADO' if health.get('connected') else 'DESCONECTADO'}` · datos recientes: `{health.get('fresh',False)}` · antigüedad: `{health.get('last_message_age_seconds','N/D')}s` · modo: `{cfg.get('feed_mode','websocket')}`")
+        lines.append(f"Indicador: `15m` · PSAR: `{ind.get('psar','N/D')}` · Lagging PSAR: `{ind.get('psar_lagging','N/D')}`")
+        lines.append(f"Última vela cerrada: `{datetime.fromtimestamp(ind['candle_time']/1000,timezone.utc):%Y-%m-%d %H:%M UTC}`" if ind.get('candle_time') else "Última vela cerrada: `calculando` ")
+        if pos:
+            lines.append(f"Entrada: `{pos.get('entry_price','N/D')}` · stop activo: `{pos.get('stop','N/D')}` · restante: `{float(pos.get('remaining_pct',100)):.2f}% · PnL realizado: {float(pos.get('realized_pnl_pct',0)):+.4f}%`")
+        lines.append(f"Dirección: `{cfg.get('pos_dir','Buy & Sell')}` · reentrada: `{cfg.get('enter_on_reentry',False)}` · TP: `{','.join(map(str,cfg.get('tp_percentages',[])))}`")
+        lines.append("")
+    await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
+
+
+async def ttr_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update): await update.message.reply_text("No autorizado."); return
+    symbol=_normalize_symbol(context.args[0]) if context.args else None
+    if not symbol:
+        await update.message.reply_text("Uso: /ttr_history BTCUSDT"); return
+    rows=TTR_LIVE_STORE.history(symbol,20)
+    if not rows: await update.message.reply_text(f"Sin operaciones registradas para {symbol}."); return
+    lines=[f"#{r['id']} {r['side'].upper()} · {datetime.fromtimestamp(r['entry_time']/1000,timezone.utc):%m-%d %H:%M} · entrada {r['entry_price']:.8g} · {'ABIERTA' if r['status']=='OPEN' else f"{r['exit_reason']} @ {r['exit_price']:.8g}"} · PnL {r['realized_pnl_pct']:+.4f}%" for r in rows]
+    await update.message.reply_text("Historial TTR "+symbol+":\n"+"\n".join(lines))
 
 
 async def backtest_ttr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2097,6 +2168,9 @@ def main() -> None:
     application.add_handler(CommandHandler("backtest_squeeze", backtest_squeeze_command))
     application.add_handler(CommandHandler("backtest_dual_thrust", backtest_dual_thrust_command))
     application.add_handler(CommandHandler("backtest_ttr", backtest_ttr_command))
+    application.add_handler(CommandHandler("ttr_live", ttr_live_command))
+    application.add_handler(CommandHandler("ttr_status", ttr_status_command))
+    application.add_handler(CommandHandler("ttr_history", ttr_history_command))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("positions", positions))
     application.add_handler(CommandHandler("open", open_position))
@@ -2106,6 +2180,8 @@ def main() -> None:
     application.add_error_handler(_error_handler)
 
     if application.job_queue is not None:
+        application.job_queue.run_repeating(ttr_live_monitor_job, interval=1, first=1, name="ttr_live_monitor")
+        logger.info("Monitor TTR paper trading: WebSocket prioritario, REST fallback; supervisor cada 1 segundo.")
         for interval, hours in (("4h", 4), ("1h", 1)):
             first_run = _next_boundary_utc(hours)
             application.job_queue.run_repeating(
