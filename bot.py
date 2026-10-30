@@ -25,6 +25,7 @@ Ejecución local:
     python bot.py
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -32,6 +33,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -1053,8 +1055,15 @@ async def ttr_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     try: poll=int(opts['--poll']); assert 2 <= poll <= 30
     except Exception: await update.message.reply_text('--poll debe estar entre 2 y 30 segundos.'); return
     config={'interval':'15m','monitor_interval':f'{poll}s','poll_seconds':poll,'feed_mode':feed_mode,'pos_dir':direction,'tp_percentages':tps,'enter_on_reentry':opts['--re-entry'].lower()=='true','psar_start':.02,'psar_increment':.02,'psar_max':.025,'paper_only':True}
-    TTR_LIVE_STORE.subscribe(symbol,update.effective_chat.id,config)
-    await update.message.reply_text(f"✅ TTR paper trading activado para {symbol}.\nIndicador: 15m cerrado · feed: {feed_mode.upper()} (REST de respaldo; sondeo {poll}s) · stop: PSAR actual al cierre 15m.\nReentrada: {config['enter_on_reentry']} · TP: {tps}.\nNo se enviarán órdenes reales.")
+    await asyncio.to_thread(TTR_LIVE_STORE.subscribe,symbol,update.effective_chat.id,config)
+    context.application.bot_data.setdefault('ttr_reconciled_symbols',set()).discard(symbol)
+    confirmation=(f"✅ TTR paper trading activado para {symbol}.\nIndicador: 15m cerrado · feed: {feed_mode.upper()} (REST de respaldo; sondeo {poll}s) · stop: PSAR actual al cierre 15m.\nReentrada: {config['enter_on_reentry']} · TP: {tps}.\nNo se enviarán órdenes reales.")
+    try:
+        await update.message.reply_text(confirmation)
+    except Exception:
+        # The subscription is already committed in the store. Telegram delivery
+        # failure must not roll back or misreport the paper-trading activation.
+        logger.warning("TTR %s activado, pero falló el envío de confirmación Telegram", symbol, exc_info=True)
 
 async def ttr_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update):
@@ -2099,9 +2108,12 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def _post_init(application: Application) -> None:
-    """Registra los comandos en Telegram (botón 'Menú' / lista al escribir '/')."""
-    await application.bot.set_my_commands(BOT_COMMANDS)
-    logger.info("Comandos registrados en el menú de Telegram.")
+    """Registra comandos sin hacer que un fallo temporal de Telegram impida arrancar."""
+    try:
+        await application.bot.set_my_commands(BOT_COMMANDS)
+        logger.info("Comandos registrados en el menú de Telegram.")
+    except Exception:
+        logger.warning("No se pudieron registrar los comandos en Telegram durante el arranque; el bot continuará y se podrá reintentar en otro despliegue.", exc_info=True)
 
 
 def _enable_health_check() -> None:
@@ -2154,7 +2166,21 @@ def main() -> None:
             "Configúralo antes de usar comandos privados en producción."
         )
 
-    application = Application.builder().token(token).post_init(_post_init).build()
+    telegram_request = HTTPXRequest(
+        connection_pool_size=20,
+        connect_timeout=20,
+        read_timeout=30,
+        write_timeout=30,
+        pool_timeout=15,
+    )
+    application = (
+        Application.builder()
+        .token(token)
+        .request(telegram_request)
+        .get_updates_request(HTTPXRequest(connect_timeout=20, read_timeout=30, write_timeout=30, pool_timeout=15))
+        .post_init(_post_init)
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("price", price))
@@ -2180,8 +2206,11 @@ def main() -> None:
     application.add_error_handler(_error_handler)
 
     if application.job_queue is not None:
-        application.job_queue.run_repeating(ttr_live_monitor_job, interval=1, first=1, name="ttr_live_monitor")
-        logger.info("Monitor TTR paper trading: WebSocket prioritario, REST fallback; supervisor cada 1 segundo.")
+        application.job_queue.run_repeating(
+            ttr_live_monitor_job, interval=1, first=1, name="ttr_live_monitor",
+            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 5},
+        )
+        logger.info("Monitor TTR paper trading: WebSocket prioritario, REST fallback; supervisor cada 1 segundo (sin solapamientos).")
         for interval, hours in (("4h", 4), ("1h", 1)):
             first_run = _next_boundary_utc(hours)
             application.job_queue.run_repeating(
