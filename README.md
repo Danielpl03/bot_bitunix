@@ -413,25 +413,25 @@ Al continuar el desarrollo:
 
 ## Trend Trader-Remastered (TTR)
 
-Comando Telegram: `/backtest_ttr BTCUSDT 1h 1000 --re-entry true --tp 40,30,30 --dir BuyOnly --fee 0.05 --slippage 0.02`. `--re-entry false` ignora las entradas RE; `--tp` asigna el porcentaje de posición por cada señal TP y su suma no puede superar 100. En reversión se cierra la posición restante y se abre la dirección contraria. El stop trailing usa el lagging PSAR calculado al cierre y se aplica desde la siguiente vela.
+El motor Python está adaptado a los fuentes Pine v6 entregados (`ttr.txt`, `tac.txt`, `toolsPos.txt`, `toolsFluent.txt`) mediante `ttr_pine.py`. Replica el `Tac.sar` personalizado (resultado, lagging y fast), los cruces exactos sobre lagging PSAR, fractales BW de cinco velas con confirmación diferida, breakout con vela previa y las condiciones engulfing/TP/RE. La entrada usa el valor lagging PSAR de la vela de señal, como `pos.enter(..., psar_lagging)` en Pine. El Pine no define stop-loss ni trailing stop; el PSAR solo determina entradas y reversiones. `--tp` asigna porcentajes contables de reducción por señal TP (extensión del backtester, no del Pine). La señal RE solo se registra; `ToolsPos.action(RE)` no aumenta la posición. Aunque la exposición contable llegue a 0% tras los TP, el estado del indicador sigue activo hasta un cruce opuesto. `--re-entry` se conserva por compatibilidad, pero no debe usarse para cambiar la posición al comparar con Pine.
 
 
 ### TTR: reporte de cierres parciales
 
-El comando `/backtest_ttr` adjunta un Excel con las hojas Resumen, Operaciones, Cierres parciales, Señales y Curva de capital. El resumen de Telegram muestra el PnL con cuatro decimales y separa el PnL acumulado de los TP del PnL del cierre final por stop/reversión. Esto permite distinguir un PnL pequeño que se redondeaba a `+0.00%` de un error de acumulación.
+El comando `/backtest_ttr` adjunta un Excel con las hojas Resumen, Operaciones, Cierres parciales, Señales y Curva de capital. El resumen de Telegram muestra el PnL con cuatro decimales y separa el PnL acumulado de los TP del PnL de la reversión/fin de datos. Esto permite distinguir un PnL pequeño que se redondeaba a `+0.00%` de un error de acumulación.
 
 ## TTR paper trading en tiempo real
 
-Se añadió `/ttr_live` para seguimiento simulado (sin órdenes reales). El indicador se calcula sobre velas 15m cerradas y un JobQueue revisa el precio cada 60 segundos. El stop se actualiza al cierre 15m con PSAR actual y el monitor registra stop/reversión intrabar. Estado, operaciones y eventos se guardan en SQLite. Consulte `API_REST_README.md` para comandos, endpoints y configuración de disco persistente en Render.
+`/ttr_live` es paper trading, no ejecución real de órdenes. Calcula las señales al cierre de velas 15m usando `ttr_pine.py`; el feed WebSocket/REST solo actualiza cotización. No existe stop intrabar porque el Pine no define stop. Estado, operaciones y eventos se guardan en SQLite/PostgreSQL. Consulte `API_REST_README.md`.
 
 
 ## TTR Live: monitor de precio y estado
 
 El indicador se calcula exclusivamente con velas 15m cerradas. El monitor de precio consulta el ticker REST de Bitunix con una frecuencia configurable entre 2 y 30 segundos (por defecto 5s): `TTR_POLL_SECONDS=5` o `--poll 5` en `/ttr_live start`. La frecuencia de 2s es un sondeo REST rápido, no un flujo realmente instantáneo; para latencia inferior se recomienda integrar el WebSocket público de trades/ticker de Bitunix y conservar REST como reconciliación.
 
-Ejemplo: `/ttr_live start BTCUSDT --dir Buy & Sell --tp 40,30,30 --re-entry false --poll 3`. Las reentradas siguen siendo opcionales mediante `--re-entry true|false`. `/ttr_status` muestra por cada suscripción activa precio consultado, intervalo de sondeo, PSAR y lagging PSAR de la última vela cerrada, hora de la vela, lado, entrada, stop, exposición restante, PnL realizado y configuración TP/reentrada. `GET /api/ttr/live/status` devuelve las mismas configuraciones y estado estructurado.
+Ejemplo: `/ttr_live start BTCUSDT --dir Buy & Sell --tp 40,30,30 --re-entry false --poll 3`. Las reentradas siguen siendo opcionales mediante `--re-entry true|false`. `/ttr_status` muestra precio consultado, PSAR/lagging PSAR, hora de vela, lado, entrada, exposición restante y PnL realizado. `GET /api/ttr/live/status` devuelve las mismas configuraciones y estado estructurado.
 
-El sondeo REST tiene límites de latencia y de rate limit; el stop intrabar se detecta en el primer sondeo cuyo precio observado haya cruzado el nivel, no necesariamente en el instante exacto del toque.
+El sondeo REST tiene límites de latencia y rate limit; la cotización no activa stops. Las señales se calculan únicamente al cierre 15m.
 
 
 ## TTR Live: WebSocket + REST fallback

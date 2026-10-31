@@ -98,7 +98,7 @@ BOT_COMMANDS = [
     BotCommand("backtest_rsi", "Backtest RSI por zonas extremas"),
     BotCommand("backtest_squeeze", "Backtest Squeeze Bollinger + Keltner"),
     BotCommand("backtest_dual_thrust", "Backtest ruptura de rango Dual Thrust"),
-    BotCommand("backtest_ttr", "Backtest Trend Trader-Remastered con TP parciales y stop PSAR"),
+    BotCommand("backtest_ttr", "Backtest TTR Pine v6 con TP parciales y reversiones"),
     BotCommand("ttr_live", "Paper trading TTR en tiempo real (sin órdenes)"),
     BotCommand("ttr_status", "Estado de operaciones TTR en seguimiento"),
     BotCommand("ttr_history", "Historial de operaciones TTR"),
@@ -1057,7 +1057,7 @@ async def ttr_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     config={'interval':'15m','monitor_interval':f'{poll}s','poll_seconds':poll,'feed_mode':feed_mode,'pos_dir':direction,'tp_percentages':tps,'enter_on_reentry':opts['--re-entry'].lower()=='true','psar_start':.02,'psar_increment':.02,'psar_max':.025,'paper_only':True}
     await asyncio.to_thread(TTR_LIVE_STORE.subscribe,symbol,update.effective_chat.id,config)
     context.application.bot_data.setdefault('ttr_reconciled_symbols',set()).discard(symbol)
-    confirmation=(f"✅ TTR paper trading activado para {symbol}.\nIndicador: 15m cerrado · feed: {feed_mode.upper()} (REST de respaldo; sondeo {poll}s) · stop: PSAR actual al cierre 15m.\nReentrada: {config['enter_on_reentry']} · TP: {tps}.\nNo se enviarán órdenes reales.")
+    confirmation=(f"✅ TTR paper trading activado para {symbol}.\nIndicador: 15m cerrado · feed: {feed_mode.upper()} (REST de respaldo; sondeo {poll}s) · sin stop-loss (Pine usa PSAR lagging solo para entrada/reversión).\nRE: señal del indicador (no añade exposición) · TP contables: {tps}.\nNo se enviarán órdenes reales.")
     try:
         await update.message.reply_text(confirmation)
     except Exception:
@@ -1080,8 +1080,8 @@ async def ttr_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append(f"Indicador: `15m` · PSAR: `{ind.get('psar','N/D')}` · Lagging PSAR: `{ind.get('psar_lagging','N/D')}`")
         lines.append(f"Última vela cerrada: `{datetime.fromtimestamp(ind['candle_time']/1000,timezone.utc):%Y-%m-%d %H:%M UTC}`" if ind.get('candle_time') else "Última vela cerrada: `calculando` ")
         if pos:
-            lines.append(f"Entrada: `{pos.get('entry_price','N/D')}` · stop activo: `{pos.get('stop','N/D')}` · restante: `{float(pos.get('remaining_pct',100)):.2f}% · PnL realizado: {float(pos.get('realized_pnl_pct',0)):+.4f}%`")
-        lines.append(f"Dirección: `{cfg.get('pos_dir','Buy & Sell')}` · reentrada: `{cfg.get('enter_on_reentry',False)}` · TP: `{','.join(map(str,cfg.get('tp_percentages',[])))}`")
+            lines.append(f"Entrada: `{pos.get('entry_price','N/D')}` · stop: `no definido por Pine` · restante: `{float(pos.get('remaining_pct',100)):.2f}% · PnL realizado: {float(pos.get('realized_pnl_pct',0)):+.4f}%`")
+        lines.append(f"Dirección: `{cfg.get('pos_dir','Buy & Sell')}` · RE: `solo señal Pine; no añade exposición` · TP: `{','.join(map(str,cfg.get('tp_percentages',[])))}`")
         lines.append("")
     await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
 
@@ -1098,12 +1098,12 @@ async def ttr_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def backtest_ttr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Backtest TTR con TP parciales, reentrada opcional y stop PSAR trailing."""
+    """Backtest TTR con port de Pine v6, TP parciales contables y reversiones."""
     raw=list(context.args)
     if not raw:
-        await update.message.reply_text("Uso: /backtest_ttr BTCUSDT 1h 1000 [--re-entry true|false] [--tp 25,25,25,25] [--dir Buy & Sell|Buy Only|Sell Only] [--fee 0.05] [--slippage 0.02]\nLos TP son porcentajes de la posición restante por cada señal TP; la suma debe ser <=100. La reversión cierra lo restante y abre la dirección contraria.")
+        await update.message.reply_text("Uso: /backtest_ttr BTCUSDT 1h 1000 [--re-entry true|false] [--tp 25,25,25,25] [--dir Buy & Sell|Buy Only|Sell Only] [--fee 0.05] [--slippage 0.02]\nLos TP son porcentajes de la posición restante por cada señal TP; la suma debe ser <=100. La señal de cruce opuesto invierte la dirección; TTR no define stop-loss.")
         return
-    opts={"--re-entry":"true","--tp":"25,25,25,25","--dir":"Buy & Sell","--fee":"0","--slippage":"0"}; positional=[]; i=0
+    opts={"--re-entry":"false","--tp":"25,25,25,25","--dir":"Buy & Sell","--fee":"0","--slippage":"0"}; positional=[]; i=0
     try:
         while i<len(raw):
             if raw[i] in opts:
@@ -1140,9 +1140,9 @@ async def backtest_ttr_command(update: Update, context: ContextTypes.DEFAULT_TYP
         result_for_export={**result,'summary':{**result['summary'],'trades':len(trades),'wins':len(wins),'losses':len(losses),'win_rate_pct':win_rate,'net_pnl_pct_compounded':(equity/100.0-1)*100,'profit_factor':pf},'events':[e for e in result.get('events',[]) if signal_start<=e.get('time',0)<=signal_end]}
         msg=(f"📊 TTR · {request.symbol} · {request.interval}\nOperaciones: {len(trades)} · Acierto: {win_rate:.2f}%\n"
              f"PnL compuesto: {(equity/100.0-1)*100:+.4f}% · Profit factor: {pf if pf is not None else 'N/D'}\n"
-             f"Dirección: {opts['--dir']} · Reentrada: {opts['--re-entry']} · TP: {','.join(map(str,tp))}%\nStop: trailing PSAR lagging actualizado al cierre; se aplica desde la vela siguiente.\n"
-             "El PnL de cada operación incluye los cierres parciales TP realizados antes del stop/reversión. El Excel adjunto desglosa cada cierre parcial.\n"
-             "Nota: los fractales y señales TP/RE son una aproximación Python, no una equivalencia validada vela por vela con TradingView.")
+             f"Dirección: {opts['--dir']} · RE auto-add (no Pine): desactivado · TP: {','.join(map(str,tp))}%\nSin stop-loss: el Pine original no contiene stop ni trailing stop.\n"
+             "El PnL de cada operación incluye los cierres parciales TP realizados antes de una reversión o fin de datos. El Excel adjunto desglosa cada cierre parcial.\n"
+             "Port Python de Tac.sar y Tac.BWFractals según los fuentes Pine entregados; aún requiere comparación de señales vela por vela con TradingView.")
         await update.message.reply_text(msg)
         if trades:
             lines=[]
@@ -1154,7 +1154,7 @@ async def backtest_ttr_command(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             workbook=build_ttr_workbook(request.symbol,request.interval,klines,result_for_export,trades,result.get('parameters',{}))
             filename=f"backtest_ttr_{request.symbol}_{request.interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
-            await update.message.reply_document(document=workbook,filename=filename,caption=f"📊 Excel TTR: {len(trades)} operaciones, cierres TP parciales, stops/reversiones, señales y curva de capital.")
+            await update.message.reply_document(document=workbook,filename=filename,caption=f"📊 Excel TTR: {len(trades)} operaciones, cierres TP parciales, reversiones, señales y curva de capital.")
         except Exception:
             logger.exception("Error generando/enviando Excel TTR")
             await update.message.reply_text("⚠️ El resumen se calculó, pero no pude generar o enviar el Excel TTR.")

@@ -32,10 +32,10 @@ def build_ttr_workbook(symbol, interval, klines, result, trades, params=None):
         ("Período UTC", f"{first:%Y-%m-%d %H:%M} → {last:%Y-%m-%d %H:%M}" if first and last else "N/D"),
         ("Velas", len(klines)), ("Operaciones cerradas en el período", len(trades)),
         ("Dirección", params.get('pos_dir', 'Buy & Sell')),
-        ("Entrar en reentrada", params.get('enter_on_reentry', True)),
+        ("Auto-add RE (no Pine)", "Desactivado; RE solo es señal"),
         ("Porcentajes TP", ", ".join(map(str, params.get('tp_percentages', [])))),
         ("Comisión por lado (%)", params.get('fee_pct', 0)), ("Deslizamiento por lado (%)", params.get('slippage_pct', 0)),
-        ("Stop", "Trailing lagging PSAR actualizado al cierre, efectivo desde la vela siguiente"),
+        ("Stop", "No existe en el Pine TTR original; el lagging PSAR solo genera entradas/reversiones"),
         ("Acierto (%)", wins / len(trades) * 100 if trades else 0),
         ("Ganadoras", wins), ("Perdedoras", losses),
         ("PnL neto sumado (% del tamaño inicial)", sum(float(t.get('pnl_pct') or 0) for t in trades)),
@@ -49,13 +49,13 @@ def build_ttr_workbook(symbol, interval, klines, result, trades, params=None):
     ws.column_dimensions['A'].width = 42; ws.column_dimensions['B'].width = 90
 
     op = wb.create_sheet("Operaciones")
-    headers = ["Entrada UTC", "Salida UTC", "Lado", "Precio entrada señal", "Precio medio entrada", "Precio salida", "Motivo salida", "PnL neto (% inicial)", "Tamaño restante (%)", "Velas", "PnL TP acumulado (% inicial)", "PnL stop/reversión (% inicial)", "Número TP", "Número reentradas"]
+    headers = ["Entrada UTC", "Salida UTC", "Lado", "Precio entrada señal", "Precio medio entrada", "Precio salida", "Motivo salida", "PnL neto (% inicial)", "Tamaño restante (%)", "Velas", "PnL TP acumulado (% inicial)", "PnL reversión (% inicial)", "Número TP", "Número señales RE"]
     for c,h in enumerate(headers,1): op.cell(1,c,h).fill=DARK; op.cell(1,c).font=WHITE
     for r,t in enumerate(trades,2):
         pieces=t.get('partial_exits') or []
         tp_pnl=sum(float(x.get('pnl_pct_position') or 0) for x in pieces if x.get('reason')=='TP')
         final_pnl=sum(float(x.get('pnl_pct_position') or 0) for x in pieces if x.get('reason') not in ('TP','RE_ADD'))
-        vals=[_dt(t.get('entry_time')),_dt(t.get('exit_time')),t.get('side'),t.get('entry_price'),t.get('avg_entry_price'),t.get('exit_price'),t.get('exit_reason'),t.get('pnl_pct'),t.get('remaining_pct'),t.get('bars_held'),tp_pnl,final_pnl,sum(x.get('reason')=='TP' for x in pieces),sum(x.get('reason')=='RE_ADD' for x in pieces)]
+        vals=[_dt(t.get('entry_time')),_dt(t.get('exit_time')),t.get('side'),t.get('entry_price'),t.get('avg_entry_price'),t.get('exit_price'),t.get('exit_reason'),t.get('pnl_pct'),t.get('remaining_pct'),t.get('bars_held'),tp_pnl,final_pnl,sum(x.get('reason')=='TP' for x in pieces),sum(e.get('type')=='RE' and e.get('side')==t.get('side') and e.get('time',0)>=t.get('entry_time',0) and e.get('time',0)<=(t.get('exit_time') or 0) for e in result.get('events',[]))]
         for c,v in enumerate(vals,1): op.cell(r,c,v)
         op.cell(r,1).number_format=op.cell(r,2).number_format="yyyy-mm-dd hh:mm"
         for c in (8,11,12): op.cell(r,c).number_format="0.0000"
@@ -75,7 +75,7 @@ def build_ttr_workbook(symbol, interval, klines, result, trades, params=None):
     for c in range(1,len(headers)+1): px.column_dimensions[get_column_letter(c)].width=24
 
     ev=wb.create_sheet("Señales")
-    headers=["Fecha UTC","Tipo","Lado","Precio","% cerrado","% añadido","Stop PSAR"]
+    headers=["Fecha UTC","Tipo","Lado","Precio","% cerrado","% añadido","Lagging PSAR / referencia"]
     for c,h in enumerate(headers,1): ev.cell(1,c,h).fill=DARK; ev.cell(1,c).font=WHITE
     for r,e in enumerate(result.get('events',[]),2):
         vals=[_dt(e.get('time')),e.get('type'),e.get('side'),e.get('price'),e.get('percent_closed'),e.get('percent_added'),e.get('stop_price',e.get('psar_lagging'))]

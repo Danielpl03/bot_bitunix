@@ -34,16 +34,16 @@ def test_tp_percentages_validation():
     else:
         assert False, 'TP allocation over 100% should fail'
 
-def test_reentry_and_trailing_stop_parameters_are_reported():
+def test_tp_parameters_and_absence_of_pine_stop_are_reported():
     r=run_backtest(*sample(),enter_on_reentry=False,tp_percentages=[40,30,30])
     assert r['parameters']['enter_on_reentry'] is False
     assert r['parameters']['tp_percentages']==[40.0,30.0,30.0]
-    assert r['parameters']['stop_mode']=='trailing_lagging_psar'
+    assert r['parameters']['stop_mode']=='none_pine_indicator'
 
 
 def test_trade_keeps_original_entry_separate_from_reentry_average():
     # The public entry price is the main signal price; re-entry averaging must not
-    # overwrite it, otherwise reversal/stop reporting can appear to close at entry.
+    # overwrite it, otherwise reversal reporting can appear to close at entry.
     r = run_backtest(*sample(), enter_on_reentry=True, sig_re_buy_no_tp=True, sig_re_sell_no_tp=True)
     for trade in r["trades"]:
         assert trade["avg_entry_price"] is not None

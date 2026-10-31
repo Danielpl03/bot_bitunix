@@ -58,10 +58,10 @@ Ejemplo de `params`:
 {"pos_dir":"Buy & Sell","psar_start":0.02,"psar_increment":0.02,"psar_max":0.025,"frac_lb_high":2,"frac_lb_low":2,"sig_re_min_proximity":0,"sig_re_buy_no_tp":false,"sig_re_sell_no_tp":false}
 ```
 
-**Limitación de fidelidad:** el Pine original importa `ToolsFluent`, `ToolsPos` y `Tac`; el código fuente de esas bibliotecas no viene incluido en el script compartido. El motor implementa PSAR, pivotes fractales confirmados, entradas/salidas por cruce del PSAR lagging y reglas visibles de TP/RE, pero algunas semánticas internas de `Tac.sar`, `Tac.BWFractals` y `ToolsPos.PosInfo/PosAction` se han aproximado. Para garantizar coincidencia vela a vela con TradingView habría que contrastar con el código de esas librerías o una exportación de señales de referencia.
+**Fidelidad:** ahora se incluyen los fuentes Pine entregados de `Tac`, `ToolsPos` y `ToolsFluent` en el módulo Python `ttr_pine.py`. Se portan el PSAR no estándar `Tac.sar`, la confirmación y ruptura de fractales BW, los filtros de engulfing, el cruce de lagging PSAR y las condiciones de TP/RE. Falta una prueba de paridad vela a vela contra una exportación de TradingView para validar la equivalencia de ejecución y los bordes temporales.
 
 ### Trend Trader-Remastered (TTR) — gestión de posición
-Para `strategy: "trend_trader_remastered"`, `params` admite `enter_on_reentry` (booleano), `tp_percentages` (lista, por ejemplo `[40,30,30]`), `fee_pct`, `slippage_pct` y los parámetros PSAR/fractales previos. La suma de `tp_percentages` no puede superar 100. Cada señal TP consume el siguiente porcentaje configurado; la reversión cierra el porcentaje restante y abre la dirección permitida. El stop sigue el lagging PSAR actualizado al cierre de cada vela y se aplica desde la siguiente. Los datos de fractales/TP/RE siguen siendo aproximados frente a las bibliotecas Pine privadas/publicadas externas.
+Para `strategy: "trend_trader_remastered"`, `params` admite `enter_on_reentry` (parámetro legado; ignorado para preservar Pine), `tp_percentages` (lista, por ejemplo `[40,30,30]`), `fee_pct`, `slippage_pct` y los parámetros PSAR/fractales previos. La suma de `tp_percentages` no puede superar 100. Cada señal TP consume el siguiente porcentaje configurado en la simulación contable Python; esos porcentajes no forman parte de las bibliotecas Pine. La señal RE se registra como evento, pero no agrega exposición: `ToolsPos.action(RE)` solo guarda la acción. Una señal de cruce opuesto cierra el estado anterior y puede iniciar la dirección permitida. **El Pine no define stop-loss ni trailing stop**; el lagging PSAR solo se usa para entradas y reversiones.
 
 ## TTR Paper Trading en tiempo real (sin órdenes)
 
@@ -80,20 +80,20 @@ Rutas de consulta:
 
 Persistencia configurable: `TTR_DB_BACKEND=sqlite` usa SQLite en `/tmp/ttr_live.sqlite3` por defecto. Esto permite probar en Render Free sin Persistent Disk, pero es **efímero**: los datos pueden perderse en reinicios, redeploys o reemplazos de instancia. Para la persistencia definitiva usa Supabase PostgreSQL con `TTR_DB_BACKEND=postgres` y `DATABASE_URL` (o `SUPABASE_DB_URL`) igual a la URI PostgreSQL de Supabase. El esquema se crea automáticamente al iniciar; `supabase_ttr_schema.sql` contiene el DDL manual. La dependencia `psycopg[binary]` está en requirements.txt.
 
-El stop se actualiza con PSAR actual al cierre 15m y queda activo desde la siguiente vela. Con `--feed websocket`, el monitor consume cada trade recibido; si el WebSocket queda inactivo usa REST como respaldo. Un toque del stop cierra la posición simulada y abre la contraria. La ejecución sigue siendo simulada.
+El monitor evalúa entradas/reversiones al cierre de velas 15m con la misma fórmula `Tac.sar`. No se vigila un stop intrabar porque el indicador Pine no define stop-loss. Con `--feed websocket`, el monitor consume trades para mostrar precio/estado; si el WebSocket queda inactivo usa REST como respaldo. La ejecución sigue siendo simulada.
 
 
 ## TTR Live: monitor de precio y estado
 
 El indicador se calcula exclusivamente con velas 15m cerradas. En modo WebSocket, `--poll 5` configura únicamente el intervalo del respaldo REST; en modo `--feed rest`, configura el sondeo REST entre 2 y 30 segundos.
 
-Ejemplo: `/ttr_live start BTCUSDT --dir Buy & Sell --tp 40,30,30 --re-entry false --poll 3`. Las reentradas siguen siendo opcionales mediante `--re-entry true|false`. `/ttr_status` muestra por cada suscripción activa precio consultado, intervalo de sondeo, PSAR y lagging PSAR de la última vela cerrada, hora de la vela, lado, entrada, stop, exposición restante, PnL realizado y configuración TP/reentrada. `GET /api/ttr/live/status` devuelve las mismas configuraciones y estado estructurado.
+Ejemplo: `/ttr_live start BTCUSDT --dir Buy & Sell --tp 40,30,30 --re-entry false --poll 3`. Las reentradas siguen siendo opcionales mediante `--re-entry true|false`. `/ttr_status` muestra por cada suscripción activa precio consultado, intervalo de sondeo, PSAR y lagging PSAR de la última vela cerrada, hora de la vela, lado, entrada, exposición restante, PnL realizado y configuración TP/reentrada. `GET /api/ttr/live/status` devuelve las mismas configuraciones y estado estructurado.
 
-En modo REST, el stop intrabar se detecta en el primer sondeo cuyo precio observado haya cruzado el nivel, no necesariamente en el instante exacto del toque.
+El WebSocket/REST actualiza el precio de mercado, pero no activa cierres por stop; las señales TTR se evalúan al cierre 15m.
 
 
 ## TTR Live WebSocket / REST
 
 `/ttr_live start BTCUSDT --feed websocket --poll 5 --re-entry false` usa el canal público `trade` de Bitunix para recibir precios ejecutados. Si no llegan mensajes durante `TTR_WS_STALE_SECONDS` (10 s por defecto), el monitor cambia automáticamente a REST con el intervalo `--poll`. Cuando el WebSocket vuelve a estar fresco, vuelve a priorizarlo. `--feed rest` mantiene el modo anterior sin WebSocket.
 
-El supervisor del bot corre cada segundo, consume los eventos trade acumulados y evalúa stops contra cada precio recibido. El PSAR se recalcula solo al cierre de la vela 15m. Esto sigue siendo paper trading: no se envían órdenes.
+El supervisor del bot corre cada segundo, consume los eventos trade acumulados para actualizar la cotización; las señales se evalúan al cierre 15m. El PSAR se recalcula solo al cierre de la vela 15m. Esto sigue siendo paper trading: no se envían órdenes.

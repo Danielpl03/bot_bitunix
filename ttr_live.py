@@ -1,11 +1,10 @@
-"""TTR paper-trading monitor: 15m closed-bar indicator + tick/price stop watcher.
+"""TTR paper-trading monitor: Pine-v6 signals on closed 15m candles.
 No exchange orders are ever sent. State and event history are persisted in SQLite or PostgreSQL.
 """
 from __future__ import annotations
 import json, os, sqlite3, time, math, asyncio, logging
 from datetime import datetime, timezone
 from pathlib import Path
-from backtest_trend_trader_remastered import _psar
 
 DATABASE_URL = os.environ.get('SUPABASE_DB_URL') or os.environ.get('DATABASE_URL')
 DB_BACKEND = os.environ.get('TTR_DB_BACKEND', 'auto').strip().lower()
@@ -13,6 +12,7 @@ if DB_BACKEND == 'auto':
     DB_BACKEND = 'postgres' if DATABASE_URL else 'sqlite'
 DB_PATH = os.environ.get('TTR_LIVE_DB', '/tmp/ttr_live.sqlite3')
 TF_MS = 15 * 60 * 1000
+PINE_ENGINE_VERSION = 2
 DEFAULT_POLL_SECONDS = max(2, int(os.environ.get('TTR_POLL_SECONDS', '5')))
 
 def poll_seconds(config=None):
@@ -172,6 +172,7 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
     # Reconcile the durable ledger once per process/symbol. This still repairs
     # crashes after a restart, without opening another PostgreSQL connection on
     # every one-second market-data tick.
+    now=int(time.time()*1000)
     reconciled=context.application.bot_data.setdefault('ttr_reconciled_symbols',set())
     if symbol not in reconciled:
         open_rows=await db_call('open_trades',symbol)
@@ -180,15 +181,28 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
             # This also repairs a crash between the trade commit and state snapshot.
             row=open_rows[0]
             payload=json.loads(row.get('payload') or '{}')
-            pos={'side':row['side'],'trade_id':row['id'],'entry_time':row['entry_time'],
-                 'entry_price':row['entry_price'],'avg_entry':payload.get('avg_entry',row['entry_price']),
-                 'remaining_pct':float(row.get('remaining_pct',100) or 0),
-                 'realized_pnl_pct':float(row.get('realized_pnl_pct',0) or 0),
-                 'stop':row.get('stop_price'), 'tp_count':int(payload.get('tp_count',0)),
-                 'tp_marked_fractals':payload.get('tp_marked_fractals',[]),
-                 're_marked_fractals':payload.get('re_marked_fractals',[]),
-                 'last_tp':payload.get('last_tp'),'last_re':payload.get('last_re')}
-            state['position']=pos
+            if int(payload.get('engine_version',0)) != PINE_ENGINE_VERSION:
+                # A legacy live-paper position was opened with the previous
+                # approximate PSAR-stop engine. Do not silently treat it as a
+                # Pine-v6 position; close its paper ledger at its entry reference.
+                await db_call('update_trade',row['id'],exit_time=now,exit_price=row['entry_price'],
+                    exit_reason='ENGINE_MIGRATION_RESET',status='CLOSED',
+                    remaining_pct=0,stop_price=None)
+                await db_call('event',symbol,'ENGINE_MIGRATION_RESET',row['side'],
+                    row['entry_price'],now,{'from_engine':payload.get('engine_version',0),'to_engine':PINE_ENGINE_VERSION})
+                pos=None
+                state['position']=None
+            else:
+                pos={'side':row['side'],'trade_id':row['id'],'entry_time':row['entry_time'],
+                     'entry_price':row['entry_price'],'avg_entry':payload.get('avg_entry',row['entry_price']),
+                     'remaining_pct':float(row.get('remaining_pct',100) or 0),
+                     'realized_pnl_pct':float(row.get('realized_pnl_pct',0) or 0),
+                     'stop':None, 'tp_count':int(payload.get('tp_count',0)),
+                     'tp_marked_fractals':payload.get('tp_marked_fractals',[]),
+                     're_marked_fractals':payload.get('re_marked_fractals',[]),
+                     'last_tp':payload.get('last_tp'),'last_re':payload.get('last_re'),'engine_version':PINE_ENGINE_VERSION}
+                await db_call('update_trade',row['id'],stop_price=None)
+                state['position']=pos
             await db_call('save_state',symbol,state)
         elif pos:
             # A stale config snapshot must not resurrect a trade already closed in SQL.
@@ -223,22 +237,8 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
     else:
         # Still evaluate a newly closed 15m bar even if there was no new quote.
         price=None; chat_id=cfg['chat_id']
-    # Check the fixed 15m PSAR stop every minute. Crossing closes and paper-reverses immediately.
-    stop_ticks=ws_ticks if source=='websocket_trade' and ws_ticks else ([{'price':price,'exchange_time':now*1,'source':source}] if price is not None else [])
-    for tick in stop_ticks:
-        tick_price=float(tick['price']); tick_time=int(tick.get('exchange_time') or now)
-        if not pos or pos.get('stop') is None: continue
-        stop=float(pos['stop']); hit=(pos['side']=='buy' and tick_price<=stop) or (pos['side']=='sell' and tick_price>=stop)
-        if hit:
-            side=pos['side']; pnl=((tick_price/pos['avg_entry']-1)*100)*(1 if side=='buy' else -1)
-            tid=pos['trade_id']; await db_call('update_trade',tid,exit_time=tick_time,exit_price=tick_price,exit_reason='SL_PSAR_INTRABAR',status='CLOSED',realized_pnl_pct=float(pos.get('realized_pnl_pct',0))+pnl*float(pos.get('remaining_pct',100))/100,remaining_pct=0)
-            await db_call('event',symbol,'SL',side,tick_price,tick_time,{'stop':stop,'trigger':source,'pnl_pct':pnl})
-            reverse='sell' if side=='buy' else 'buy'
-            new_id=await db_call('open_trade',symbol,reverse,tick_time,tick_price,None)
-            pos={'side':reverse,'trade_id':new_id,'entry_time':tick_time,'entry_price':tick_price,'avg_entry':tick_price,'remaining_pct':100.0,'realized_pnl_pct':0.0,'stop':None,'tp_count':0,'tp_marked_fractals':[],'re_marked_fractals':[],'last_tp':None,'last_re':None}
-            await db_call('event',symbol,'REVERSAL_ENTRY',reverse,tick_price,tick_time,{'closed_trade_id':tid})
-            _queue_notify(context, chat_id, f'🚨 TTR {symbol} · STOP/REVERSIÓN intrabar\nCierre {side.upper()} @ {tick_price:.8g} (PSAR {stop:.8g})\nPnL tramo abierto: {pnl:+.4f}%\nNueva operación simulada: {reverse.upper()} @ {tick_price:.8g}.')
-            state['position']=pos; await db_call('save_state',symbol,state)
+    # The Pine TTR indicator has no stop-loss or PSAR trailing stop.
+    # Its PSAR lagging line is used only for entry/reversal cross signals.
     # Do not download 120 candles on every supervisor tick. A new 15m bar is
     # eligible only after the current interval has ended and its open-time is
     # newer than the last bar committed to PostgreSQL.
@@ -264,106 +264,113 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
         return
     highs=[float(x['high']) for x in candles]; lows=[float(x['low']) for x in candles]
     closes=[float(x['close']) for x in candles]; opens=[float(x['open']) for x in candles]; times=[int(x['time']) for x in candles]
-    sar=_psar(highs,lows,float(params.get('psar_start',.02)),float(params.get('psar_increment',.02)),float(params.get('psar_max',.025)))
-    i=len(candles)-1; new_stop=float(sar[i]) if math.isfinite(sar[i]) else None
-    lagging=float(sar[i-1]) if i>=1 and math.isfinite(sar[i-1]) else None
+    from ttr_pine import sar as pine_sar, fractal_snapshots, cross_signal
+    sar_values, lag_values, fast_values = pine_sar(
+        highs, lows, closes, float(params.get('psar_start',.02)),
+        float(params.get('psar_increment',.02)), float(params.get('psar_max',.025)))
+    i=len(candles)-1
+    new_psar=float(sar_values[i]) if math.isfinite(sar_values[i]) else None
+    lagging=float(lag_values[i]) if math.isfinite(lag_values[i]) else None
+    fast=float(fast_values[i]) if math.isfinite(fast_values[i]) else None
     state['indicator']={'timeframe':'15m','candle_time':bar_time,'candle_close':closes[i],
-        'psar':new_stop,'psar_lagging':lagging,'psar_fast':None,
-        'updated_at':now,'source':'last_closed_15m_candle'}
-    # Stop ratchets only in the protective direction and becomes active after this candle closes.
-    if pos and new_stop is not None:
-        old=pos.get('stop')
-        candidate=new_stop if old is None else (max(float(old),new_stop) if pos['side']=='buy' else min(float(old),new_stop))
-        changed=old is None or not math.isclose(float(old),candidate,rel_tol=1e-12,abs_tol=1e-12)
-        pos['stop']=candidate
-        await db_call('update_trade',pos['trade_id'],stop_price=pos['stop'])
-        if changed:
-            await db_call('event',symbol,'STOP_UPDATE',pos['side'],pos['stop'],bar_time,{'indicator':'PSAR','activation':'next_15m_candle'})
-            _queue_notify(context,chat_id,f'🛡 TTR {symbol} · Stop PSAR actualizado al cierre 15m: {pos["stop"]:.8g} ({pos["side"].upper()}).')
-    # Main signal uses the Pine script's lagging-PSAR cross definition.
-    if i>=2 and math.isfinite(sar[i-1]) and math.isfinite(sar[i-2]):
-        lag_prev=float(sar[i-2]); lag_now=float(sar[i-1])
-        cross_high=highs[i]>lag_now and highs[i-1]<=lag_prev
-        cross_low=lows[i]<lag_now and lows[i-1]>=lag_prev
-        cross=1 if lag_prev>highs[i-1] and cross_high else (-1 if lag_prev<lows[i-1] and cross_low else 0)
+        'psar':new_psar,'psar_lagging':lagging,'psar_fast':fast,
+        'updated_at':now,'source':'Tac.sar Pine v6'}
+    # Replay every unprocessed closed candle in order. This is important after a
+    # worker restart: entry/reversal and TP/RE state must not jump straight to the
+    # newest candle and silently lose intervening Pine signals.
+    previous_bar=int(cfg.get('last_bar_time') or 0)
+    if previous_bar:
+        first_idx=next((k for k,t in enumerate(times) if int(t)>previous_bar),i)
+    else:
+        # A fresh subscription starts tracking from the latest completed bar;
+        # do not backfill historical trades before the subscription existed.
+        first_idx=i
+    hh_by_bar,ll_by_bar=fractal_snapshots(
+        highs,lows,opens,closes,times,
+        hh_lookback=int(params.get('frac_lb_high',2)),
+        ll_lookback=int(params.get('frac_lb_low',2)))
+    tp_values=[float(x) for x in params.get('tp_percentages',[25,25,25,25])]
+    for k in range(max(1,first_idx),i+1):
+        cross=cross_signal(highs,lows,lag_values,k)
         allow_buy=params.get('pos_dir','Buy & Sell') in ('Buy & Sell','Buy Only')
         allow_sell=params.get('pos_dir','Buy & Sell') in ('Buy & Sell','Sell Only')
         desired='buy' if cross==1 and allow_buy else ('sell' if cross==-1 and allow_sell else None)
-        if desired and (not pos or pos['side']!=desired):
-            if pos:
-                await db_call('update_trade',pos['trade_id'],exit_time=bar_time,exit_price=closes[i],exit_reason='REVERSAL_15M',status='CLOSED',realized_pnl_pct=float(pos.get('realized_pnl_pct',0))+((closes[i]/pos['avg_entry']-1)*100*(1 if pos['side']=='buy' else -1))*float(pos.get('remaining_pct',100))/100,remaining_pct=0)
-                await db_call('event',symbol,'REVERSAL_EXIT',pos['side'],closes[i],bar_time,{})
-            tid=await db_call('open_trade',symbol,desired,bar_time,closes[i],new_stop)
-            pos={'side':desired,'trade_id':tid,'entry_time':bar_time,'entry_price':closes[i],'avg_entry':closes[i],'remaining_pct':100.0,'realized_pnl_pct':0.0,'stop':new_stop,'tp_count':0,'tp_marked_fractals':[],'re_marked_fractals':[],'last_tp':None,'last_re':None}
-            await db_call('event',symbol,'ENTRY',desired,closes[i],bar_time,{'signal':'PSAR_LAGGING_CROSS','stop_psar':new_stop})
-            _queue_notify(context,chat_id,f'📍 TTR {symbol} · ENTRADA {desired.upper()}\nVela 15m cerrada: {datetime.fromtimestamp(bar_time/1000,timezone.utc):%Y-%m-%d %H:%M UTC}\nPrecio: {closes[i]:.8g}\nStop PSAR: {new_stop:.8g} (se comprueba con cada tick disponible).')
-    # Evaluate TP/RE on each unprocessed closed candle. Re-running the whole
-    # backtest here was incorrect: it reconstructed an independent position and
-    # could silently miss a TP for the actual live trade. This uses the same
-    # Python fractal/engulfing approximation, anchored to the persisted position.
-    if pos:
-        try:
-            from backtest_trend_trader_remastered import _fractals
-            frac_h,frac_l=_fractals(highs,lows,int(params.get('frac_lb_high',2)),int(params.get('frac_lb_low',2)))
-            previous_bar=int(cfg.get('last_bar_time') or (bar_time-TF_MS))
-            # A position with no recorded TP is replayed from its entry candle once
-            # so an earlier partial signal (missed by the old monitor) is not lost.
-            # Persisted TP markers/count prevent already-accounted partials repeating.
-            replay_from_entry=(int(pos.get('tp_count',0))==0 and not pos.get('tp_marked_fractals'))
-            if replay_from_entry:
-                first_idx=next((k for k,t in enumerate(times) if int(t)>=int(pos.get('entry_time',times[0]))),i)
+        exits_current=bool(pos and ((pos['side']=='buy' and cross==-1) or (pos['side']=='sell' and cross==1)))
+        if exits_current:
+            old_side=pos['side']
+            raw=((closes[k]/pos['avg_entry']-1)*100)*(1 if old_side=='buy' else -1)
+            realized=float(pos.get('realized_pnl_pct',0))+raw*float(pos.get('remaining_pct',100))/100
+            await db_call('update_trade',pos['trade_id'],exit_time=int(times[k]),exit_price=float(closes[k]),
+                exit_reason='REVERSAL_15M',status='CLOSED',realized_pnl_pct=realized,remaining_pct=0)
+            await db_call('event',symbol,'REVERSAL_EXIT',old_side,float(closes[k]),int(times[k]),{})
+            pos=None
+        elif pos and desired==pos['side']:
+            old_side=pos['side']
+            raw=((closes[k]/pos['avg_entry']-1)*100)*(1 if old_side=='buy' else -1)
+            realized=float(pos.get('realized_pnl_pct',0))+raw*float(pos.get('remaining_pct',100))/100
+            await db_call('update_trade',pos['trade_id'],exit_time=int(times[k]),exit_price=float(closes[k]),
+                exit_reason='PINE_ENTRY_RESET',status='CLOSED',realized_pnl_pct=realized,remaining_pct=0)
+            await db_call('event',symbol,'ENTRY_RESET',old_side,float(closes[k]),int(times[k]),{})
+            pos=None
+        if desired:
+            entry_price=float(lag_values[k]) if math.isfinite(lag_values[k]) else float(closes[k])
+            tid=await db_call('open_trade',symbol,desired,int(times[k]),entry_price,None)
+            await db_call('update_trade',tid,payload=json.dumps({'engine_version':PINE_ENGINE_VERSION}))
+            pos={'side':desired,'trade_id':tid,'entry_time':int(times[k]),'entry_price':entry_price,
+                 'avg_entry':entry_price,'remaining_pct':100.0,'realized_pnl_pct':0.0,'stop':None,
+                 'tp_count':0,'tp_marked_fractals':[],'re_marked_fractals':[],'last_tp':None,'last_re':None,'engine_version':PINE_ENGINE_VERSION}
+            await db_call('event',symbol,'ENTRY',desired,entry_price,int(times[k]),
+                          {'signal':'PSAR_LAGGING_CROSS','psar_lagging':entry_price})
+            _queue_notify(context,chat_id,f'📍 TTR {symbol} · ENTRADA {desired.upper()}\\nVela 15m cerrada: {datetime.fromtimestamp(int(times[k])/1000,timezone.utc):%Y-%m-%d %H:%M UTC}\\nPrecio de referencia Pine: {entry_price:.8g} (lagging PSAR).')
+            continue
+        # Pine does not evaluate TP/RE on a candle with a posExit.
+        if exits_current or not pos or int(times[k])<=int(pos.get('entry_time',0)):
+            continue
+        pos.setdefault('tp_count',0); pos.setdefault('tp_marked_fractals',[])
+        pos.setdefault('re_marked_fractals',[]); pos.setdefault('last_tp',None); pos.setdefault('last_re',None)
+        side=pos['side']
+        action,fractal=ttr_bar_action(
+            k,side=side,entry_price=float(pos['entry_price']),
+            entry_time=int(pos['entry_time']),closes=closes,opens=opens,
+            lagging=lag_values,times=times,hh_by_bar=hh_by_bar,ll_by_bar=ll_by_bar,
+            frac_lb_high=int(params.get('frac_lb_high',2)),frac_lb_low=int(params.get('frac_lb_low',2)),
+            sig_re_min_proximity=float(params.get('sig_re_min_proximity',0)),
+            sig_re_buy_no_tp=bool(params.get('sig_re_buy_no_tp',False)),
+            sig_re_sell_no_tp=bool(params.get('sig_re_sell_no_tp',False)),
+            marked_tp=set(int(x) for x in pos['tp_marked_fractals']),
+            marked_re=set(int(x) for x in pos['re_marked_fractals']),
+            last_tp=pos.get('last_tp'),last_re=pos.get('last_re'))
+        if not action:
+            continue
+        if action=='TP':
+            marked=set(int(x) for x in pos['tp_marked_fractals']); marked.add(int(fractal.when))
+            pos['tp_marked_fractals']=sorted(marked)
+            slot=int(pos.get('tp_count',0))
+            pct=min(tp_values[slot],float(pos.get('remaining_pct',100))) if slot<len(tp_values) else 0.0
+            pos['last_tp']=float(closes[k]); pos['tp_count']=slot+1
+            if pct>0:
+                raw=((float(closes[k])/float(pos['avg_entry'])-1)*100)*(1 if side=='buy' else -1)
+                pos['realized_pnl_pct']=float(pos.get('realized_pnl_pct',0))+raw*pct/100
+                pos['remaining_pct']=max(0,float(pos.get('remaining_pct',100))-pct)
+                await db_call('update_trade',pos['trade_id'],realized_pnl_pct=pos['realized_pnl_pct'],
+                    remaining_pct=pos['remaining_pct'],payload=json.dumps({key:pos.get(key) for key in
+                    ('engine_version','avg_entry','tp_count','tp_marked_fractals','re_marked_fractals','last_tp','last_re')}))
+                await db_call('event',symbol,'TP',side,float(closes[k]),int(times[k]),
+                    {'tp_number':slot+1,'percent_closed':pct,'remaining_pct':pos['remaining_pct'],'fractal_time':int(fractal.when)})
+                _queue_notify(context,chat_id,f'🎯 TTR {symbol} · TP {slot+1}\\n{side.upper()} · vela {datetime.fromtimestamp(int(times[k])/1000,timezone.utc):%Y-%m-%d %H:%M UTC} · precio {closes[k]:.8g} · cierre simulado {pct:.2f}% · restante {pos["remaining_pct"]:.2f}%.')
             else:
-                first_idx=next((k for k,t in enumerate(times) if int(t)>previous_bar),i)
-            tp_values=[float(x) for x in params.get('tp_percentages',[25,25,25,25])]
-            pos.setdefault('tp_count',0); pos.setdefault('tp_marked_fractals',[])
-            pos.setdefault('re_marked_fractals',[]); pos.setdefault('last_tp',None); pos.setdefault('last_re',None)
-            for k in range(max(2,first_idx),i+1):
-                if not pos: break
-                side=pos['side']; entry_idx=next((q for q,t in enumerate(times) if int(t)>=int(pos.get('entry_time',times[0]))),0)
-                proximity=abs(closes[k]-sar[k])/abs(sar[k])*100 if math.isfinite(sar[k]) and sar[k] else 0
-                up_bo=closes[k-1]>opens[k-1] and closes[k]<=opens[k]
-                down_bo=closes[k-1]<opens[k-1] and closes[k]>=opens[k]
-                marked_tp=set(int(x) for x in pos.get('tp_marked_fractals',[]))
-                marked_re=set(int(x) for x in pos.get('re_marked_fractals',[]))
-                action=None; candidate=None
-                if up_bo:
-                    candidates=[j for j in range(max(0,k-int(params.get('frac_lb_high',2))*3),k)
-                                if frac_h[j] and j>=entry_idx and closes[k]>highs[j] and j not in marked_tp and j not in marked_re]
-                    if side=='buy' and closes[k]>float(pos['entry_price']) and candidates and (pos.get('last_tp') is None or closes[k]>float(pos['last_tp'])):
-                        action='TP'; candidate=candidates[-1]
-                    elif side=='sell' and candidates and proximity>float(params.get('sig_re_min_proximity',0)) and (pos.get('last_tp') is not None or params.get('sig_re_sell_no_tp',False)) and (pos.get('last_re') is None or closes[k]>float(pos['last_re'])):
-                        action='RE'; candidate=candidates[-1]
-                if down_bo and action is None:
-                    candidates=[j for j in range(max(0,k-int(params.get('frac_lb_low',2))*3),k)
-                                if frac_l[j] and j>=entry_idx and closes[k]<lows[j] and j not in marked_tp and j not in marked_re]
-                    if side=='sell' and closes[k]<float(pos['entry_price']) and candidates and (pos.get('last_tp') is None or closes[k]<float(pos['last_tp'])):
-                        action='TP'; candidate=candidates[-1]
-                    elif side=='buy' and candidates and proximity>float(params.get('sig_re_min_proximity',0)) and (pos.get('last_tp') is not None or params.get('sig_re_buy_no_tp',False)) and (pos.get('last_re') is None or closes[k]<float(pos['last_re'])):
-                        action='RE'; candidate=candidates[-1]
-                if not action or candidate is None: continue
-                if action=='TP':
-                    marked_tp.add(candidate); pos['tp_marked_fractals']=sorted(marked_tp)
-                    slot=int(pos.get('tp_count',0)); pct=min(tp_values[slot],float(pos.get('remaining_pct',100))) if slot<len(tp_values) else 0.0
-                    pos['last_tp']=float(closes[k]); pos['tp_count']=slot+1
-                    if pct>0:
-                        raw=((float(closes[k])/float(pos['avg_entry'])-1)*100)*(1 if side=='buy' else -1)
-                        pos['realized_pnl_pct']=float(pos.get('realized_pnl_pct',0))+raw*pct/100
-                        pos['remaining_pct']=max(0,float(pos.get('remaining_pct',100))-pct)
-                        await db_call('update_trade',pos['trade_id'],realized_pnl_pct=pos['realized_pnl_pct'],remaining_pct=pos['remaining_pct'],payload=json.dumps({key:pos.get(key) for key in ('avg_entry','tp_count','tp_marked_fractals','re_marked_fractals','last_tp','last_re')}))
-                        await db_call('event',symbol,'TP',side,float(closes[k]),int(times[k]),{'tp_number':slot+1,'percent_closed':pct,'remaining_pct':pos['remaining_pct'],'fractal_index':candidate})
-                        _queue_notify(context,chat_id,f'🎯 TTR {symbol} · TP {slot+1}\n{side.upper()} · vela {datetime.fromtimestamp(int(times[k])/1000,timezone.utc):%Y-%m-%d %H:%M UTC} · precio {closes[k]:.8g} · cierre simulado {pct:.2f}% · restante {pos["remaining_pct"]:.2f}%.')
-                    if pos['remaining_pct']<=1e-8:
-                        await db_call('update_trade',pos['trade_id'],exit_time=int(times[k]),exit_price=float(closes[k]),exit_reason='TP_FULL',status='CLOSED',remaining_pct=0)
-                        pos=None
-                        break
-                else:
-                    marked_re.add(candidate); pos['re_marked_fractals']=sorted(marked_re); pos['last_re']=float(closes[k])
-                    await db_call('event',symbol,'RE',side,float(closes[k]),int(times[k]),{'entry_enabled':bool(params.get('enter_on_reentry',False))})
-                    _queue_notify(context,chat_id,f'↪️ TTR {symbol} · señal RE {side.upper()} @ {closes[k]:.8g} · entrada RE habilitada: {bool(params.get("enter_on_reentry",False))}.')
-                if pos:
-                    await db_call('update_trade',pos['trade_id'],payload=json.dumps({key:pos.get(key) for key in ('avg_entry','tp_count','tp_marked_fractals','re_marked_fractals','last_tp','last_re')}))
-        except Exception:
-            import logging; logging.getLogger(__name__).exception('TTR TP/RE evaluation error %s',symbol)
+                await db_call('event',symbol,'TP_SIGNAL_NO_CLOSE',side,float(closes[k]),int(times[k]),
+                    {'tp_number':slot+1,'percent_closed':0,'remaining_pct':pos['remaining_pct'],'fractal_time':int(fractal.when)})
+                _queue_notify(context,chat_id,f'🎯 TTR {symbol} · señal TP {slot+1} @ {closes[k]:.8g} (sin reducción adicional configurada).')
+        else:
+            marked=set(int(x) for x in pos['re_marked_fractals']); marked.add(int(fractal.when))
+            pos['re_marked_fractals']=sorted(marked); pos['last_re']=float(closes[k])
+            await db_call('event',symbol,'RE',side,float(closes[k]),int(times[k]),
+                {'entry_enabled':False,'fractal_time':int(fractal.when)})
+            _queue_notify(context,chat_id,f'↪️ TTR {symbol} · señal RE {side.upper()} @ {closes[k]:.8g} · RE solo informativa; Pine no aumenta exposición.')
+        if pos:
+            await db_call('update_trade',pos['trade_id'],payload=json.dumps({key:pos.get(key) for key in
+                ('engine_version','avg_entry','tp_count','tp_marked_fractals','re_marked_fractals','last_tp','last_re')}))
     state['position']=pos
     await db_call('save_state',symbol,state,last_bar_time=bar_time)
 
