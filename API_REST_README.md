@@ -69,7 +69,7 @@ El bot incorpora un monitor de TTR que consulta precio cada 60 segundos y calcul
 
 Comandos Telegram (solo usuario autorizado):
 - `/ttr_live start BTCUSDT [--dir "Buy & Sell"] [--tp 40,30,30] [--re-entry true|false]`
-- `/ttr_live stop BTCUSDT`
+- `/ttr_stop BTCUSDT` (también disponible como `/ttr_live stop BTCUSDT`)
 - `/ttr_live list`
 - `/ttr_status`
 - `/ttr_history BTCUSDT`

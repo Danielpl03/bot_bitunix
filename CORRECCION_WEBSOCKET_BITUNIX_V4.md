@@ -41,7 +41,7 @@ Si una variable contiene un valor no numérico, el sistema registra una adverten
 
 ## Cambios adicionales V4.1 — control por símbolo
 
-- `/ttr_live stop SIMBOLO` desactiva la suscripción persistente y cierra solamente el WebSocket de ese símbolo; no afecta a los demás.
+- `/ttr_stop SIMBOLO` (también `/ttr_live stop SIMBOLO`) desactiva la suscripción persistente y cierra solamente el WebSocket de ese símbolo; no afecta a los demás.
 - Un símbolo detenido queda bloqueado frente a un `ensure()` tardío del supervisor; solo un nuevo `/ttr_live start SIMBOLO` lo habilita expresamente.
 - El supervisor limpia conexiones de símbolos desactivados o configurados en modo REST.
 - Repetir `/ttr_live start SIMBOLO` actualiza únicamente las opciones indicadas; las omitidas conservan sus valores actuales. Se conserva el estado de estrategia, `last_bar_time`, historial y posiciones abiertas.

@@ -471,7 +471,7 @@ Nota: el TP live usa la misma aproximación Python de fractales/engulfing que el
 
 ### Actualizar o detener un TTR Live por símbolo
 
-- Detener solo una moneda: `/ttr_live stop BTCUSDT`. Se desactiva su monitor y se cierra su WebSocket; los datos históricos y posiciones registradas se conservan.
+- Detener solo una moneda: `/ttr_stop BTCUSDT` (también disponible como `/ttr_live stop BTCUSDT`). Se desactiva su monitor y se cierra su WebSocket; los datos históricos y posiciones registradas se conservan.
 - Cambiar parámetros sin reiniciar el estado: volver a ejecutar `/ttr_live start BTCUSDT` con las opciones que se quieran modificar, por ejemplo `/ttr_live start BTCUSDT --tp 40,30,30` o `/ttr_live start BTCUSDT --feed rest --poll 3`. Las opciones omitidas conservan su configuración anterior.
 - Dirección con espacios: `/ttr_live start BTCUSDT --dir "Buy & Sell"`.
 - El comando `/ttr_health` responde en texto plano para que nombres de componentes y mensajes con caracteres especiales no provoquen errores de parseo Markdown de Telegram.

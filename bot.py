@@ -105,6 +105,7 @@ BOT_COMMANDS = [
     BotCommand("backtest_dual_thrust", "Backtest ruptura de rango Dual Thrust"),
     BotCommand("backtest_ttr", "Backtest TTR Pine v6 con TP parciales y reversiones"),
     BotCommand("ttr_live", "Paper trading TTR en tiempo real (sin órdenes)"),
+    BotCommand("ttr_stop", "Detener TTR Live para un símbolo (/ttr_stop BTCUSDT)"),
     BotCommand("ttr_notify", "Activar/desactivar avisos TTR por evento y símbolo"),
     BotCommand("ttr_status", "Estado de operaciones TTR en seguimiento"),
     BotCommand("ttr_history", "Historial global o por símbolo de TTR"),
@@ -1188,6 +1189,30 @@ async def ttr_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text(confirmation)
     except Exception:
         logger.warning("TTR %s guardado, pero falló el envío de confirmación Telegram", symbol, exc_info=True)
+
+
+async def ttr_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Detiene TTR Live para un símbolo sin borrar historial ni posiciones."""
+    if not _is_authorized(update):
+        await update.message.reply_text("No autorizado.")
+        return
+    if not context.args:
+        await update.message.reply_text("Uso: /ttr_stop BTCUSDT")
+        return
+
+    symbol = _normalize_symbol(context.args[0])
+    await asyncio.to_thread(TTR_LIVE_STORE.unsubscribe, symbol)
+    feed = context.application.bot_data.get("ttr_ws_feed")
+    if feed is not None:
+        try:
+            await feed.stop_symbol(symbol)
+        except Exception:
+            logger.exception("No se pudo cerrar WebSocket TTR de %s", symbol)
+    context.application.bot_data.setdefault("ttr_reconciled_symbols", set()).discard(symbol)
+    await update.message.reply_text(
+        f"⏹ Seguimiento TTR detenido para {symbol}. "
+        "Se cierra su WebSocket; el historial y las posiciones registradas se conservan."
+    )
 
 
 async def ttr_notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2405,6 +2430,7 @@ def main() -> None:
     application.add_handler(CommandHandler("backtest_dual_thrust", backtest_dual_thrust_command))
     application.add_handler(CommandHandler("backtest_ttr", backtest_ttr_command))
     application.add_handler(CommandHandler("ttr_live", ttr_live_command))
+    application.add_handler(CommandHandler("ttr_stop", ttr_stop_command))
     application.add_handler(CommandHandler("ttr_notify", ttr_notify_command))
     application.add_handler(CommandHandler("ttr_status", ttr_status_command))
     application.add_handler(CommandHandler("ttr_history", ttr_history_command))
