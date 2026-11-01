@@ -15,9 +15,33 @@ TF_MS = 15 * 60 * 1000
 PINE_ENGINE_VERSION = 2
 DEFAULT_POLL_SECONDS = max(2, int(os.environ.get('TTR_POLL_SECONDS', '5')))
 
+def resume_bar_boundary(now_ms=None):
+    """Latest fully closed 15m candle; bars during downtime are deliberately skipped."""
+    now_ms = int(time.time()*1000) if now_ms is None else int(now_ms)
+    return (now_ms//TF_MS)*TF_MS-TF_MS
+
+
+def restore_position_from_trade(row):
+    """Rebuild a TTR position from the durable OPEN-trade ledger row."""
+    try: payload=json.loads(row.get('payload') or '{}')
+    except (TypeError, ValueError): payload={}
+    saved=dict(payload.get('position') or {})
+    saved.update({'side':row['side'],'trade_id':row['id'],'entry_time':int(row['entry_time']),
+        'entry_price':float(row['entry_price']),'avg_entry':float(payload.get('avg_entry',saved.get('avg_entry',row['entry_price']))),
+        'remaining_pct':float(row.get('remaining_pct',100) or 0),
+        'realized_pnl_pct':float(row.get('realized_pnl_pct',0) or 0),
+        'stop':row.get('stop_price'),'engine_version':payload.get('engine_version',PINE_ENGINE_VERSION)})
+    for key,default in (('tp_count',0),('tp_marked_fractals',[]),('re_marked_fractals',[]),('last_tp',None),('last_re',None)):
+        saved.setdefault(key,payload.get(key,default))
+    return saved
+
+
 def poll_seconds(config=None):
     config = config or {}
     return max(2, min(30, int(config.get('poll_seconds', DEFAULT_POLL_SECONDS))))
+
+class TTRDatabaseError(RuntimeError):
+    pass
 
 class TTRLiveStore:
     """SQLite/PostgreSQL persistence adapter. SQLite on Render Free is ephemeral."""
@@ -58,21 +82,41 @@ class TTRLiveStore:
             ddl = [
                 "CREATE TABLE IF NOT EXISTS ttr_live_config (symbol TEXT PRIMARY KEY, chat_id INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, config TEXT NOT NULL, last_bar_time INTEGER, state TEXT NOT NULL DEFAULT '{}', updated_at INTEGER NOT NULL)",
                 "CREATE TABLE IF NOT EXISTS ttr_live_events (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, event_time INTEGER NOT NULL, event_type TEXT NOT NULL, side TEXT, price REAL, payload TEXT NOT NULL)",
-                "CREATE TABLE IF NOT EXISTS ttr_live_trades (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_time INTEGER NOT NULL, entry_price REAL NOT NULL, exit_time INTEGER, exit_price REAL, exit_reason TEXT, status TEXT NOT NULL, stop_price REAL, realized_pnl_pct REAL NOT NULL DEFAULT 0, remaining_pct REAL NOT NULL DEFAULT 100, payload TEXT NOT NULL DEFAULT '{}')"
+                "CREATE TABLE IF NOT EXISTS ttr_live_trades (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_time INTEGER NOT NULL, entry_price REAL NOT NULL, exit_time INTEGER, exit_price REAL, exit_reason TEXT, status TEXT NOT NULL, stop_price REAL, realized_pnl_pct REAL NOT NULL DEFAULT 0, remaining_pct REAL NOT NULL DEFAULT 100, payload TEXT NOT NULL DEFAULT '{}')",
+                "CREATE TABLE IF NOT EXISTS ttr_live_health (component TEXT PRIMARY KEY, category TEXT NOT NULL, status TEXT NOT NULL, message TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, occurrences INTEGER NOT NULL DEFAULT 1, last_success INTEGER)"
             ]
         else:
             ddl = [
                 "CREATE TABLE IF NOT EXISTS ttr_live_config (symbol TEXT PRIMARY KEY, chat_id BIGINT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, config TEXT NOT NULL, last_bar_time BIGINT, state TEXT NOT NULL DEFAULT '{}', updated_at BIGINT NOT NULL)",
                 "CREATE TABLE IF NOT EXISTS ttr_live_events (id BIGSERIAL PRIMARY KEY, symbol TEXT NOT NULL, event_time BIGINT NOT NULL, event_type TEXT NOT NULL, side TEXT, price DOUBLE PRECISION, payload TEXT NOT NULL)",
-                "CREATE TABLE IF NOT EXISTS ttr_live_trades (id BIGSERIAL PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_time BIGINT NOT NULL, entry_price DOUBLE PRECISION NOT NULL, exit_time BIGINT, exit_price DOUBLE PRECISION, exit_reason TEXT, status TEXT NOT NULL, stop_price DOUBLE PRECISION, realized_pnl_pct DOUBLE PRECISION NOT NULL DEFAULT 0, remaining_pct DOUBLE PRECISION NOT NULL DEFAULT 100, payload TEXT NOT NULL DEFAULT '{}')"
+                "CREATE TABLE IF NOT EXISTS ttr_live_trades (id BIGSERIAL PRIMARY KEY, symbol TEXT NOT NULL, side TEXT NOT NULL, entry_time BIGINT NOT NULL, entry_price DOUBLE PRECISION NOT NULL, exit_time BIGINT, exit_price DOUBLE PRECISION, exit_reason TEXT, status TEXT NOT NULL, stop_price DOUBLE PRECISION, realized_pnl_pct DOUBLE PRECISION NOT NULL DEFAULT 0, remaining_pct DOUBLE PRECISION NOT NULL DEFAULT 100, payload TEXT NOT NULL DEFAULT '{}')",
+                "CREATE TABLE IF NOT EXISTS ttr_live_health (component TEXT PRIMARY KEY, category TEXT NOT NULL, status TEXT NOT NULL, message TEXT, first_seen BIGINT NOT NULL, last_seen BIGINT NOT NULL, occurrences BIGINT NOT NULL DEFAULT 1, last_success BIGINT)"
             ]
         with self._db() as c:
             for stmt in ddl:
                 self._execute(c, stmt)
 
     def subscribe(self, symbol, chat_id, config):
+        # Per-symbol Telegram preferences survive /start and default to enabled.
+        existing = self.get_config(symbol)
+        old_config = json.loads(existing.get('config') or '{}') if existing else {}
+        for key in ('notify_stop', 'notify_tp', 'notify_open', 'notify_close'):
+            config.setdefault(key, old_config.get(key, True))
         with self._db() as c:
             self._execute(c, 'INSERT INTO ttr_live_config(symbol,chat_id,enabled,config,last_bar_time,state,updated_at) VALUES(?,?,1,?,NULL,?,?) ON CONFLICT(symbol) DO UPDATE SET chat_id=excluded.chat_id,enabled=1,config=excluded.config,updated_at=excluded.updated_at', (symbol, chat_id, json.dumps(config), json.dumps({'position': None}), int(time.time()*1000)))
+
+    def set_notification(self, symbol, notification, enabled):
+        allowed = {'stop':'notify_stop', 'tp':'notify_tp', 'open':'notify_open', 'close':'notify_close'}
+        if notification not in allowed:
+            raise ValueError('Notificación inválida')
+        row = self.get_config(symbol)
+        if not row:
+            raise ValueError(f'TTR no está configurado para {symbol}')
+        config = json.loads(row.get('config') or '{}')
+        config[allowed[notification]] = bool(enabled)
+        with self._db() as c:
+            self._execute(c, 'UPDATE ttr_live_config SET config=?,updated_at=? WHERE symbol=?', (json.dumps(config), int(time.time()*1000), symbol))
+        return config
 
     def unsubscribe(self, symbol):
         with self._db() as c:
@@ -129,7 +173,63 @@ class TTRLiveStore:
     def status(self):
         with self._db() as c:
             return [dict(x) for x in self._execute(c, 'SELECT symbol,enabled,config,state,last_bar_time,updated_at FROM ttr_live_config ORDER BY symbol').fetchall()]
+
+    def all_history(self, limit=100):
+        with self._db() as c:
+            return [dict(x) for x in self._execute(c, 'SELECT * FROM ttr_live_trades ORDER BY entry_time DESC,id DESC LIMIT ?', (limit,)).fetchall()]
+
+    def performance(self):
+        with self._db() as c:
+            trades=[dict(x) for x in self._execute(c, 'SELECT * FROM ttr_live_trades ORDER BY entry_time').fetchall()]
+            configs=[dict(x) for x in self._execute(c, 'SELECT symbol,state FROM ttr_live_config').fetchall()]
+        market={}
+        for row in configs:
+            try: market[row['symbol']]=(json.loads(row.get('state') or '{}').get('market') or {}).get('last_price')
+            except Exception: market[row['symbol']]=None
+        def metrics(items):
+            closed=[t for t in items if t['status']=='CLOSED']
+            opened=[t for t in items if t['status']=='OPEN']
+            pnls=[float(t.get('realized_pnl_pct') or 0) for t in closed]
+            realized_values=[float(t.get('realized_pnl_pct') or 0) for t in items]
+            wins=sum(x>0 for x in pnls); losses=sum(x<0 for x in pnls)
+            gross_profit=sum(x for x in realized_values if x>0); gross_loss=abs(sum(x for x in realized_values if x<0))
+            floating=[]
+            for t in opened:
+                px=market.get(t['symbol'])
+                if px and t.get('entry_price'):
+                    direction=1 if t['side']=='buy' else -1
+                    floating.append((float(px)/float(t['entry_price'])-1)*100*direction*float(t.get('remaining_pct',100))/100)
+            return {'total':len(items),'closed':len(closed),'open':len(opened),'wins':wins,'losses':losses,
+                'win_rate':(wins/len(closed)*100 if closed else 0),'realized_pnl_pct':sum(realized_values),
+                'gross_profit_pct':gross_profit,'gross_loss_pct':gross_loss,
+                'profit_factor':(gross_profit/gross_loss if gross_loss else (float('inf') if gross_profit else 0)),
+                'avg_pnl_pct':(sum(pnls)/len(closed) if closed else 0),
+                'best_pct':max(pnls) if pnls else 0,'worst_pct':min(pnls) if pnls else 0,
+                'floating_pnl_pct':sum(floating),'net_pnl_pct':sum(realized_values)+sum(floating),'open_marked':len(floating)}
+        by_symbol={}
+        for t in trades: by_symbol.setdefault(t['symbol'],[]).append(t)
+        return {'overall':metrics(trades),'by_symbol':{k:metrics(v) for k,v in sorted(by_symbol.items())},'generated_at':int(time.time()*1000)}
+
+    def set_health(self, component, category, status, message=None):
+        now=int(time.time()*1000)
+        with self._db() as c:
+            if status=='OK':
+                self._execute(c, 'INSERT INTO ttr_live_health(component,category,status,message,first_seen,last_seen,occurrences,last_success) VALUES(?,?,?,?,?,?,1,?) ON CONFLICT(component) DO UPDATE SET category=excluded.category,status=excluded.status,message=NULL,last_seen=excluded.last_seen,last_success=excluded.last_success', (component,category,status,None,now,now,now))
+            else:
+                self._execute(c, 'INSERT INTO ttr_live_health(component,category,status,message,first_seen,last_seen,occurrences,last_success) VALUES(?,?,?,?,?,?,1,NULL) ON CONFLICT(component) DO UPDATE SET category=excluded.category,status=excluded.status,message=excluded.message,last_seen=excluded.last_seen,occurrences=ttr_live_health.occurrences+1', (component,category,status,(message or '')[:500],now,now))
+
+    def health(self):
+        with self._db() as c:
+            return [dict(x) for x in self._execute(c, 'SELECT * FROM ttr_live_health ORDER BY status DESC,component').fetchall()]
 STORE=TTRLiveStore()
+
+async def _health_transition(context, component, category, status, message=None):
+    """Persist only state transitions; the supervisor runs every second."""
+    cache=context.application.bot_data.setdefault('ttr_health_cache',{})
+    signature=(category,status,message if status!='OK' else None)
+    if cache.get(component)==signature: return
+    await asyncio.to_thread(STORE.set_health,component,category,status,message)
+    cache[component]=signature
 
 def _closed_candles(client,symbol):
     """Fetch only the recent 15m history and discard the still-open candle."""
@@ -138,25 +238,57 @@ def _closed_candles(client,symbol):
     return [x for x in rows if int(x.get('time',0))+TF_MS <= now]
 
 
-async def _safe_notify(bot, chat_id, message, *, attempts=2):
-    """Telegram is an output channel: transient network failures must not stop trading logic."""
-    for attempt in range(attempts):
-        try:
-            await asyncio.wait_for(bot.send_message(chat_id=chat_id, text=message), timeout=8)
-            return True
-        except Exception:
-            logging.getLogger(__name__).warning(
-                'TTR Telegram notification failed (attempt %s/%s) for chat %s',
-                attempt + 1, attempts, chat_id, exc_info=True)
-            if attempt + 1 < attempts:
-                await asyncio.sleep(1.0 * (attempt + 1))
-    return False
+async def _safe_notify(context, chat_id, message, *, attempts=2):
+    """Send serially and honor Telegram's bot-wide RetryAfter flood-control window."""
+    data = context.application.bot_data
+    lock = data.setdefault('ttr_notification_lock', asyncio.Lock())
+    async with lock:
+        blocked_until = float(data.get('ttr_telegram_blocked_until', 0) or 0)
+        if time.monotonic() < blocked_until:
+            return False
+        for attempt in range(attempts):
+            try:
+                await asyncio.wait_for(context.bot.send_message(chat_id=chat_id, text=message), timeout=8)
+                try: await asyncio.to_thread(STORE.set_health,'telegram','TELEGRAM','OK')
+                except Exception: pass
+                return True
+            except Exception as exc:
+                # python-telegram-bot raises telegram.error.RetryAfter and exposes
+                # retry_after as seconds (int/float or timedelta depending on version).
+                retry_after = getattr(exc, 'retry_after', None)
+                if retry_after is not None:
+                    if hasattr(retry_after, 'total_seconds'):
+                        retry_after = retry_after.total_seconds()
+                    delay = max(1.0, float(retry_after))
+                    data['ttr_telegram_blocked_until'] = time.monotonic() + delay
+                    try: await asyncio.to_thread(STORE.set_health,'telegram','TELEGRAM','RATE_LIMITED',f'RetryAfter {delay:.0f}s')
+                    except Exception: pass
+                    logging.getLogger(__name__).error(
+                        'Telegram flood control: pausing all TTR notifications for %.0f seconds', delay)
+                    return False
+                try: await asyncio.to_thread(STORE.set_health,'telegram','TELEGRAM','ERROR',str(exc))
+                except Exception: pass
+                logging.getLogger(__name__).warning(
+                    'TTR Telegram notification failed (attempt %s/%s) for chat %s: %s',
+                    attempt + 1, attempts, chat_id, exc)
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(1.0 * (attempt + 1))
+        return False
+
+
+def _notify_trade_event(context, chat_id, params, event, message):
+    key = {'stop':'notify_stop', 'tp':'notify_tp', 'open':'notify_open', 'close':'notify_close'}.get(event)
+    if key is None or bool(params.get(key, True)):
+        _queue_notify(context, chat_id, message)
 
 
 def _queue_notify(context, chat_id, message):
-    """Send notifications outside the market-monitor critical path."""
-    tasks=context.application.bot_data.setdefault('ttr_notification_tasks',set())
-    task=asyncio.create_task(_safe_notify(context.bot,chat_id,message))
+    """Queue notifications, dropping them while Telegram's global cooldown is active."""
+    data = context.application.bot_data
+    if time.monotonic() < float(data.get('ttr_telegram_blocked_until', 0) or 0):
+        return
+    tasks=data.setdefault('ttr_notification_tasks',set())
+    task=asyncio.create_task(_safe_notify(context,chat_id,message))
     tasks.add(task)
     task.add_done_callback(tasks.discard)
 
@@ -164,7 +296,10 @@ def _queue_notify(context, chat_id, message):
 async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
     async def db_call(method, *args, **kwargs):
         # PostgreSQL connection establishment and queries must not block PTB's event loop.
-        return await asyncio.to_thread(getattr(store, method), *args, **kwargs)
+        try:
+            return await asyncio.to_thread(getattr(store, method), *args, **kwargs)
+        except Exception as exc:
+            raise TTRDatabaseError(f'{method}: {exc}') from exc
 
     cfg=await db_call('get_config',symbol)
     if not cfg or not cfg['enabled']: return
@@ -193,17 +328,17 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
                 pos=None
                 state['position']=None
             else:
-                pos={'side':row['side'],'trade_id':row['id'],'entry_time':row['entry_time'],
-                     'entry_price':row['entry_price'],'avg_entry':payload.get('avg_entry',row['entry_price']),
-                     'remaining_pct':float(row.get('remaining_pct',100) or 0),
-                     'realized_pnl_pct':float(row.get('realized_pnl_pct',0) or 0),
-                     'stop':None, 'tp_count':int(payload.get('tp_count',0)),
-                     'tp_marked_fractals':payload.get('tp_marked_fractals',[]),
-                     're_marked_fractals':payload.get('re_marked_fractals',[]),
-                     'last_tp':payload.get('last_tp'),'last_re':payload.get('last_re'),'engine_version':PINE_ENGINE_VERSION}
+                pos=restore_position_from_trade(row)
                 await db_call('update_trade',row['id'],stop_price=None)
                 state['position']=pos
-            await db_call('save_state',symbol,state)
+            # Resume at the current closed-candle boundary. No TP, RE, reversal
+            # or entry signals from the service downtime are replayed.
+            resume_bar=resume_bar_boundary()
+            await db_call('save_state',symbol,state,last_bar_time=resume_bar)
+            cfg['last_bar_time']=resume_bar
+            await db_call('update_trade',row['id'],payload=json.dumps({'engine_version':PINE_ENGINE_VERSION,'position':pos,
+                'avg_entry':pos['avg_entry'],'tp_count':pos['tp_count'],'tp_marked_fractals':pos['tp_marked_fractals'],
+                're_marked_fractals':pos['re_marked_fractals'],'last_tp':pos['last_tp'],'last_re':pos['last_re']}))
         elif pos:
             # A stale config snapshot must not resurrect a trade already closed in SQL.
             pos=None
@@ -264,7 +399,7 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
         return
     highs=[float(x['high']) for x in candles]; lows=[float(x['low']) for x in candles]
     closes=[float(x['close']) for x in candles]; opens=[float(x['open']) for x in candles]; times=[int(x['time']) for x in candles]
-    from ttr_pine import sar as pine_sar, fractal_snapshots, cross_signal
+    from ttr_pine import sar as pine_sar, fractal_snapshots, cross_signal, ttr_bar_action
     sar_values, lag_values, fast_values = pine_sar(
         highs, lows, closes, float(params.get('psar_start',.02)),
         float(params.get('psar_increment',.02)), float(params.get('psar_max',.025)))
@@ -303,6 +438,7 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
             await db_call('update_trade',pos['trade_id'],exit_time=int(times[k]),exit_price=float(closes[k]),
                 exit_reason='REVERSAL_15M',status='CLOSED',realized_pnl_pct=realized,remaining_pct=0)
             await db_call('event',symbol,'REVERSAL_EXIT',old_side,float(closes[k]),int(times[k]),{})
+            _notify_trade_event(context,chat_id,params,'close',f'🔒 TTR {symbol} · CIERRE por reversión\n{old_side.upper()} @ {closes[k]:.8g} · PnL realizado {realized:+.4f}%.')
             pos=None
         elif pos and desired==pos['side']:
             old_side=pos['side']
@@ -311,17 +447,18 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
             await db_call('update_trade',pos['trade_id'],exit_time=int(times[k]),exit_price=float(closes[k]),
                 exit_reason='PINE_ENTRY_RESET',status='CLOSED',realized_pnl_pct=realized,remaining_pct=0)
             await db_call('event',symbol,'ENTRY_RESET',old_side,float(closes[k]),int(times[k]),{})
+            _notify_trade_event(context,chat_id,params,'close',f'🔒 TTR {symbol} · CIERRE por nueva señal\n{old_side.upper()} @ {closes[k]:.8g} · PnL realizado {realized:+.4f}%.')
             pos=None
         if desired:
             entry_price=float(lag_values[k]) if math.isfinite(lag_values[k]) else float(closes[k])
             tid=await db_call('open_trade',symbol,desired,int(times[k]),entry_price,None)
-            await db_call('update_trade',tid,payload=json.dumps({'engine_version':PINE_ENGINE_VERSION}))
             pos={'side':desired,'trade_id':tid,'entry_time':int(times[k]),'entry_price':entry_price,
                  'avg_entry':entry_price,'remaining_pct':100.0,'realized_pnl_pct':0.0,'stop':None,
                  'tp_count':0,'tp_marked_fractals':[],'re_marked_fractals':[],'last_tp':None,'last_re':None,'engine_version':PINE_ENGINE_VERSION}
+            await db_call('update_trade',tid,payload=json.dumps({'engine_version':PINE_ENGINE_VERSION,'position':pos}))
             await db_call('event',symbol,'ENTRY',desired,entry_price,int(times[k]),
                           {'signal':'PSAR_LAGGING_CROSS','psar_lagging':entry_price})
-            _queue_notify(context,chat_id,f'📍 TTR {symbol} · ENTRADA {desired.upper()}\\nVela 15m cerrada: {datetime.fromtimestamp(int(times[k])/1000,timezone.utc):%Y-%m-%d %H:%M UTC}\\nPrecio de referencia Pine: {entry_price:.8g} (lagging PSAR).')
+            _notify_trade_event(context,chat_id,params,'open',f'📍 TTR {symbol} · ENTRADA {desired.upper()}\\nVela 15m cerrada: {datetime.fromtimestamp(int(times[k])/1000,timezone.utc):%Y-%m-%d %H:%M UTC}\\nPrecio de referencia Pine: {entry_price:.8g} (lagging PSAR).')
             continue
         # Pine does not evaluate TP/RE on a candle with a posExit.
         if exits_current or not pos or int(times[k])<=int(pos.get('entry_time',0)):
@@ -357,11 +494,11 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
                     ('engine_version','avg_entry','tp_count','tp_marked_fractals','re_marked_fractals','last_tp','last_re')}))
                 await db_call('event',symbol,'TP',side,float(closes[k]),int(times[k]),
                     {'tp_number':slot+1,'percent_closed':pct,'remaining_pct':pos['remaining_pct'],'fractal_time':int(fractal.when)})
-                _queue_notify(context,chat_id,f'🎯 TTR {symbol} · TP {slot+1}\\n{side.upper()} · vela {datetime.fromtimestamp(int(times[k])/1000,timezone.utc):%Y-%m-%d %H:%M UTC} · precio {closes[k]:.8g} · cierre simulado {pct:.2f}% · restante {pos["remaining_pct"]:.2f}%.')
+                _notify_trade_event(context,chat_id,params,'tp',f'🎯 TTR {symbol} · TP {slot+1}\\n{side.upper()} · vela {datetime.fromtimestamp(int(times[k])/1000,timezone.utc):%Y-%m-%d %H:%M UTC} · precio {closes[k]:.8g} · cierre simulado {pct:.2f}% · restante {pos["remaining_pct"]:.2f}%.')
             else:
                 await db_call('event',symbol,'TP_SIGNAL_NO_CLOSE',side,float(closes[k]),int(times[k]),
                     {'tp_number':slot+1,'percent_closed':0,'remaining_pct':pos['remaining_pct'],'fractal_time':int(fractal.when)})
-                _queue_notify(context,chat_id,f'🎯 TTR {symbol} · señal TP {slot+1} @ {closes[k]:.8g} (sin reducción adicional configurada).')
+                _notify_trade_event(context,chat_id,params,'tp',f'🎯 TTR {symbol} · señal TP {slot+1} @ {closes[k]:.8g} (sin reducción adicional configurada).')
         else:
             marked=set(int(x) for x in pos['re_marked_fractals']); marked.add(int(fractal.when))
             pos['re_marked_fractals']=sorted(marked); pos['last_re']=float(closes[k])
@@ -369,9 +506,11 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
                 {'entry_enabled':False,'fractal_time':int(fractal.when)})
             _queue_notify(context,chat_id,f'↪️ TTR {symbol} · señal RE {side.upper()} @ {closes[k]:.8g} · RE solo informativa; Pine no aumenta exposición.')
         if pos:
-            await db_call('update_trade',pos['trade_id'],payload=json.dumps({key:pos.get(key) for key in
-                ('engine_version','avg_entry','tp_count','tp_marked_fractals','re_marked_fractals','last_tp','last_re')}))
+            await db_call('update_trade',pos['trade_id'],payload=json.dumps({'engine_version':PINE_ENGINE_VERSION,'position':pos, **{key:pos.get(key) for key in
+                ('avg_entry','tp_count','tp_marked_fractals','re_marked_fractals','last_tp','last_re')}}))
     state['position']=pos
+    if pos:
+        await db_call('update_trade',pos['trade_id'],payload=json.dumps({'engine_version':PINE_ENGINE_VERSION,'position':pos, **{key:pos.get(key) for key in ('avg_entry','tp_count','tp_marked_fractals','re_marked_fractals','last_tp','last_re')}}))
     await db_call('save_state',symbol,state,last_bar_time=bar_time)
 
 async def monitor_job(context):
@@ -381,11 +520,36 @@ async def monitor_job(context):
     if feed is None:
         feed=BitunixTickerFeed(stale_after=float(os.environ.get('TTR_WS_STALE_SECONDS','10')))
         context.application.bot_data['ttr_ws_feed']=feed
-    configs=await asyncio.to_thread(STORE.configs)
+    try:
+        configs=await asyncio.to_thread(STORE.configs)
+        await _health_transition(context,'database','DATABASE','OK')
+    except Exception as exc:
+        logging.getLogger(__name__).exception('TTR supervisor: database unavailable')
+        context.application.bot_data['ttr_supervisor_last_error']=str(exc)[:300]
+        return
+    context.application.bot_data['ttr_supervisor_last_heartbeat']=time.time()
+    await _health_transition(context,'worker','WORKER','OK')
     for cfg in configs:
         params=json.loads(cfg.get('config') or '{}')
         if params.get('feed_mode','websocket')=='websocket': feed.ensure(cfg['symbol'])
-        try: await monitor_symbol(context,cfg['symbol'],bitunix,ws_feed=feed)
+        errors=context.application.bot_data.setdefault('ttr_monitor_errors',{})
+        try:
+            await monitor_symbol(context,cfg['symbol'],bitunix,ws_feed=feed)
+            errors.pop(cfg['symbol'],None)
+            await _health_transition(context,f"symbol:{cfg['symbol']}",'MONITOR','OK')
+            await _health_transition(context,f"bitunix:{cfg['symbol']}",'BITUNIX','OK')
+            if feed and params.get('feed_mode','websocket')=='websocket':
+                ws=feed.health(cfg['symbol'])
+                await _health_transition(context,f"websocket:{cfg['symbol']}",'WEBSOCKET','OK' if ws.get('connected') and ws.get('fresh') else 'DEGRADED',None if ws.get('connected') and ws.get('fresh') else str(ws.get('last_error') or 'Sin datos recientes'))
         except Exception as exc:
-            import logging; logging.getLogger(__name__).exception('TTR live monitor error %s',cfg['symbol'])
-            _queue_notify(context,cfg['chat_id'],f'⚠️ TTR {cfg["symbol"]}: error en monitor: {str(exc)[:250]}')
+            category='DATABASE' if isinstance(exc,TTRDatabaseError) else ('BITUNIX' if any(x in type(exc).__name__.lower()+' '+str(exc).lower() for x in ('bitunix','http','timeout','connection','request','exchange')) else 'MONITOR')
+            component='database' if category=='DATABASE' else (f'bitunix:{cfg["symbol"]}' if category=='BITUNIX' else f'symbol:{cfg["symbol"]}')
+            try: await _health_transition(context,component,category,'ERROR',str(exc))
+            except Exception: logging.getLogger(__name__).exception('Could not persist TTR health incident')
+            signature=f'{type(exc).__name__}: {exc}'
+            # A persistent fault is logged/notified once, not once per polling tick.
+            if errors.get(cfg['symbol']) != signature:
+                import logging
+                logging.getLogger(__name__).exception('TTR live monitor error %s',cfg['symbol'])
+                _queue_notify(context,cfg['chat_id'],f'⚠️ TTR {cfg["symbol"]}: error en monitor: {str(exc)[:250]}')
+                errors[cfg['symbol']]=signature

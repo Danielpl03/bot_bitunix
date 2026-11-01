@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -100,8 +101,11 @@ BOT_COMMANDS = [
     BotCommand("backtest_dual_thrust", "Backtest ruptura de rango Dual Thrust"),
     BotCommand("backtest_ttr", "Backtest TTR Pine v6 con TP parciales y reversiones"),
     BotCommand("ttr_live", "Paper trading TTR en tiempo real (sin órdenes)"),
+    BotCommand("ttr_notify", "Activar/desactivar avisos TTR por evento y símbolo"),
     BotCommand("ttr_status", "Estado de operaciones TTR en seguimiento"),
-    BotCommand("ttr_history", "Historial de operaciones TTR"),
+    BotCommand("ttr_history", "Historial global o por símbolo de TTR"),
+    BotCommand("ttr_stats", "Rendimiento global y por símbolo de TTR"),
+    BotCommand("ttr_health", "Salud y supervisión de TTR Live"),
     BotCommand("balance", "Balance de tu cuenta de futuros (/balance USDT)"),
     BotCommand("positions", "Ver posiciones abiertas (/positions BTCUSDT)"),
     BotCommand("open", "Abrir posición (/open BTCUSDT BUY 0.01)"),
@@ -1065,6 +1069,35 @@ async def ttr_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         # failure must not roll back or misreport the paper-trading activation.
         logger.warning("TTR %s activado, pero falló el envío de confirmación Telegram", symbol, exc_info=True)
 
+async def ttr_notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Configure independent per-symbol Telegram event notifications."""
+    if not _is_authorized(update):
+        await update.message.reply_text("No autorizado."); return
+    args=list(context.args)
+    if not args:
+        await update.message.reply_text(
+            "Uso: /ttr_notify BTCUSDT [open|close|tp|stop] [on|off]\n"
+            "Ejemplo: /ttr_notify BTCUSDT tp off\n"
+            "Sin categoría muestra las preferencias actuales."); return
+    symbol=_normalize_symbol(args[0])
+    row=TTR_LIVE_STORE.get_config(symbol)
+    if not row:
+        await update.message.reply_text(f"TTR no está configurado para {symbol}."); return
+    labels={'open':'notify_open','close':'notify_close','tp':'notify_tp','stop':'notify_stop'}
+    cfg=json.loads(row.get('config') or '{}')
+    if len(args)==1:
+        lines=[f"🔔 Notificaciones TTR · {symbol}"]
+        for key,label in [('open','Apertura'),('close','Cierre'),('tp','Take profit'),('stop','Actualización de stop')]:
+            lines.append(f"{label}: {'ACTIVADA' if cfg.get(labels[key],True) else 'DESACTIVADA'}")
+        lines.append("Configúralas por separado con /ttr_notify SIMBOLO categoría on|off.")
+        await update.message.reply_text("\n".join(lines)); return
+    if len(args)!=3 or args[1].lower() not in labels or args[2].lower() not in ('on','off'):
+        await update.message.reply_text("Parámetros inválidos. Categorías: open, close, tp, stop; valores: on, off."); return
+    category=args[1].lower(); enabled=args[2].lower()=='on'
+    await asyncio.to_thread(TTR_LIVE_STORE.set_notification,symbol,category,enabled)
+    await update.message.reply_text(f"🔔 Notificación {category} para {symbol}: {'ACTIVADA' if enabled else 'DESACTIVADA'}.")
+
+
 async def ttr_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update):
         await update.message.reply_text("No autorizado."); return
@@ -1089,12 +1122,56 @@ async def ttr_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def ttr_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update): await update.message.reply_text("No autorizado."); return
     symbol=_normalize_symbol(context.args[0]) if context.args else None
-    if not symbol:
-        await update.message.reply_text("Uso: /ttr_history BTCUSDT"); return
-    rows=TTR_LIVE_STORE.history(symbol,20)
-    if not rows: await update.message.reply_text(f"Sin operaciones registradas para {symbol}."); return
-    lines=[f"#{r['id']} {r['side'].upper()} · {datetime.fromtimestamp(r['entry_time']/1000,timezone.utc):%m-%d %H:%M} · entrada {r['entry_price']:.8g} · {'ABIERTA' if r['status']=='OPEN' else f"{r['exit_reason']} @ {r['exit_price']:.8g}"} · PnL {r['realized_pnl_pct']:+.4f}%" for r in rows]
-    await update.message.reply_text("Historial TTR "+symbol+":\n"+"\n".join(lines))
+    rows=TTR_LIVE_STORE.history(symbol,30) if symbol else TTR_LIVE_STORE.all_history(50)
+    if not rows:
+        await update.message.reply_text(f"Sin operaciones TTR registradas{(' para '+symbol) if symbol else ''}."); return
+    title=f"Historial TTR · {symbol}" if symbol else "Historial global TTR · últimos 50 registros"
+    lines=[]
+    for r in rows:
+        entry=datetime.fromtimestamp(r['entry_time']/1000,timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+        status='🟢 ABIERTA' if r['status']=='OPEN' else f"CERRADA ({r.get('exit_reason') or 'N/D'})"
+        exit_info=(f" · salida {float(r['exit_price']):.8g}" if r.get('exit_price') is not None else '')
+        lines.append(f"{r['symbol']} #{r['id']} · {r['side'].upper()} · {entry} · entrada {float(r['entry_price']):.8g}{exit_info} · {status} · PnL realizado {float(r.get('realized_pnl_pct') or 0):+.4f}%")
+    # Telegram limits a message to 4096 chars; send compact pages.
+    page=title+'\n'+'\n'.join(lines)
+    for offset in range(0,len(page),3800): await update.message.reply_text(page[offset:offset+3800])
+
+
+async def ttr_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update): await update.message.reply_text("No autorizado."); return
+    data=await asyncio.to_thread(TTR_LIVE_STORE.performance)
+    overall=data['overall']
+    def fmt(label,m):
+        pf='∞' if m['profit_factor']==float('inf') else f"{m['profit_factor']:.2f}"
+        return (f"*{label}* · {m['total']} ops ({m['closed']} cerradas / {m['open']} abiertas)\n"
+            f"Acierto: {m['win_rate']:.1f}% ({m['wins']}G/{m['losses']}P) · PF: {pf}\n"
+            f"PnL realizado acumulado: {m['realized_pnl_pct']:+.4f}% · media/cerrada: {m['avg_pnl_pct']:+.4f}%\n"
+            f"Mejor: {m['best_pct']:+.4f}% · peor: {m['worst_pct']:+.4f}%\n"
+            f"PnL flotante estimado: {m['floating_pnl_pct']:+.4f}% ({m['open_marked']}/{m['open']} abiertas con precio)\nPnL neto realizado + flotante: {m['net_pnl_pct']:+.4f}%")
+    lines=['📊 *Rendimiento TTR Live · acumulado*','',fmt('TOTAL GENERAL',overall),'','*DESGLOSE POR SÍMBOLO*']
+    if data['by_symbol']:
+        for symbol,m in data['by_symbol'].items(): lines.extend(['',fmt(symbol,m)])
+    else: lines.append('Todavía no hay operaciones registradas.')
+    lines.extend(['','_PnL porcentual ponderado por el porcentaje de posición cerrado. El flotante es una estimación sobre el último precio guardado; no incluye comisiones ni financiación._'])
+    message='\n'.join(lines)
+    for offset in range(0,len(message),3800): await update.message.reply_text(message[offset:offset+3800],parse_mode='Markdown')
+
+
+async def ttr_health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update): await update.message.reply_text("No autorizado."); return
+    try: rows=await asyncio.to_thread(TTR_LIVE_STORE.health)
+    except Exception as exc:
+        await update.message.reply_text(f"🔴 PostgreSQL/SQLite no disponible: {str(exc)[:250]}"); return
+    heartbeat=context.application.bot_data.get('ttr_supervisor_last_heartbeat')
+    age=(time.time()-heartbeat) if heartbeat else None
+    lines=['🩺 *Supervisión TTR Live*',f"Supervisor: {'🟢 activo' if age is not None and age<15 else '🔴 sin heartbeat reciente'}"+(f" · hace {age:.1f}s" if age is not None else ''),'']
+    if not rows: lines.append('Sin incidentes registrados.')
+    for r in rows:
+        icon='🟢' if r['status']=='OK' else ('🟠' if r['status'] in ('RATE_LIMITED','DEGRADED') else '🔴')
+        lines.append(f"{icon} *{r['component']}* · {r['category']} · {r['status']} · ocurrencias {r['occurrences']}")
+        if r.get('message'): lines.append(f"  {str(r['message'])[:220]}")
+    lines.extend(['','Render: el estado de cuota/horas gratuitas no es consultable desde el proceso del bot. Revísalo en el dashboard de Render; si el servicio está suspendido, el heartbeat dejará de actualizarse.'])
+    await update.message.reply_text('\n'.join(lines),parse_mode='Markdown')
 
 
 async def backtest_ttr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2195,8 +2272,11 @@ def main() -> None:
     application.add_handler(CommandHandler("backtest_dual_thrust", backtest_dual_thrust_command))
     application.add_handler(CommandHandler("backtest_ttr", backtest_ttr_command))
     application.add_handler(CommandHandler("ttr_live", ttr_live_command))
+    application.add_handler(CommandHandler("ttr_notify", ttr_notify_command))
     application.add_handler(CommandHandler("ttr_status", ttr_status_command))
     application.add_handler(CommandHandler("ttr_history", ttr_history_command))
+    application.add_handler(CommandHandler("ttr_stats", ttr_stats_command))
+    application.add_handler(CommandHandler("ttr_health", ttr_health_command))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("positions", positions))
     application.add_handler(CommandHandler("open", open_position))
