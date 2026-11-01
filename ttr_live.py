@@ -535,7 +535,18 @@ async def monitor_job(context):
     from ttr_websocket import BitunixTickerFeed
     feed=context.application.bot_data.get('ttr_ws_feed')
     if feed is None:
-        feed=BitunixTickerFeed(stale_after=float(os.environ.get('TTR_WS_STALE_SECONDS','10')))
+        def _ws_env_float(name, default):
+            try:
+                return float(os.environ.get(name, str(default)))
+            except (TypeError, ValueError):
+                log.warning('Valor inválido para %s; se usará %s.', name, default)
+                return float(default)
+
+        feed=BitunixTickerFeed(
+            stale_after=_ws_env_float('TTR_WS_STALE_SECONDS', 10),
+            heartbeat_interval=_ws_env_float('TTR_WS_HEARTBEAT_INTERVAL_SECONDS', 20),
+            heartbeat_timeout=_ws_env_float('TTR_WS_HEARTBEAT_TIMEOUT_SECONDS', 10),
+        )
         context.application.bot_data['ttr_ws_feed']=feed
     try:
         configs=await asyncio.to_thread(STORE.configs)

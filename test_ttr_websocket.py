@@ -48,3 +48,50 @@ def test_stop_closes_active_websocket_connections():
         assert feed.tasks == {}
 
     asyncio.run(scenario())
+
+
+def test_bitunix_json_pong_is_recognized_and_updates_health():
+    import asyncio
+    import json
+
+    feed = BitunixTickerFeed()
+    event = asyncio.Event()
+    feed.status['BTCUSDT'] = {'heartbeat_sent_monotonic': time.monotonic() - 0.01}
+    feed._process_message(
+        json.dumps({'op': 'ping', 'pong': int(time.time()), 'ping': int(time.time())}),
+        'BTCUSDT',
+        event,
+    )
+    assert event.is_set()
+    health = feed.health('BTCUSDT')
+    assert health['last_pong_at'] is not None
+    assert health['heartbeat_rtt_ms'] >= 0
+
+
+def test_documented_json_heartbeat_is_sent_even_without_trade_frames():
+    import asyncio
+    import json
+
+    class FakeSocket:
+        def __init__(self, pong_event):
+            self.pong_event = pong_event
+            self.sent = []
+
+        async def send(self, raw):
+            self.sent.append(json.loads(raw))
+            self.pong_event.set()
+
+    async def scenario():
+        feed = BitunixTickerFeed(heartbeat_interval=5, heartbeat_timeout=2)
+        event = asyncio.Event()
+        socket = FakeSocket(event)
+        task = asyncio.create_task(feed._heartbeat(socket, 'BTCUSDT', event))
+        await asyncio.sleep(0.03)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert socket.sent
+        assert socket.sent[0]['op'] == 'ping'
+        assert isinstance(socket.sent[0]['ping'], int)
+        assert feed.health('BTCUSDT')['last_ping_at'] is not None
+
+    asyncio.run(scenario())
