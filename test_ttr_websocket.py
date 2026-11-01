@@ -95,3 +95,39 @@ def test_documented_json_heartbeat_is_sent_even_without_trade_frames():
         assert feed.health('BTCUSDT')['last_ping_at'] is not None
 
     asyncio.run(scenario())
+
+
+def test_stop_symbol_closes_only_requested_feed_and_marks_it_stopped():
+    import asyncio
+
+    class FakeSocket:
+        def __init__(self):
+            self.closed = False
+        async def close(self):
+            self.closed = True
+
+    async def scenario():
+        feed = BitunixTickerFeed()
+        btc = FakeSocket()
+        eth = FakeSocket()
+        feed.connections.update({'BTCUSDT': btc, 'ETHUSDT': eth})
+        feed.latest['BTCUSDT'] = {'price': 1, 'received_at': time.time()}
+        feed.pending['BTCUSDT'] = [{'price': 1}]
+        await feed.stop_symbol('BTCUSDT')
+        assert btc.closed is True
+        assert eth.closed is False
+        assert 'BTCUSDT' not in feed.connections
+        assert 'BTCUSDT' not in feed.latest and 'BTCUSDT' not in feed.pending
+        assert feed.health('BTCUSDT')['state'] == 'stopped'
+        assert 'BTCUSDT' in feed._stopped_symbols
+
+    asyncio.run(scenario())
+
+
+def test_stopped_symbol_does_not_restart_until_explicitly_resumed():
+    feed = BitunixTickerFeed()
+    feed._stopped_symbols.add('BTCUSDT')
+    feed.ensure('BTCUSDT')
+    assert 'BTCUSDT' not in feed.tasks
+    feed.resume_symbol('BTCUSDT')
+    assert 'BTCUSDT' not in feed._stopped_symbols

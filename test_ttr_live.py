@@ -159,3 +159,22 @@ def test_trade_event_notification_flags_are_independent(monkeypatch):
     for event in ('open','close','tp','stop'):
         ttr_live._notify_trade_event(None,1,params,event,event)
     assert sent==['close','stop']
+
+
+def test_resubscribe_updates_config_without_resetting_position_or_bar(tmp_path):
+    store = TTRLiveStore(str(tmp_path/'update_config.sqlite'))
+    store.subscribe('BTCUSDT', 123, {'feed_mode': 'websocket', 'poll_seconds': 5,
+                                    'tp_percentages': [25, 25, 25, 25]})
+    state = {'position': {'side': 'buy', 'trade_id': 7, 'remaining_pct': 50}}
+    store.save_state('BTCUSDT', state, 987654)
+    store.unsubscribe('BTCUSDT')
+    store.subscribe('BTCUSDT', 123, {'feed_mode': 'rest', 'poll_seconds': 3,
+                                    'tp_percentages': [40, 30, 30]})
+    row = store.get_config('BTCUSDT')
+    cfg = json.loads(row['config'])
+    assert row['enabled'] == 1
+    assert cfg['feed_mode'] == 'rest'
+    assert cfg['poll_seconds'] == 3
+    assert cfg['tp_percentages'] == [40, 30, 30]
+    assert json.loads(row['state']) == state
+    assert row['last_bar_time'] == 987654

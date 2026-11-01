@@ -557,6 +557,14 @@ async def monitor_job(context):
         return
     context.application.bot_data['ttr_supervisor_last_heartbeat']=time.time()
     await _health_transition(context,'worker','WORKER','OK')
+    # Close feeds for symbols no longer subscribed or switched to REST.
+    active_ws = {
+        row['symbol'] for row in configs
+        if json.loads(row.get('config') or '{}').get('feed_mode', 'websocket') == 'websocket'
+    }
+    for connected_symbol in list(feed.tasks):
+        if connected_symbol not in active_ws:
+            await feed.stop_symbol(connected_symbol)
     for cfg in configs:
         params=json.loads(cfg.get('config') or '{}')
         if params.get('feed_mode','websocket')=='websocket': feed.ensure(cfg['symbol'])

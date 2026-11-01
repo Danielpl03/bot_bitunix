@@ -1032,46 +1032,163 @@ async def backtest_squeeze_command(update: Update, context: ContextTypes.DEFAULT
 
 
 async def ttr_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Suscribe/unsubscribe un símbolo a paper trading TTR; no envía órdenes."""
+    """Suscribe, actualiza o detiene el paper trading TTR de un símbolo."""
     if not _is_authorized(update):
-        await update.message.reply_text("No autorizado."); return
-    args=list(context.args)
+        await update.message.reply_text("No autorizado.")
+        return
+    args = list(context.args)
     if not args:
-        await update.message.reply_text("Uso:\n/ttr_live start BTCUSDT [--dir Buy & Sell] [--tp 40,30,30] [--re-entry true|false] [--feed websocket|rest] [--poll 5]\n/ttr_live stop BTCUSDT\n/ttr_live list\nSolo alertas y simulación; nunca envía órdenes."); return
-    action=args[0].lower()
-    if action=='list':
-        rows=TTR_LIVE_STORE.status(); await update.message.reply_text("Seguimientos TTR:\n"+("\n".join(f"{r['symbol']}: {'ACTIVO' if r['enabled'] else 'DETENIDO'}" for r in rows) if rows else "Ninguno.")); return
-    if len(args)<2:
-        await update.message.reply_text("Indica el símbolo."); return
-    symbol=_normalize_symbol(args[1])
-    if action=='stop':
-        TTR_LIVE_STORE.unsubscribe(symbol); await update.message.reply_text(f"⏹ Seguimiento TTR detenido para {symbol}. El historial se conserva."); return
-    if action!='start':
-        await update.message.reply_text("Acción inválida: usa start, stop o list."); return
-    opts={'--dir':'Buy & Sell','--tp':'25,25,25,25','--re-entry':'false','--poll':'5','--feed':'websocket'}; i=2
-    while i<len(args):
-        k=args[i]
-        if k not in opts or i+1>=len(args): await update.message.reply_text(f"Parámetro inválido: {k}"); return
-        opts[k]=args[i+1]; i+=2
-    direction={'Both':'Buy & Sell','BuyOnly':'Buy Only','SellOnly':'Sell Only'}.get(opts['--dir'],opts['--dir'])
-    if direction not in ('Buy & Sell','Buy Only','Sell Only') or opts['--re-entry'].lower() not in ('true','false'):
-        await update.message.reply_text("Dirección o re-entry inválido."); return
-    try: tps=[float(x) for x in opts['--tp'].split(',')]; assert tps and all(x>0 for x in tps) and sum(tps)<=100
-    except Exception: await update.message.reply_text("TP inválido; ejemplo: --tp 40,30,30 (suma <=100)."); return
-    feed_mode=opts['--feed'].lower()
-    if feed_mode not in ('websocket','rest'): await update.message.reply_text('--feed debe ser websocket o rest.'); return
-    try: poll=int(opts['--poll']); assert 2 <= poll <= 30
-    except Exception: await update.message.reply_text('--poll debe estar entre 2 y 30 segundos.'); return
-    config={'interval':'15m','monitor_interval':f'{poll}s','poll_seconds':poll,'feed_mode':feed_mode,'pos_dir':direction,'tp_percentages':tps,'enter_on_reentry':opts['--re-entry'].lower()=='true','psar_start':.02,'psar_increment':.02,'psar_max':.025,'paper_only':True}
-    await asyncio.to_thread(TTR_LIVE_STORE.subscribe,symbol,update.effective_chat.id,config)
-    context.application.bot_data.setdefault('ttr_reconciled_symbols',set()).discard(symbol)
-    confirmation=(f"✅ TTR paper trading activado para {symbol}.\nIndicador: 15m cerrado · feed: {feed_mode.upper()} (REST de respaldo; sondeo {poll}s) · sin stop-loss (Pine usa PSAR lagging solo para entrada/reversión).\nRE: señal del indicador (no añade exposición) · TP contables: {tps}.\nNo se enviarán órdenes reales.")
+        await update.message.reply_text(
+            "Uso:\n"
+            '/ttr_live start BTCUSDT [--dir "Buy & Sell"|"Buy Only"|"Sell Only"] '
+            "[--tp 40,30,30] [--re-entry true|false] [--feed websocket|rest] [--poll 5]\n"
+            "/ttr_live stop BTCUSDT\n/ttr_live list\n"
+            "Si vuelves a ejecutar start, solo se modifican los parámetros indicados; "
+            "los demás conservan su valor. El estado y las operaciones abiertas se conservan.\n"
+            "Solo alertas y simulación; nunca envía órdenes."
+        )
+        return
+
+    action = args[0].lower()
+    if action == "list":
+        rows = TTR_LIVE_STORE.status()
+        await update.message.reply_text(
+            "Seguimientos TTR:\n" + (
+                "\n".join(f"{r['symbol']}: {'ACTIVO' if r['enabled'] else 'DETENIDO'}" for r in rows)
+                if rows else "Ninguno."
+            )
+        )
+        return
+    if len(args) < 2:
+        await update.message.reply_text("Indica el símbolo.")
+        return
+
+    symbol = _normalize_symbol(args[1])
+    if action == "stop":
+        await asyncio.to_thread(TTR_LIVE_STORE.unsubscribe, symbol)
+        feed = context.application.bot_data.get("ttr_ws_feed")
+        if feed is not None:
+            try:
+                await feed.stop_symbol(symbol)
+            except Exception:
+                logger.exception("No se pudo cerrar WebSocket TTR de %s", symbol)
+        context.application.bot_data.setdefault("ttr_reconciled_symbols", set()).discard(symbol)
+        await update.message.reply_text(
+            f"⏹ Seguimiento TTR detenido para {symbol}. "
+            "Se cierra su WebSocket; el historial y las posiciones registradas se conservan."
+        )
+        return
+    if action != "start":
+        await update.message.reply_text("Acción inválida: usa start, stop o list.")
+        return
+
+    # Start is also an in-place configuration update. Omitted options keep their
+    # previous values, avoiding accidental resets when changing one parameter.
+    existing = await asyncio.to_thread(TTR_LIVE_STORE.get_config, symbol)
+    try:
+        previous = json.loads(existing.get("config") or "{}") if existing else {}
+    except (TypeError, ValueError):
+        previous = {}
+    defaults = {
+        "interval": "15m", "monitor_interval": "5s", "poll_seconds": 5,
+        "feed_mode": "websocket", "pos_dir": "Buy & Sell",
+        "tp_percentages": [25, 25, 25, 25], "enter_on_reentry": False,
+        "psar_start": .02, "psar_increment": .02, "psar_max": .025,
+        "paper_only": True,
+    }
+    config = {**defaults, **previous}
+    raw_opts = {"--dir": None, "--tp": None, "--re-entry": None, "--poll": None, "--feed": None}
+    i = 2
+    while i < len(args):
+        key = args[i]
+        if key not in raw_opts or i + 1 >= len(args):
+            await update.message.reply_text(f"Parámetro inválido o sin valor: {key}")
+            return
+        if key == "--dir":
+            # Telegram splits command arguments on spaces; accept both
+            # --dir "Buy & Sell" and --dir Buy & Sell.
+            values = []
+            i += 1
+            while i < len(args) and not args[i].startswith("--"):
+                values.append(args[i].strip('"\''))
+                i += 1
+            raw_opts[key] = " ".join(values)
+            if not raw_opts[key]:
+                await update.message.reply_text('Falta el valor de --dir. Ejemplo: --dir "Buy & Sell".')
+                return
+            continue
+        raw_opts[key] = args[i + 1].strip('"\'')
+        i += 2
+
+    direction = raw_opts["--dir"]
+    if direction is not None:
+        direction = {"Both": "Buy & Sell", "BuyOnly": "Buy Only", "SellOnly": "Sell Only"}.get(direction, direction)
+        if direction not in ("Buy & Sell", "Buy Only", "Sell Only"):
+            await update.message.reply_text('Dirección inválida. Usa --dir "Buy & Sell", "Buy Only" o "Sell Only".')
+            return
+        config["pos_dir"] = direction
+
+    if raw_opts["--re-entry"] is not None:
+        value = raw_opts["--re-entry"].lower()
+        if value not in ("true", "false"):
+            await update.message.reply_text("--re-entry admite true o false.")
+            return
+        config["enter_on_reentry"] = value == "true"
+
+    if raw_opts["--tp"] is not None:
+        try:
+            tps = [float(x.strip()) for x in raw_opts["--tp"].split(",") if x.strip()]
+            if not tps or any(x <= 0 or x > 100 for x in tps) or sum(tps) > 100:
+                raise ValueError
+            config["tp_percentages"] = tps
+        except (TypeError, ValueError):
+            await update.message.reply_text("TP inválido; ejemplo: --tp 40,30,30 (suma <=100).")
+            return
+
+    if raw_opts["--feed"] is not None:
+        feed_mode = raw_opts["--feed"].lower()
+        if feed_mode not in ("websocket", "rest"):
+            await update.message.reply_text("--feed debe ser websocket o rest.")
+            return
+        config["feed_mode"] = feed_mode
+
+    if raw_opts["--poll"] is not None:
+        try:
+            poll = int(raw_opts["--poll"])
+            if not 2 <= poll <= 30:
+                raise ValueError
+            config["poll_seconds"] = poll
+        except (TypeError, ValueError):
+            await update.message.reply_text("--poll debe estar entre 2 y 30 segundos.")
+            return
+
+    config["monitor_interval"] = f"{int(config.get('poll_seconds', 5))}s"
+    config["paper_only"] = True
+    await asyncio.to_thread(TTR_LIVE_STORE.subscribe, symbol, update.effective_chat.id, config)
+    context.application.bot_data.setdefault("ttr_reconciled_symbols", set()).discard(symbol)
+
+    # If feed mode changed to REST, stop the now-unneeded socket. If it changed
+    # back to WebSocket, the next supervisor tick will ensure a fresh connection.
+    feed = context.application.bot_data.get("ttr_ws_feed")
+    if feed is not None:
+        if config["feed_mode"] == "rest":
+            await feed.stop_symbol(symbol)
+        else:
+            feed.resume_symbol(symbol)
+
+    confirmation = (
+        f"✅ TTR paper trading {'actualizado' if existing else 'activado'} para {symbol}.\n"
+        f"Indicador: 15m cerrado · feed: {config['feed_mode'].upper()} "
+        f"(REST de respaldo; sondeo {config['poll_seconds']}s).\n"
+        f"Dirección: {config['pos_dir']} · RE: {'activado' if config['enter_on_reentry'] else 'desactivado'} "
+        f"· TP contables: {config['tp_percentages']}.\n"
+        "Se conservan el estado y las operaciones abiertas. No se enviarán órdenes reales."
+    )
     try:
         await update.message.reply_text(confirmation)
     except Exception:
-        # The subscription is already committed in the store. Telegram delivery
-        # failure must not roll back or misreport the paper-trading activation.
-        logger.warning("TTR %s activado, pero falló el envío de confirmación Telegram", symbol, exc_info=True)
+        logger.warning("TTR %s guardado, pero falló el envío de confirmación Telegram", symbol, exc_info=True)
+
 
 async def ttr_notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Configure independent per-symbol Telegram event notifications."""
@@ -1175,7 +1292,7 @@ async def ttr_health_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append(f"{icon} *{r['component']}* · {r['category']} · {r['status']} · ocurrencias {r['occurrences']}")
         if r.get('message'): lines.append(f"  {str(r['message'])[:220]}")
     lines.extend(['','Render: el estado de cuota/horas gratuitas no es consultable desde el proceso del bot. Revísalo en el dashboard de Render; si el servicio está suspendido, el heartbeat dejará de actualizarse.'])
-    await update.message.reply_text('\n'.join(lines),parse_mode='Markdown')
+    await update.message.reply_text('\n'.join(lines))
 
 
 async def backtest_ttr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

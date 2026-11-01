@@ -30,8 +30,15 @@ class BitunixTickerFeed:
         self.tasks: Dict[str, asyncio.Task] = {}
         self.connections: Dict[str, Any] = {}
         self._stopping = False
+        self._stopped_symbols = set()
+
+    def resume_symbol(self, symbol: str):
+        """Explicitly allow a previously stopped symbol to reconnect."""
+        self._stopped_symbols.discard(symbol)
 
     def ensure(self, symbol: str):
+        if symbol in self._stopped_symbols or self._stopping:
+            return
         task = self.tasks.get(symbol)
         if task is None or task.done():
             self.tasks[symbol] = asyncio.create_task(
@@ -61,6 +68,27 @@ class BitunixTickerFeed:
         )
         status["fresh"] = self.get(symbol) is not None
         return status
+
+    async def stop_symbol(self, symbol: str):
+        """Stop only one market stream; it will restart on the next ensure()."""
+        self._stopped_symbols.add(symbol)
+        ws = self.connections.get(symbol)
+        if ws is not None:
+            try:
+                await asyncio.wait_for(ws.close(), timeout=5)
+            except Exception:
+                log.debug("Error cerrando WebSocket de %s", symbol, exc_info=True)
+        task = self.tasks.pop(symbol, None)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.connections.pop(symbol, None)
+        # Never reuse a pre-stop quote when the symbol is subscribed again.
+        self.latest.pop(symbol, None)
+        self.pending.pop(symbol, None)
+        self.status.setdefault(symbol, {}).update(
+            {"connected": False, "state": "stopped", "stopped_at": time.time()}
+        )
 
     async def stop(self):
         """Close sockets gracefully before cancelling their reader tasks."""
@@ -193,7 +221,7 @@ class BitunixTickerFeed:
             return
 
         reconnect_delay = 1.0
-        while not self._stopping:
+        while not self._stopping and symbol not in self._stopped_symbols:
             ws = None
             connected_monotonic = None
             reader_task = None
@@ -256,7 +284,7 @@ class BitunixTickerFeed:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if self._stopping:
+                if self._stopping or symbol in self._stopped_symbols:
                     break
                 uptime = (
                     time.monotonic() - connected_monotonic
@@ -300,5 +328,5 @@ class BitunixTickerFeed:
                     self.connections.pop(symbol, None)
 
         self.status.setdefault(symbol, {}).update(
-            {"connected": False, "state": "stopped" if self._stopping else "disconnected"}
+            {"connected": False, "state": "stopped" if (self._stopping or symbol in self._stopped_symbols) else "disconnected"}
         )

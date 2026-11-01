@@ -38,3 +38,11 @@ Variables de entorno opcionales:
 - `TTR_WS_HEARTBEAT_TIMEOUT_SECONDS=10`
 
 Si una variable contiene un valor no numérico, el sistema registra una advertencia y utiliza el valor predeterminado.
+
+## Cambios adicionales V4.1 — control por símbolo
+
+- `/ttr_live stop SIMBOLO` desactiva la suscripción persistente y cierra solamente el WebSocket de ese símbolo; no afecta a los demás.
+- Un símbolo detenido queda bloqueado frente a un `ensure()` tardío del supervisor; solo un nuevo `/ttr_live start SIMBOLO` lo habilita expresamente.
+- El supervisor limpia conexiones de símbolos desactivados o configurados en modo REST.
+- Repetir `/ttr_live start SIMBOLO` actualiza únicamente las opciones indicadas; las omitidas conservan sus valores actuales. Se conserva el estado de estrategia, `last_bar_time`, historial y posiciones abiertas.
+- `/ttr_health` envía texto plano. Los componentes y mensajes dinámicos ya no se interpretan como Markdown, evitando `BadRequest: Can't parse entities` cuando aparecen `_`, `*`, `[` u otros caracteres especiales.

@@ -429,7 +429,7 @@ El comando `/backtest_ttr` adjunta un Excel con las hojas Resumen, Operaciones, 
 
 El indicador se calcula exclusivamente con velas 15m cerradas. El monitor de precio consulta el ticker REST de Bitunix con una frecuencia configurable entre 2 y 30 segundos (por defecto 5s): `TTR_POLL_SECONDS=5` o `--poll 5` en `/ttr_live start`. La frecuencia de 2s es un sondeo REST rápido, no un flujo realmente instantáneo; para latencia inferior se recomienda integrar el WebSocket público de trades/ticker de Bitunix y conservar REST como reconciliación.
 
-Ejemplo: `/ttr_live start BTCUSDT --dir Buy & Sell --tp 40,30,30 --re-entry false --poll 3`. Las reentradas siguen siendo opcionales mediante `--re-entry true|false`. `/ttr_status` muestra precio consultado, PSAR/lagging PSAR, hora de vela, lado, entrada, exposición restante y PnL realizado. `GET /api/ttr/live/status` devuelve las mismas configuraciones y estado estructurado.
+Ejemplo: `/ttr_live start BTCUSDT --dir "Buy & Sell" --tp 40,30,30 --re-entry false --poll 3`. Las reentradas siguen siendo opcionales mediante `--re-entry true|false`. `/ttr_status` muestra precio consultado, PSAR/lagging PSAR, hora de vela, lado, entrada, exposición restante y PnL realizado. `GET /api/ttr/live/status` devuelve las mismas configuraciones y estado estructurado.
 
 El sondeo REST tiene límites de latencia y rate limit; la cotización no activa stops. Las señales se calculan únicamente al cierre 15m.
 
@@ -467,3 +467,11 @@ Al iniciar cada ciclo, el monitor reconcilia la posición guardada con la tabla 
 **Migración única de SQLite a Supabase:** copia el archivo SQLite existente a un entorno donde puedas ejecutar Python, define `TTR_SQLITE_SOURCE=/ruta/ttr_live.sqlite3` y `DATABASE_URL`, instala `pip install -r requirements.txt` y ejecuta `python migrate_ttr_sqlite_to_postgres.py`. La migración conserva IDs, operaciones, eventos y suscripciones; puede reejecutarse sin duplicar IDs. No borres el SQLite hasta verificar `/ttr_history SIMBOLO` y `/ttr_status` contra PostgreSQL.
 
 Nota: el TP live usa la misma aproximación Python de fractales/engulfing que el backtest, no garantiza identidad exacta con TradingView mientras no tengamos el código fuente de las librerías Pine importadas. Ahora el cálculo se ejecuta sobre la posición real persistida y cada vela cerrada pendiente, en vez de reconstruir un backtest independiente y filtrar solo el evento de la última vela.
+
+
+### Actualizar o detener un TTR Live por símbolo
+
+- Detener solo una moneda: `/ttr_live stop BTCUSDT`. Se desactiva su monitor y se cierra su WebSocket; los datos históricos y posiciones registradas se conservan.
+- Cambiar parámetros sin reiniciar el estado: volver a ejecutar `/ttr_live start BTCUSDT` con las opciones que se quieran modificar, por ejemplo `/ttr_live start BTCUSDT --tp 40,30,30` o `/ttr_live start BTCUSDT --feed rest --poll 3`. Las opciones omitidas conservan su configuración anterior.
+- Dirección con espacios: `/ttr_live start BTCUSDT --dir "Buy & Sell"`.
+- El comando `/ttr_health` responde en texto plano para que nombres de componentes y mensajes con caracteres especiales no provoquen errores de parseo Markdown de Telegram.

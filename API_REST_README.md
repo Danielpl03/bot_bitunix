@@ -68,7 +68,7 @@ Para `strategy: "trend_trader_remastered"`, `params` admite `enter_on_reentry` (
 El bot incorpora un monitor de TTR que consulta precio cada 60 segundos y calcula el indicador únicamente con velas 15m cerradas. No envía órdenes a Bitunix.
 
 Comandos Telegram (solo usuario autorizado):
-- `/ttr_live start BTCUSDT [--dir Buy & Sell] [--tp 40,30,30] [--re-entry true|false]`
+- `/ttr_live start BTCUSDT [--dir "Buy & Sell"] [--tp 40,30,30] [--re-entry true|false]`
 - `/ttr_live stop BTCUSDT`
 - `/ttr_live list`
 - `/ttr_status`
@@ -87,7 +87,7 @@ El monitor evalúa entradas/reversiones al cierre de velas 15m con la misma fór
 
 El indicador se calcula exclusivamente con velas 15m cerradas. En modo WebSocket, `--poll 5` configura únicamente el intervalo del respaldo REST; en modo `--feed rest`, configura el sondeo REST entre 2 y 30 segundos.
 
-Ejemplo: `/ttr_live start BTCUSDT --dir Buy & Sell --tp 40,30,30 --re-entry false --poll 3`. Las reentradas siguen siendo opcionales mediante `--re-entry true|false`. `/ttr_status` muestra por cada suscripción activa precio consultado, intervalo de sondeo, PSAR y lagging PSAR de la última vela cerrada, hora de la vela, lado, entrada, exposición restante, PnL realizado y configuración TP/reentrada. `GET /api/ttr/live/status` devuelve las mismas configuraciones y estado estructurado.
+Ejemplo: `/ttr_live start BTCUSDT --dir "Buy & Sell" --tp 40,30,30 --re-entry false --poll 3`. Las reentradas siguen siendo opcionales mediante `--re-entry true|false`. `/ttr_status` muestra por cada suscripción activa precio consultado, intervalo de sondeo, PSAR y lagging PSAR de la última vela cerrada, hora de la vela, lado, entrada, exposición restante, PnL realizado y configuración TP/reentrada. `GET /api/ttr/live/status` devuelve las mismas configuraciones y estado estructurado.
 
 El WebSocket/REST actualiza el precio de mercado, pero no activa cierres por stop; las señales TTR se evalúan al cierre 15m.
 
