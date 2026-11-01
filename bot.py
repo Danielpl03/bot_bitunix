@@ -2197,6 +2197,17 @@ async def _post_init(application: Application) -> None:
         logger.warning("No se pudieron registrar los comandos en Telegram durante el arranque; el bot continuará y se podrá reintentar en otro despliegue.", exc_info=True)
 
 
+async def _post_stop(application: Application) -> None:
+    """Stop long-lived TTR WebSockets while the asyncio loop is still alive."""
+    feed = application.bot_data.get('ttr_ws_feed')
+    if feed is not None:
+        try:
+            await feed.stop()
+            logger.info('Conexiones WebSocket TTR cerradas ordenadamente.')
+        except Exception:
+            logger.exception('Error cerrando las conexiones WebSocket TTR.')
+
+
 def _enable_health_check() -> None:
     """
     En modo webhook, python-telegram-bot solo responde en la ruta del webhook
@@ -2260,6 +2271,7 @@ def main() -> None:
         .request(telegram_request)
         .get_updates_request(HTTPXRequest(connect_timeout=20, read_timeout=30, write_timeout=30, pool_timeout=15))
         .post_init(_post_init)
+        .post_stop(_post_stop)
         .build()
     )
 

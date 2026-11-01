@@ -13,6 +13,7 @@ class BitunixTickerFeed:
         self.pending: Dict[str, list] = {}
         self.status: Dict[str, Dict[str, Any]] = {}
         self.tasks: Dict[str, asyncio.Task] = {}
+        self.connections: Dict[str, Any] = {}
         self._stopping=False
 
     def ensure(self, symbol: str):
@@ -40,10 +41,23 @@ class BitunixTickerFeed:
         return s
 
     async def stop(self):
+        """Close sockets gracefully before cancelling their reader tasks."""
         self._stopping=True
-        for task in self.tasks.values(): task.cancel()
-        if self.tasks: await asyncio.gather(*self.tasks.values(), return_exceptions=True)
+        sockets=list(self.connections.values())
+        if sockets:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(ws.close() for ws in sockets), return_exceptions=True),
+                    timeout=7,
+                )
+            except asyncio.TimeoutError:
+                log.warning('Timeout cerrando conexiones WebSocket; se cancelarán las tareas restantes.')
+        for task in self.tasks.values():
+            if not task.done(): task.cancel()
+        if self.tasks:
+            await asyncio.gather(*self.tasks.values(), return_exceptions=True)
         self.tasks.clear()
+        self.connections.clear()
 
     async def _run(self, symbol: str):
         try:
@@ -53,12 +67,15 @@ class BitunixTickerFeed:
             return
         delay=1
         while not self._stopping:
+            ws=None
+            connected_monotonic=None
             try:
                 self.status[symbol]={'connected':False,'state':'connecting','last_error':None}
                 async with websockets.connect(self.url, ping_interval=20, ping_timeout=10, close_timeout=5, max_queue=1000) as ws:
+                    self.connections[symbol]=ws
                     await ws.send(json.dumps({'op':'subscribe','args':[{'symbol':symbol,'ch':'trade'}]}))
+                    connected_monotonic=time.monotonic()
                     self.status[symbol]={'connected':True,'state':'connected','connected_at':time.time(),'last_error':None}
-                    delay=1
                     while not self._stopping:
                         try:
                             raw=await asyncio.wait_for(ws.recv(), timeout=25)
@@ -90,7 +107,19 @@ class BitunixTickerFeed:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.status[symbol]={'connected':False,'state':'reconnecting','last_error':str(exc)[:300],'disconnected_at':time.time()}
-                log.warning('Bitunix WS %s disconnected: %s',symbol,exc)
+                # A deliberate application shutdown is not an exchange outage.
+                if self._stopping:
+                    break
+                uptime=(time.monotonic()-connected_monotonic) if connected_monotonic is not None else 0
+                if uptime >= 60:
+                    delay=1
+                self.status[symbol]={'connected':False,'state':'reconnecting','last_error':str(exc)[:300],
+                                     'disconnected_at':time.time(),'last_connection_seconds':round(uptime,2),
+                                     'reconnect_in_seconds':delay}
+                log.warning('Bitunix WS %s disconnected after %.1fs; reconectando en %ss: %s',symbol,uptime,delay,exc)
                 await asyncio.sleep(delay)
                 delay=min(delay*2,30)
+            finally:
+                if ws is not None and self.connections.get(symbol) is ws:
+                    self.connections.pop(symbol, None)
+        self.status.setdefault(symbol, {}).update({'connected':False,'state':'stopped' if self._stopping else 'disconnected'})

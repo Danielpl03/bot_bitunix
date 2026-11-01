@@ -14,20 +14,21 @@ DB_PATH = os.environ.get('TTR_LIVE_DB', '/tmp/ttr_live.sqlite3')
 TF_MS = 15 * 60 * 1000
 PINE_ENGINE_VERSION = 2
 DEFAULT_POLL_SECONDS = max(2, int(os.environ.get('TTR_POLL_SECONDS', '5')))
+log = logging.getLogger(__name__)
 
 
 def supervisor_interval_seconds(value=None):
     """Polling cadence for the sequential TTR supervisor.
 
-    The monitor handles symbols serially and must never overlap itself. A 10s
-    default avoids scheduling a new run while PostgreSQL/REST work is still in
-    flight; deployments can tune it with TTR_SUPERVISOR_INTERVAL_SECONDS.
+    The monitor handles symbols serially and must never overlap itself. A 15s
+    default reduces skipped ticks when several symbols need REST/DB work; tune
+    with TTR_SUPERVISOR_INTERVAL_SECONDS for the deployed watchlist size.
     """
-    raw = os.environ.get('TTR_SUPERVISOR_INTERVAL_SECONDS', '10') if value is None else value
+    raw = os.environ.get('TTR_SUPERVISOR_INTERVAL_SECONDS', '15') if value is None else value
     try:
         seconds = int(raw)
     except (TypeError, ValueError):
-        seconds = 10
+        seconds = 15
     return max(5, min(60, seconds))
 
 def resume_bar_boundary(now_ms=None):
@@ -529,6 +530,7 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
     await db_call('save_state',symbol,state,last_bar_time=bar_time)
 
 async def monitor_job(context):
+    cycle_started=time.monotonic()
     from bot import bitunix
     from ttr_websocket import BitunixTickerFeed
     feed=context.application.bot_data.get('ttr_ws_feed')
@@ -548,8 +550,11 @@ async def monitor_job(context):
         params=json.loads(cfg.get('config') or '{}')
         if params.get('feed_mode','websocket')=='websocket': feed.ensure(cfg['symbol'])
         errors=context.application.bot_data.setdefault('ttr_monitor_errors',{})
+        symbol_started=time.monotonic()
         try:
             await monitor_symbol(context,cfg['symbol'],bitunix,ws_feed=feed)
+            symbol_elapsed=time.monotonic()-symbol_started
+            log.info('TTR monitor %s completado en %.2fs',cfg['symbol'],symbol_elapsed)
             errors.pop(cfg['symbol'],None)
             await _health_transition(context,f"symbol:{cfg['symbol']}",'MONITOR','OK')
             await _health_transition(context,f"bitunix:{cfg['symbol']}",'BITUNIX','OK')
@@ -568,3 +573,5 @@ async def monitor_job(context):
                 logging.getLogger(__name__).exception('TTR live monitor error %s',cfg['symbol'])
                 _queue_notify(context,cfg['chat_id'],f'⚠️ TTR {cfg["symbol"]}: error en monitor: {str(exc)[:250]}')
                 errors[cfg['symbol']]=signature
+    cycle_elapsed=time.monotonic()-cycle_started
+    log.info('TTR supervisor completado: %d símbolos en %.2fs',len(configs),cycle_elapsed)

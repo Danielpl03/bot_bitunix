@@ -2,7 +2,7 @@ from ttr_live import supervisor_interval_seconds
 
 
 def test_supervisor_interval_defaults_to_ten_seconds():
-    assert supervisor_interval_seconds(None) == 10
+    assert supervisor_interval_seconds(None) == 15
 
 
 def test_supervisor_interval_is_clamped_to_safe_bounds():
@@ -15,4 +15,4 @@ def test_supervisor_interval_accepts_custom_value():
 
 
 def test_supervisor_interval_handles_invalid_value():
-    assert supervisor_interval_seconds('invalid') == 10
+    assert supervisor_interval_seconds('invalid') == 15
