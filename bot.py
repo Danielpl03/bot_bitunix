@@ -75,7 +75,11 @@ from backtest_dual_thrust_multitimeframe import (load_multitimeframe_candles, ru
 from backtest_trend_trader_remastered import run_backtest as run_ttr_backtest
 from xlsx_export_dual_thrust import build_dual_thrust_workbook
 from xlsx_export_ttr import build_ttr_workbook
-from ttr_live import STORE as TTR_LIVE_STORE, monitor_job as ttr_live_monitor_job
+from ttr_live import (
+    STORE as TTR_LIVE_STORE,
+    monitor_job as ttr_live_monitor_job,
+    supervisor_interval_seconds as ttr_supervisor_interval_seconds,
+)
 from backtest_common import (parse_backtest_request, load_backtest_klines, filter_signals_to_period, filter_signals_by_density, filter_signals_by_opposite_band, filter_signals_by_channel_width)
 from risk_management import RiskConfig
 
@@ -2286,11 +2290,22 @@ def main() -> None:
     application.add_error_handler(_error_handler)
 
     if application.job_queue is not None:
+        supervisor_interval = ttr_supervisor_interval_seconds()
         application.job_queue.run_repeating(
-            ttr_live_monitor_job, interval=1, first=1, name="ttr_live_monitor",
-            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 5},
+            ttr_live_monitor_job, interval=supervisor_interval, first=1, name="ttr_live_monitor",
+            # Keep one sequential worker: concurrent runs could process the same
+            # candle twice or race while persisting an open paper position.
+            job_kwargs={
+                "max_instances": 1,
+                "coalesce": True,
+                "misfire_grace_time": max(30, supervisor_interval * 2),
+            },
         )
-        logger.info("Monitor TTR paper trading: WebSocket prioritario, REST fallback; supervisor cada 1 segundo (sin solapamientos).")
+        logger.info(
+            "Monitor TTR paper trading: WebSocket prioritario, REST fallback; "
+            "supervisor cada %s segundos (sin solapamientos).",
+            supervisor_interval,
+        )
         for interval, hours in (("4h", 4), ("1h", 1)):
             first_run = _next_boundary_utc(hours)
             application.job_queue.run_repeating(

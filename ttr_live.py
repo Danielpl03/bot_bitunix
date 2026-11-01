@@ -15,6 +15,21 @@ TF_MS = 15 * 60 * 1000
 PINE_ENGINE_VERSION = 2
 DEFAULT_POLL_SECONDS = max(2, int(os.environ.get('TTR_POLL_SECONDS', '5')))
 
+
+def supervisor_interval_seconds(value=None):
+    """Polling cadence for the sequential TTR supervisor.
+
+    The monitor handles symbols serially and must never overlap itself. A 10s
+    default avoids scheduling a new run while PostgreSQL/REST work is still in
+    flight; deployments can tune it with TTR_SUPERVISOR_INTERVAL_SECONDS.
+    """
+    raw = os.environ.get('TTR_SUPERVISOR_INTERVAL_SECONDS', '10') if value is None else value
+    try:
+        seconds = int(raw)
+    except (TypeError, ValueError):
+        seconds = 10
+    return max(5, min(60, seconds))
+
 def resume_bar_boundary(now_ms=None):
     """Latest fully closed 15m candle; bars during downtime are deliberately skipped."""
     now_ms = int(time.time()*1000) if now_ms is None else int(now_ms)
