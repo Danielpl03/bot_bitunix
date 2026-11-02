@@ -56,6 +56,12 @@ def poll_seconds(config=None):
     config = config or {}
     return max(2, min(30, int(config.get('poll_seconds', DEFAULT_POLL_SECONDS))))
 
+
+def tp_close_percent(remaining_pct, configured_pct, is_last_tp):
+    """Final configured TP liquidates all remaining paper margin."""
+    remaining = max(0.0, float(remaining_pct))
+    return remaining if is_last_tp else min(max(0.0, float(configured_pct)), remaining)
+
 class TTRDatabaseError(RuntimeError):
     pass
 
@@ -237,6 +243,17 @@ class TTRLiveStore:
     def health(self):
         with self._db() as c:
             return [dict(x) for x in self._execute(c, 'SELECT * FROM ttr_live_health ORDER BY status DESC,component').fetchall()]
+
+    def reset_all(self):
+        """Delete every TTR Live record (subscriptions, state, trades, events and health)."""
+        with self._db() as c:
+            if self.backend == 'postgres':
+                self._execute(c, 'TRUNCATE TABLE ttr_live_events, ttr_live_trades, ttr_live_config, ttr_live_health RESTART IDENTITY')
+            else:
+                for table in ('ttr_live_events', 'ttr_live_trades', 'ttr_live_config', 'ttr_live_health'):
+                    self._execute(c, f'DELETE FROM {table}')
+                self._execute(c, "DELETE FROM sqlite_sequence WHERE name IN ('ttr_live_events','ttr_live_trades')")
+
 STORE=TTRLiveStore()
 
 async def _health_transition(context, component, category, status, message=None):
@@ -474,7 +491,7 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
             await db_call('update_trade',tid,payload=json.dumps({'engine_version':PINE_ENGINE_VERSION,'position':pos}))
             await db_call('event',symbol,'ENTRY',desired,entry_price,int(times[k]),
                           {'signal':'PSAR_LAGGING_CROSS','psar_lagging':entry_price})
-            _notify_trade_event(context,chat_id,params,'open',f'📍 TTR {symbol} · ENTRADA {desired.upper()}\\nVela 15m cerrada: {datetime.fromtimestamp(int(times[k])/1000,timezone.utc):%Y-%m-%d %H:%M UTC}\\nPrecio de referencia Pine: {entry_price:.8g} (lagging PSAR).')
+            _notify_trade_event(context,chat_id,params,'open',f'📍 TTR {symbol} · ENTRADA {desired.upper()}\nVela 15m cerrada: {datetime.fromtimestamp(int(times[k])/1000,timezone.utc):%Y-%m-%d %H:%M UTC}\nPrecio de referencia Pine: {entry_price:.8g} (lagging PSAR).')
             continue
         # Pine does not evaluate TP/RE on a candle with a posExit.
         if exits_current or not pos or int(times[k])<=int(pos.get('entry_time',0)):
@@ -499,18 +516,28 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
             marked=set(int(x) for x in pos['tp_marked_fractals']); marked.add(int(fractal.when))
             pos['tp_marked_fractals']=sorted(marked)
             slot=int(pos.get('tp_count',0))
-            pct=min(tp_values[slot],float(pos.get('remaining_pct',100))) if slot<len(tp_values) else 0.0
+            is_last_tp = slot + 1 >= len(tp_values)
+            pct=tp_close_percent(pos.get('remaining_pct',100), tp_values[slot], is_last_tp) if slot<len(tp_values) else 0.0
             pos['last_tp']=float(closes[k]); pos['tp_count']=slot+1
             if pct>0:
                 raw=((float(closes[k])/float(pos['avg_entry'])-1)*100)*(1 if side=='buy' else -1)
                 pos['realized_pnl_pct']=float(pos.get('realized_pnl_pct',0))+raw*pct/100
                 pos['remaining_pct']=max(0,float(pos.get('remaining_pct',100))-pct)
-                await db_call('update_trade',pos['trade_id'],realized_pnl_pct=pos['realized_pnl_pct'],
-                    remaining_pct=pos['remaining_pct'],payload=json.dumps({key:pos.get(key) for key in
-                    ('engine_version','avg_entry','tp_count','tp_marked_fractals','re_marked_fractals','last_tp','last_re')}))
+                exhausted = is_last_tp or pos['remaining_pct'] <= 1e-8
+                trade_fields = {'realized_pnl_pct':pos['realized_pnl_pct'], 'remaining_pct':0.0 if exhausted else pos['remaining_pct']}
+                if exhausted:
+                    pos['remaining_pct']=0.0
+                    trade_fields.update(exit_time=int(times[k]), exit_price=float(closes[k]),
+                                        exit_reason='TP_EXHAUSTED', status='CLOSED')
+                trade_fields['payload']=json.dumps({key:pos.get(key) for key in
+                    ('engine_version','avg_entry','tp_count','tp_marked_fractals','re_marked_fractals','last_tp','last_re')})
+                await db_call('update_trade',pos['trade_id'],**trade_fields)
                 await db_call('event',symbol,'TP',side,float(closes[k]),int(times[k]),
-                    {'tp_number':slot+1,'percent_closed':pct,'remaining_pct':pos['remaining_pct'],'fractal_time':int(fractal.when)})
-                _notify_trade_event(context,chat_id,params,'tp',f'🎯 TTR {symbol} · TP {slot+1}\\n{side.upper()} · vela {datetime.fromtimestamp(int(times[k])/1000,timezone.utc):%Y-%m-%d %H:%M UTC} · precio {closes[k]:.8g} · cierre simulado {pct:.2f}% · restante {pos["remaining_pct"]:.2f}%.')
+                    {'tp_number':slot+1,'percent_closed':pct,'remaining_pct':pos['remaining_pct'],'closed':exhausted,'fractal_time':int(fractal.when)})
+                _notify_trade_event(context,chat_id,params,'tp',f'🎯 TTR {symbol} · TP {slot+1}\n{side.upper()} · vela {datetime.fromtimestamp(int(times[k])/1000,timezone.utc):%Y-%m-%d %H:%M UTC} · precio {closes[k]:.8g} · margen liquidado {pct:.2f}% · restante {pos["remaining_pct"]:.2f}%.')
+                if exhausted:
+                    _notify_trade_event(context,chat_id,params,'close',f'🔒 TTR {symbol} · OPERACIÓN CERRADA por agotamiento de TP\n{side.upper()} @ {closes[k]:.8g} · margen restante liquidado · PnL realizado {pos["realized_pnl_pct"]:+.4f}%.')
+                    pos=None
             else:
                 await db_call('event',symbol,'TP_SIGNAL_NO_CLOSE',side,float(closes[k]),int(times[k]),
                     {'tp_number':slot+1,'percent_closed':0,'remaining_pct':pos['remaining_pct'],'fractal_time':int(fractal.when)})

@@ -178,3 +178,24 @@ def test_resubscribe_updates_config_without_resetting_position_or_bar(tmp_path):
     assert cfg['tp_percentages'] == [40, 30, 30]
     assert json.loads(row['state']) == state
     assert row['last_bar_time'] == 987654
+
+
+def test_reset_all_deletes_all_ttr_data_and_resets_ids(tmp_path):
+    store = TTRLiveStore(str(tmp_path / 'reset.sqlite'))
+    store.subscribe('BTCUSDT', 123, {'tp_percentages': [25, 25, 25, 25]})
+    trade_id = store.open_trade('BTCUSDT', 'buy', 1000, 100, None)
+    store.event('BTCUSDT', 'ENTRY', 'buy', 100, 1000, {'x': 1})
+    store.set_health('ws', 'WEBSOCKET', 'ERROR', 'test')
+    store.reset_all()
+    assert store.status() == []
+    assert store.all_history() == []
+    assert store.events('BTCUSDT') == []
+    assert store.health() == []
+    assert store.open_trade('ETHUSDT', 'sell', 2000, 200, None) == 1
+
+
+def test_last_configured_tp_liquidates_all_remaining_margin():
+    from ttr_live import tp_close_percent
+    assert tp_close_percent(25, 25, True) == 25
+    assert tp_close_percent(25, 10, True) == 25
+    assert tp_close_percent(60, 30, False) == 30

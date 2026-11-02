@@ -106,6 +106,7 @@ BOT_COMMANDS = [
     BotCommand("backtest_ttr", "Backtest TTR Pine v6 con TP parciales y reversiones"),
     BotCommand("ttr_live", "Paper trading TTR en tiempo real (sin órdenes)"),
     BotCommand("ttr_stop", "Detener TTR Live para un símbolo (/ttr_stop BTCUSDT)"),
+    BotCommand("ttr_restart", "Borrar y reiniciar TTR Live desde cero (incluye históricos)"),
     BotCommand("ttr_notify", "Activar/desactivar avisos TTR por evento y símbolo"),
     BotCommand("ttr_status", "Estado de operaciones TTR en seguimiento"),
     BotCommand("ttr_history", "Historial global o por símbolo de TTR"),
@@ -1212,6 +1213,42 @@ async def ttr_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(
         f"⏹ Seguimiento TTR detenido para {symbol}. "
         "Se cierra su WebSocket; el historial y las posiciones registradas se conservan."
+    )
+
+
+async def ttr_restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Destructive reset of TTR Live only; requires an explicit confirmation token."""
+    if not _is_authorized(update):
+        await update.message.reply_text("No autorizado.")
+        return
+    if len(context.args) != 1 or context.args[0].upper() != "CONFIRMAR":
+        await update.message.reply_text(
+            "⚠️ Este comando elimina TODAS las suscripciones TTR, estados, operaciones abiertas y cerradas, "
+            "eventos e históricos, además de los registros de salud. No afecta a otras estrategias ni a órdenes "
+            "de Bitunix.\n\nPara confirmar el borrado irreversible, ejecuta: /ttr_restart CONFIRMAR"
+        )
+        return
+
+    # Close each symbol socket without globally killing the feed object, so a
+    # later /ttr_live start can resume new subscriptions in this same process.
+    feed = context.application.bot_data.get("ttr_ws_feed")
+    symbols = [row["symbol"] for row in await asyncio.to_thread(TTR_LIVE_STORE.status)]
+    if feed is not None:
+        for symbol in symbols:
+            try:
+                await feed.stop_symbol(symbol)
+            except Exception:
+                logger.exception("No se pudo detener WebSocket TTR de %s durante el reinicio", symbol)
+
+    await asyncio.to_thread(TTR_LIVE_STORE.reset_all)
+    data = context.application.bot_data
+    data["ttr_reconciled_symbols"] = set()
+    data["ttr_health_cache"] = {}
+    data.pop("ttr_supervisor_last_heartbeat", None)
+    await update.message.reply_text(
+        "♻️ TTR Live reiniciado desde cero. Se eliminaron suscripciones, estados, posiciones, "
+        "operaciones e históricos, eventos y registros de salud. No se modificó ninguna otra estrategia "
+        "ni se enviaron órdenes. Puedes volver a suscribir símbolos con /ttr_live start BTCUSDT."
     )
 
 
@@ -2431,6 +2468,7 @@ def main() -> None:
     application.add_handler(CommandHandler("backtest_ttr", backtest_ttr_command))
     application.add_handler(CommandHandler("ttr_live", ttr_live_command))
     application.add_handler(CommandHandler("ttr_stop", ttr_stop_command))
+    application.add_handler(CommandHandler("ttr_restart", ttr_restart_command))
     application.add_handler(CommandHandler("ttr_notify", ttr_notify_command))
     application.add_handler(CommandHandler("ttr_status", ttr_status_command))
     application.add_handler(CommandHandler("ttr_history", ttr_history_command))
