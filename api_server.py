@@ -21,6 +21,7 @@ from backtest_squeeze import run_backtest as run_squeeze, summarize as summarize
 from backtest_dual_thrust import run_backtest as run_dual, summarize as summarize_dual
 from backtest_trend_trader_remastered import run_backtest as run_ttr
 from ttr_live import STORE as TTR_LIVE_STORE
+from rsi_live import STORE as RSI_LIVE_STORE
 
 PORT = int(os.environ.get('PORT', '8000'))
 API_KEY = os.environ.get('BACKTEST_API_KEY', '').strip()
@@ -117,7 +118,7 @@ def run(payload):
             trades.append({'time':x.time,'entry_time':x.time,'side':x.side,'entry':x.close,'exit_price':sc.exit_price,'stop_loss':x.stop_loss,'target':sc.target,'outcome':sc.outcome,'pnl_pct':sc.pct_change,'r_multiple':sc.r_multiple})
     else:
         if strategy=='rsi':
-            results=run_rsi(closes,highs,lows,opens,times,horizon=horizon,rsi_period=int(p.get('rsi_period',14)),ma_type=str(p.get('ma_type','SMA')),ma_period=int(p.get('ma_period',14)),sl_lookback=int(p.get('sl_lookback',10)),stop_mode=str(p.get('stop_mode','lookback')),pivot_buffer_pct=float(p.get('pivot_buffer_pct',0.1)))
+            results=run_rsi(closes,highs,lows,opens,times,horizon=horizon,rsi_period=int(p.get('rsi_period',14)),oversold=float(p.get('oversold',30)),overbought=float(p.get('overbought',70)),pivot_left=int(p.get('pivot_left',2)),pivot_right=int(p.get('pivot_right',2)),stop_buffer_pct=float(p.get('stop_buffer_pct',0)),risk_usdt=float(p.get('risk_usdt',10)),fee_pct=float(p.get('fee_pct',0)))
             summarizer=summarize_rsi
         elif strategy=='reversion':
             results=run_reversion(closes,highs,lows,opens,times,horizon=horizon,bb_period=int(p.get('bb_period',20)),bb_std=float(p.get('bb_std',2)),k_period=int(p.get('k_period',14)),smooth_k=int(p.get('smooth_k',3)),d_period=int(p.get('d_period',3)),oversold=float(p.get('oversold',20)),overbought=float(p.get('overbought',80)),sl_lookback=int(p.get('sl_lookback',10)))
@@ -147,13 +148,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self): self.send_json(204,{})
     def do_GET(self):
         path=urlparse(self.path).path
-        if path=='/api/health': return self.send_json(200,{'ok':True,'service':'backtest-lab-python-api','strategies':['keltner','bollinger','rsi','reversion','squeeze','dual_thrust','trend_trader_remastered','trend_trader_remastered_live']})
+        if path=='/api/health': return self.send_json(200,{'ok':True,'service':'backtest-lab-python-api','strategies':['keltner','bollinger','rsi','reversion','squeeze','dual_thrust','trend_trader_remastered','trend_trader_remastered_live','rsi_extreme_live']})
         if path=='/api/ttr/live/status':
             rows=[r for r in TTR_LIVE_STORE.status() if r.get('enabled')]
             for r in rows:
                 r['config']=json.loads(r.get('config') or '{}')
                 r['state']=json.loads(r.get('state') or '{}')
             return self.send_json(200,{'subscriptions':rows,'count':len(rows)})
+        if path=='/api/rsi/live/status':
+            rows=RSI_LIVE_STORE.status()
+            for r in rows: r['config']=json.loads(r.get('config') or '{}')
+            return self.send_json(200,{'subscriptions':rows,'count':sum(bool(r.get('enabled')) for r in rows)})
+        if path.startswith('/api/rsi/live/history'):
+            parts=path.strip('/').split('/'); symbol=parts[4].upper() if len(parts)>4 else None
+            return self.send_json(200,{'trades':RSI_LIVE_STORE.history(symbol)})
         if path.startswith('/api/ttr/live/history/'):
             symbol=path.rsplit('/',1)[-1].upper(); return self.send_json(200,{'symbol':symbol,'trades':TTR_LIVE_STORE.history(symbol,200),'events':TTR_LIVE_STORE.events(symbol,500)})
         return self.send_json(404,{'error':'Ruta no encontrada.'})

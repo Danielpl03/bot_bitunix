@@ -80,6 +80,7 @@ from ttr_live import (
     monitor_job as ttr_live_monitor_job,
     supervisor_interval_seconds as ttr_supervisor_interval_seconds,
 )
+from rsi_live import STORE as RSI_LIVE_STORE, monitor_job as rsi_live_monitor_job
 from backtest_common import (parse_backtest_request, load_backtest_klines, filter_signals_to_period, filter_signals_by_density, filter_signals_by_opposite_band, filter_signals_by_channel_width)
 from risk_management import RiskConfig
 
@@ -105,6 +106,8 @@ BOT_COMMANDS = [
     BotCommand("backtest_dual_thrust", "Backtest ruptura de rango Dual Thrust"),
     BotCommand("backtest_ttr", "Backtest TTR Pine v6 con TP parciales y reversiones"),
     BotCommand("ttr_live", "Paper trading TTR en tiempo real (sin órdenes)"),
+    BotCommand("rsi_live", "Paper trading RSI multi-temporalidad (sin órdenes)"),
+    BotCommand("rsi_status", "Estado e historial de operaciones RSI"),
     BotCommand("ttr_stop", "Detener TTR Live para un símbolo (/ttr_stop BTCUSDT)"),
     BotCommand("ttr_restart", "Borrar y reiniciar TTR Live desde cero (incluye históricos)"),
     BotCommand("ttr_notify", "Activar/desactivar avisos TTR por evento y símbolo"),
@@ -317,7 +320,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/backtest SIMBOLO [INTERVALO] AAAA-MM-DD AAAA-MM-DD [HORIZONTE] - backtest por fechas UTC\n"
         "/backtest_keltner ... - backtest con Canal Keltner\n"
         "/backtest_reversion ... - reversión a la media con Bollinger + Estocástico\n"
-        "/backtest_rsi ... - estrategia RSI por regímenes de sobrecompra/sobreventa\n"
+        "/backtest_rsi ... - estrategia RSI extremo, stop estructural y TP en extremo opuesto\n"
+        "/rsi_live add BTCUSDT 15m [RIESGO_USDT] - activar RSI Live paper\n"
+        "/rsi_live remove BTCUSDT 15m | /rsi_live list\n"
+        "/rsi_status [SIMBOLO] - operaciones RSI abiertas e historial\n"
         "/backtest_squeeze ... - ruptura Squeeze con Bollinger + Keltner\n"
         "/backtest_dual_thrust ... - ruptura de rango Dual Thrust\n"
         " /backtest_ttr SIMBOLO INTERVALO VELAS [--re-entry true|false] [--tp 25,25,25,25] [--dir Buy & Sell|Buy Only|Sell Only]\n\n"
@@ -856,107 +862,46 @@ async def backtest_reversion_command(update: Update, context: ContextTypes.DEFAU
 
 
 async def backtest_rsi_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Backtest independiente de cruce RSI + media del RSI."""
-    raw = list(context.args)
-    params = {"rsi_period": 14, "ma_period": 14, "ma_type": "SMA", "sl_lookback": 10, "stop_mode": "lookback", "pivot_left": 2, "pivot_right": 2, "pivot_buffer_pct": 0.1, "ignore_first_ma_cross": False}
-    use_extreme_filter = False
-    positional = []
-    i = 0
+    """Backtest RSI: giro en extremo, stop estructural y TP en extremo opuesto."""
+    raw=list(context.args); params={"rsi_period":14,"oversold":30.0,"overbought":70.0,"pivot_left":2,"pivot_right":2,"stop_buffer_pct":0.0,"risk_usdt":10.0,"fee_pct":0.0}
+    positional=[]; i=0
     try:
-        while i < len(raw):
-            token = raw[i].lower()
-            if token == "--zonas-extremas":
-                use_extreme_filter = True; i += 1; continue
-            if token == "--omitir-primer-cruce":
-                params["ignore_first_ma_cross"] = True; i += 1; continue
-            if token in ("--rsi", "--media", "--tipo-media", "--stop", "--stop-mode", "--pivot-left", "--pivot-right", "--pivot-buffer"):
-                if i + 1 >= len(raw):
-                    raise ValueError(f"Falta el valor después de {raw[i]}.")
-                value = raw[i + 1]
-                if token == "--stop-mode":
-                    mode = value.lower()
-                    if mode not in ("pivot", "lookback"):
-                        raise ValueError("--stop-mode acepta pivot o lookback.")
-                    params["stop_mode"] = mode
-                elif token == "--tipo-media":
-                    ma_types = {"none":"None", "sma":"SMA", "ema":"EMA", "rma":"SMMA (RMA)", "smma":"SMMA (RMA)", "wma":"WMA", "vwma":"VWMA", "bb":"SMA + Bollinger Bands"}
-                    if value.lower() not in ma_types:
-                        raise ValueError("--tipo-media acepta SMA, EMA, RMA, WMA, VWMA, BB o None.")
-                    params["ma_type"] = ma_types[value.lower()]
-                else:
-                    key = {"--rsi":"rsi_period", "--media":"ma_period", "--stop":"sl_lookback", "--pivot-left":"pivot_left", "--pivot-right":"pivot_right", "--pivot-buffer":"pivot_buffer_pct"}[token]
-                    params[key] = float(value) if token == "--pivot-buffer" else int(value)
-                    if params[key] < 0 or (token != "--pivot-buffer" and params[key] < 1): raise ValueError(f"Valor inválido para {raw[i]}.")
-                i += 2; continue
-            positional.append(raw[i]); i += 1
-        args, risk_config, filter_window, filter_limit, band_ratio, channel_width_pct, only_outer_bands = _parse_backtest_args(positional)
+        while i<len(raw):
+            tok=raw[i].lower()
+            keys={"--rsi":"rsi_period","--oversold":"oversold","--overbought":"overbought","--pivot-left":"pivot_left","--pivot-right":"pivot_right","--stop-buffer":"stop_buffer_pct","--risk-usdt":"risk_usdt","--fee":"fee_pct"}
+            if tok in keys:
+                if i+1>=len(raw): raise ValueError(f"Falta el valor después de {raw[i]}")
+                key=keys[tok]; val=float(raw[i+1]); params[key]=int(val) if key in ("rsi_period","pivot_left","pivot_right") else val; i+=2
+            else: positional.append(raw[i]); i+=1
+        request=parse_backtest_request(positional,normalize_symbol=_normalize_symbol,default_interval="4h",max_candles=BACKTEST_MAX_CANDLES)
+        if params['risk_usdt']<=0 or params['rsi_period']<1 or params['pivot_left']<1 or params['pivot_right']<1: raise ValueError("Parámetros de riesgo o pivotes inválidos")
     except ValueError as exc:
-        await update.message.reply_text(f"⚠️ {exc}"); return
-    if filter_window is not None or band_ratio is not None or channel_width_pct is not None or only_outer_bands:
-        await update.message.reply_text("⚠️ Los filtros de otras estrategias no se aplican a /backtest_rsi."); return
-    if params["ma_type"] == "None":
-        await update.message.reply_text("⚠️ La estrategia necesita una media del RSI. Elige SMA, EMA, RMA, WMA, VWMA o BB."); return
-    if not args:
-        await update.message.reply_text(
-            "Backtest RSI + media del RSI (Pine Script/TradingView).\n\n"
-            "Uso por cantidad: /backtest_rsi BTCUSDT 4h 500 [HORIZONTE]\n"
-            "Uso por período: /backtest_rsi BTCUSDT 15m 2025-01-01 2025-01-31 [HORIZONTE]\n\n"
-            "Parámetros: --rsi 14 --tipo-media SMA --media 14 --stop 10 --stop-mode lookback|pivot --pivot-left 2 --pivot-right 2 --pivot-buffer 0.1 --omitir-primer-cruce.\n"
-            "Tipos de media: SMA, EMA, RMA, WMA, VWMA, BB (SMA + Bollinger Bands), None.\n"
-            "Al alcanzar RSI 70 se buscan SHORT hasta RSI 30; al alcanzar RSI 30 se buscan LONG hasta RSI 70. "
-            "Primera entrada por giro del RSI; entradas adicionales por cruce de media (LONG RSI < 55; SHORT RSI > 45).\n"
-            "Entrada en apertura siguiente; SL por ventana --stop o último pivote local confirmado (--stop-mode pivot; --pivot-left/--pivot-right; colchón --pivot-buffer 0.1%). "
-            "Con --omitir-primer-cruce se descarta el primer cruce RSI/media válido de cada régimen y se considera desde el segundo. "
-            "Se permiten varias operaciones simultáneas. Costes no incluidos.")
-        return
-    try:
-        request = parse_backtest_request(args, normalize_symbol=_normalize_symbol, default_interval="4h", max_candles=BACKTEST_MAX_CANDLES)
-    except ValueError as exc:
-        await update.message.reply_text(f"⚠️ {exc}"); return
-    symbol, interval, horizon = request.symbol, request.interval, request.horizon
+        await update.message.reply_text("Uso: /backtest_rsi SIMBOLO INTERVALO VELAS [HORIZONTE] [--risk-usdt 10] [--rsi 14] [--oversold 30] [--overbought 70] [--pivot-left 2] [--pivot-right 2] [--stop-buffer 0] [--fee 0].\n"+str(exc)); return
+    symbol,interval,horizon=request.symbol,request.interval,request.horizon
     if interval not in VALID_INTERVALS:
-        await update.message.reply_text(f"Intervalo {interval} no válido. Usa uno de: {' '.join(sorted(VALID_INTERVALS, key=len))}"); return
-    period_text = (f"período {datetime.fromtimestamp(request.start_ms/1000,tz=timezone.utc):%Y-%m-%d} → {datetime.fromtimestamp(request.end_ms/1000,tz=timezone.utc):%Y-%m-%d} UTC" if request.is_date_range else f"hasta {request.candle_count} velas recientes")
-    await update.message.reply_text(f"Descargando histórico de {symbol} ({interval}, {period_text}) y ejecutando backtest RSI + media…")
+        await update.message.reply_text(f"Intervalo no válido: {interval}"); return
+    await update.message.reply_text(f"Descargando histórico RSI de {symbol} ({interval})…")
     try:
-        klines, signal_start, signal_end = load_backtest_klines(bitunix, request, warmup_candles=max(100, params["rsi_period"] + params["ma_period"] + 10), followup_candles=200)
+        klines,signal_start,signal_end=load_backtest_klines(bitunix,request,warmup_candles=max(100,params['rsi_period']+20),followup_candles=100)
+        closes=[float(k['close']) for k in klines]; highs=[float(k['high']) for k in klines]; lows=[float(k['low']) for k in klines]; opens=[float(k['open']) for k in klines]; times=[int(k['time']) for k in klines]; volumes=[float(k.get('volume',0) or 0) for k in klines]
+        all_trades=run_rsi_backtest(closes,highs,lows,opens,times,horizon=horizon,volumes=volumes,**params)
+        trades=filter_signals_to_period(all_trades,signal_start,signal_end); stats=summarize_rsi(trades)
     except Exception as exc:
-        logger.exception("Error consultando histórico para backtest RSI")
-        await update.message.reply_text(f"⚠️ Error consultando histórico de Bitunix: {exc}"); return
-    if len(klines) < params["rsi_period"] + params["ma_period"] + 2:
-        await update.message.reply_text(f"Solo hay {len(klines)} velas para {symbol} en {interval}; no es suficiente para RSI + media."); return
-    closes=[float(k["close"]) for k in klines]; highs=[float(k["high"]) for k in klines]
-    lows=[float(k["low"]) for k in klines]; opens=[float(k["open"]) for k in klines]; times=[int(k["time"]) for k in klines]; volumes=[float(k.get("volume",0) or 0) for k in klines]
-    try:
-        all_trades=run_rsi_backtest(closes,highs,lows,opens,times,horizon=horizon,**params,use_extreme_filter=use_extreme_filter,volumes=volumes)
-        trades=filter_signals_to_period(all_trades,signal_start,signal_end)
-        stats=summarize_rsi(trades)
-    except Exception as exc:
-        logger.exception("Error calculando backtest RSI")
-        await update.message.reply_text(f"⚠️ Error calculando el backtest RSI: {exc}"); return
-    first_date=datetime.fromtimestamp(times[0]/1000,tz=timezone.utc).strftime("%Y-%m-%d"); last_date=datetime.fromtimestamp(times[-1]/1000,tz=timezone.utc).strftime("%Y-%m-%d")
-    period=(f"señales entre {datetime.fromtimestamp(signal_start/1000,tz=timezone.utc):%Y-%m-%d} → {datetime.fromtimestamp(signal_end/1000,tz=timezone.utc):%Y-%m-%d} UTC" if signal_start is not None else f"{len(klines)} velas ({first_date} → {last_date})")
-    header=(f"*Backtest RSI + Media RSI — {symbol} · {interval}*\nRSI: {params['rsi_period']} · Media: {params['ma_type']} ({params['ma_period']}) · Stop: {params['sl_lookback']} velas · Objetivo: 2R.\n"
-      f"Regímenes RSI 30/70 · entradas MA LONG < 55 / SHORT > 45 · SL: {params['stop_mode']} · omitir primer cruce: {params['ignore_first_ma_cross']} · Riesgo: {risk_config.label}.\n{period}; velas cargadas: {len(klines)}; " + (f"horizonte: {horizon} velas.\n" if horizon is not None else "sin límite de duración.\n") + "Entrada en apertura siguiente; varias posiciones simultáneas permitidas. Costes no incluidos.\n\n")
-    groups=[]
-    for label,key in (("TOTAL","total"),("LONG","long"),("SHORT","short")):
-        st=stats[key]; wr=f"{st['win_rate']:.1f}%" if st['win_rate'] is not None else "N/D"; avg=f"{st['r_medio']:+.2f}R" if st['r_medio'] is not None else "N/D"; total_r=f"{st['r_total']:+.2f}R" if st['r_total'] is not None else "N/D"
-        pf="∞" if st['profit_factor']==float('inf') else (f"{st['profit_factor']:.2f}" if st['profit_factor'] is not None else "N/D"); dd=f"{st['max_drawdown_r']:.2f}R" if st['max_drawdown_r'] is not None else "N/D"
-        groups.append(f"*{label}*: {st['total']} operaciones · {st['tp']} TP · {st['sl']} SL · {st['horizonte']} horizonte · {st['pendientes']} pendientes\nAcierto: {wr} · R total: {total_r} · R medio: {avg}\nProfit factor: {pf} · drawdown máximo: {dd}")
+        logger.exception("Error en backtest RSI"); await update.message.reply_text(f"Error en backtest RSI: {exc}"); return
     if not trades:
-        await update.message.reply_text(header+"No se generaron operaciones válidas en el período con las reglas actuales."); return
-    recent=[]
-    for t in trades[-6:]:
-        dt=datetime.fromtimestamp(t.entry_time/1000,tz=timezone.utc).strftime("%Y-%m-%d %H:%M"); icon="🟢" if t.side=="LONG" else "🔴"; result=f"{t.r_multiple:+.2f}R" if t.r_multiple is not None else t.outcome
-        recent.append(f"{icon} `{dt}` {t.side} entrada `{t.entry:.6g}` · SL `{t.stop_loss:.6g}` · TP `{t.target:.6g}` · RSI `{t.rsi:.2f}` / media `{t.rsi_ma:.2f}` · {result}")
-    await update.message.reply_text(header+"\n\n".join(groups)+"\n\n_Últimas operaciones:_\n"+"\n".join(recent),parse_mode="Markdown")
+        await update.message.reply_text(f"RSI {symbol} {interval}: no se generaron operaciones válidas."); return
+    st=stats['total']; wr=f"{st['win_rate']:.1f}%" if st['win_rate'] is not None else "N/D"; pnl=f"{st['pnl_usdt']:+.2f} USDT" if st['pnl_usdt'] is not None else "N/D"
+    msg=(f"*Backtest RSI extremo — {symbol} · {interval}*\nRSI({params['rsi_period']}) Wilder/RMA · sobreventa {params['oversold']:g} · sobrecompra {params['overbought']:g}\n"
+         f"Stop: pivote confirmado ({params['pivot_left']}/{params['pivot_right']}); si no existe, extremo desde entrada en zona. Riesgo fijo: {params['risk_usdt']:g} USDT/operación.\n"
+         f"TP: cierre a mercado al alcanzar zona opuesta · Entrada: apertura siguiente · operaciones simultáneas permitidas.\n\n"
+         f"Operaciones: {st['total']} · TP: {st['tp']} · SL: {st['sl']} · pendientes: {st['pendientes']}\nAcierto: {wr} · PnL neto: {pnl}")
+    await update.message.reply_text(msg,parse_mode="Markdown")
     try:
-        workbook=build_rsi_workbook(symbol,interval,horizon,klines,trades,stats,risk_config,**params,use_extreme_filter=use_extreme_filter)
+        from xlsx_export_rsi import build_rsi_workbook
+        wb=build_rsi_workbook(symbol,interval,horizon,klines,trades,stats,None,**params)
+        await update.message.reply_document(document=wb,filename=f"backtest_rsi_{symbol}_{interval}_{datetime.now(timezone.utc):%Y%m%d_%H%M}.xlsx")
     except Exception:
-        logger.exception("Error generando Excel del backtest RSI")
-        await update.message.reply_text("⚠️ El backtest terminó, pero no se pudo generar el Excel."); return
-    filename=f"backtest_rsi_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
-    await update.message.reply_document(document=workbook,filename=filename,caption=f"📊 Backtest RSI + media: {len(trades)} operaciones; {symbol} ({interval}).")
+        logger.exception("No se pudo exportar Excel RSI")
 
 
 async def backtest_squeeze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1031,6 +976,41 @@ async def backtest_squeeze_command(update: Update, context: ContextTypes.DEFAULT
         return
     filename=f"backtest_squeeze_{symbol}_{interval}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.xlsx"
     await update.message.reply_document(document=workbook,filename=filename,caption=f"📊 Squeeze Bollinger + Keltner: {len(trades)} operaciones; {symbol} ({interval}).")
+
+
+async def rsi_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/rsi_live add|remove|list SYMBOL TF [RISK_USDT]"""
+    a=list(context.args)
+    if not a or a[0].lower() in ('help','ayuda'):
+        await update.message.reply_text("RSI Live (paper, sin órdenes reales):\n/rsi_live add BTCUSDT 15m [riesgo_USDT]\n/rsi_live remove BTCUSDT 15m\n/rsi_live list\n/rsi_status [BTCUSDT]"); return
+    action=a[0].lower()
+    if action=='list':
+        rows=await asyncio.to_thread(RSI_LIVE_STORE.status)
+        active=[r for r in rows if r['enabled']]
+        await update.message.reply_text("RSI Live activo:\n"+("\n".join(f"{r['symbol']} · {r['interval']} · {json.loads(r['config']).get('risk_usdt',10):g} USDT riesgo" for r in active) if active else "Sin suscripciones")); return
+    if action not in ('add','remove') or len(a)<3:
+        await update.message.reply_text("Uso: /rsi_live add|remove SIMBOLO TEMPORALIDAD [RIESGO_USDT]"); return
+    symbol=_normalize_symbol(a[1]); interval=a[2].lower()
+    from rsi_live import TF_MS
+    if interval not in TF_MS:
+        await update.message.reply_text("Temporalidad admitida: "+", ".join(TF_MS)); return
+    if action=='remove':
+        await asyncio.to_thread(RSI_LIVE_STORE.unsubscribe,symbol,interval)
+        await update.message.reply_text(f"RSI Live detenido para {symbol} {interval}. Las operaciones abiertas conservan su historial."); return
+    try: risk=float(a[3]) if len(a)>3 else 10.0
+    except ValueError: await update.message.reply_text("El riesgo debe ser un importe USDT válido."); return
+    if risk<=0: await update.message.reply_text("El riesgo debe ser mayor que cero."); return
+    cfg={'rsi_period':14,'oversold':30.0,'overbought':70.0,'pivot_left':2,'pivot_right':2,'stop_buffer_pct':0.0,'risk_usdt':risk}
+    await asyncio.to_thread(RSI_LIVE_STORE.subscribe,symbol,interval,update.effective_chat.id,cfg)
+    await update.message.reply_text(f"✅ RSI Live activado para {symbol} {interval}. Riesgo fijo {risk:g} USDT por operación. Solo paper trading; no se envían órdenes a Bitunix.")
+
+async def rsi_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    symbol=_normalize_symbol(context.args[0]) if context.args else None
+    rows=await asyncio.to_thread(RSI_LIVE_STORE.history,symbol)
+    opened=[r for r in rows if r['status']=='OPEN']
+    lines=["*RSI Live · operaciones*",f"Abiertas: {len(opened)}"]
+    for t in opened[:20]: lines.append(f"{t['symbol']} {t['interval']} {t['side']} · entrada {t['entry_price']:.8g} · SL {t['stop_price']:.8g} · riesgo {t['risk_usdt']:.2f} USDT")
+    await update.message.reply_text("\n".join(lines),parse_mode="Markdown")
 
 
 async def ttr_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1916,14 +1896,14 @@ def _evaluate_rsi_alert_history(symbol: str, interval: str = "4h"):
             closed.append(item)
     closed.sort(key=lambda candle: int(candle["time"]))
     if len(closed) < 40:
-        raise ValueError("no hay suficientes velas cerradas para calcular RSI y su media")
+        raise ValueError("no hay suficientes velas cerradas para calcular RSI")
 
     closes = [float(k["close"]) for k in closed]
     highs = [float(k["high"]) for k in closed]
     lows = [float(k["low"]) for k in closed]
     signals = generate_rsi_signals(
-        closes, highs, lows, rsi_period=14, ma_type="SMA", ma_period=14,
-        sl_lookback=10, stop_mode="lookback", ignore_first_ma_cross=False,
+        closes, highs, lows, rsi_period=14, oversold=30, overbought=70,
+        pivot_left=2, pivot_right=2, stop_buffer_pct=0,
     )
     indicator = rsi_indicator(closes, rsi_period=14, ma_type="SMA", ma_period=14)
     rows = []
@@ -1951,10 +1931,10 @@ def _format_rsi_signal_message(symbol: str, interval: str, signal) -> str:
     return (
         f"🔔 *Señal RSI — {symbol}* ({side_label})\n\n"
         f"Vela de {interval} cerrada. Tipo: *{signal.signal_type}*.\n"
-        f"RSI: `{signal.rsi:.2f}` · Media RSI: `{signal.rsi_ma:.2f}`\n"
+        f"RSI: `{signal.rsi:.2f}` · sin filtro de media RSI\n"
         f"Cierre de señal: `{signal.signal_close:.6g}`\n"
         f"Stop sugerido ({stop_desc}): `{signal.stop_loss:.6g}` (riesgo aprox. {risk_pct:.2f}%).\n"
-        f"Objetivo teórico 2R: `{signal.target:.6g}`. Entrada de referencia: apertura de la vela siguiente."
+        f"TP: al salir de la zona extrema opuesta (a mercado). Entrada de referencia: apertura de la vela siguiente."
     )
 
 
@@ -2378,13 +2358,14 @@ async def _post_init(application: Application) -> None:
 
 async def _post_stop(application: Application) -> None:
     """Stop long-lived TTR WebSockets while the asyncio loop is still alive."""
-    feed = application.bot_data.get('ttr_ws_feed')
-    if feed is not None:
-        try:
-            await feed.stop()
-            logger.info('Conexiones WebSocket TTR cerradas ordenadamente.')
-        except Exception:
-            logger.exception('Error cerrando las conexiones WebSocket TTR.')
+    for feed_key,label in (('ttr_ws_feed','TTR'),('rsi_ws_feed','RSI')):
+        feed = application.bot_data.get(feed_key)
+        if feed is not None:
+            try:
+                await feed.stop()
+                logger.info('Conexiones WebSocket %s cerradas ordenadamente.',label)
+            except Exception:
+                logger.exception('Error cerrando las conexiones WebSocket %s.',label)
 
 
 def _enable_health_check() -> None:
@@ -2466,6 +2447,8 @@ def main() -> None:
     application.add_handler(CommandHandler("backtest_squeeze", backtest_squeeze_command))
     application.add_handler(CommandHandler("backtest_dual_thrust", backtest_dual_thrust_command))
     application.add_handler(CommandHandler("backtest_ttr", backtest_ttr_command))
+    application.add_handler(CommandHandler("rsi_live", rsi_live_command))
+    application.add_handler(CommandHandler("rsi_status", rsi_status_command))
     application.add_handler(CommandHandler("ttr_live", ttr_live_command))
     application.add_handler(CommandHandler("ttr_stop", ttr_stop_command))
     application.add_handler(CommandHandler("ttr_restart", ttr_restart_command))
@@ -2494,6 +2477,8 @@ def main() -> None:
                 "misfire_grace_time": max(30, supervisor_interval * 2),
             },
         )
+        application.job_queue.run_repeating(rsi_live_monitor_job, interval=10, first=3, name="rsi_live_monitor", job_kwargs={"max_instances":1,"coalesce":True,"misfire_grace_time":30})
+        logger.info("Monitor RSI paper trading activo (supervisor cada 10 segundos; sin órdenes reales).")
         logger.info(
             "Monitor TTR paper trading: WebSocket prioritario, REST fallback; "
             "supervisor cada %s segundos (sin solapamientos).",

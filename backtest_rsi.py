@@ -1,103 +1,83 @@
-"""Backtesting RSI por regímenes; permite varias operaciones simultáneas."""
+"""Backtest RSI: entry next open, fixed USDT risk, SL structural, TP by RSI opposite extreme."""
 from __future__ import annotations
 from dataclasses import dataclass
 from strategy_rsi import generate_rsi_signals
+from indicators import rsi_indicator
 
-TP, SL, HORIZON, PENDING = "TP", "SL", "HORIZONTE", "PENDIENTE"
+TP, SL, HORIZON, PENDING = 'TP_RSI_OPUESTO', 'SL', 'HORIZONTE', 'PENDIENTE'
 
 @dataclass
 class RSITrade:
-    time: int
-    entry_time: int
-    side: str
-    entry: float
-    stop_loss: float
-    target: float
-    rsi: float
-    rsi_ma: float
-    risk_pct: float
-    target_r: float
-    outcome: str
-    exit_time: int | None
-    exit_price: float | None
-    pnl_pct: float | None
-    r_multiple: float | None
-    signal_type: str = "MA_CROSS"
+    time:int; entry_time:int; side:str; entry:float; stop_loss:float; target:float|None
+    rsi:float; rsi_ma:float|None; risk_pct:float; target_r:float|None
+    outcome:str; exit_time:int|None; exit_price:float|None; pnl_pct:float|None
+    r_multiple:float|None; signal_type:str='RSI_TURN'
+    risk_usdt:float=10.0; quantity:float=0.0; pnl_usdt:float|None=None
+    pivot_used:bool=False
 
 
-def _simulate(side, stop, target, highs, lows, closes, times, entry_i, horizon):
-    last = len(closes) - 1
-    end = last if horizon is None else min(entry_i + horizon - 1, last)
-    for j in range(entry_i, end + 1):
-        hit_sl = lows[j] <= stop if side == "LONG" else highs[j] >= stop
-        hit_tp = highs[j] >= target if side == "LONG" else lows[j] <= target
-        if hit_sl: return SL, int(times[j]), float(stop)  # SL primero si OHLC no permite saber el orden
-        if hit_tp: return TP, int(times[j]), float(target)
-    if horizon is not None and entry_i + horizon - 1 <= last:
-        j = entry_i + horizon - 1
-        return HORIZON, int(times[j]), float(closes[j])
-    return PENDING, None, None
-
-
-def run_backtest(closes, highs, lows, opens, times, horizon=None, *, rsi_period=14,
-                 ma_type="SMA", ma_period=14, sl_lookback=10, stop_mode="lookback",
-                 pivot_left=2, pivot_right=2, pivot_buffer_pct=0.1, ignore_first_ma_cross=False,
-                 use_extreme_filter=False, oversold=30.0, overbought=70.0, volumes=None):
-    """Genera señales por vela y simula cada operación independientemente.
-
-    use_extreme_filter se conserva por compatibilidad con el comando anterior;
-    el sistema de regímenes extremos ahora es parte obligatoria de la estrategia.
-    """
-    if not (len(closes) == len(highs) == len(lows) == len(opens) == len(times)):
-        raise ValueError("Todas las series OHLC y timestamps deben tener la misma longitud.")
-    if volumes is not None and len(volumes) != len(closes):
-        raise ValueError("volumes debe tener la misma longitud que las demás series.")
-    signals = generate_rsi_signals(closes, highs, lows, rsi_period=rsi_period,
-        ma_type=ma_type, ma_period=ma_period, sl_lookback=sl_lookback, stop_mode=stop_mode,
-        pivot_left=pivot_left, pivot_right=pivot_right, pivot_buffer_pct=pivot_buffer_pct, ignore_first_ma_cross=ignore_first_ma_cross,
-        oversold=oversold, overbought=overbought, volume=volumes)
-    trades = []
-    for i, sig in enumerate(signals[:-1]):
-        if sig is None:
-            continue
-        entry_i = i + 1
-        entry = float(opens[entry_i]); stop = float(sig.stop_loss)
-        risk_distance = entry - stop if sig.side == "LONG" else stop - entry
-        if risk_distance <= 0:
-            continue
-        target = entry + 2*risk_distance if sig.side == "LONG" else entry - 2*risk_distance
-        if target <= 0:
-            continue
-        outcome, exit_time, exit_price = _simulate(sig.side, stop, target, highs, lows, closes, times, entry_i, horizon)
-        if exit_price is None:
-            pnl_pct = r_multiple = None
+def run_backtest(closes,highs,lows,opens,times,horizon=None,*,rsi_period=14,
+                 oversold=30.0,overbought=70.0,pivot_left=2,pivot_right=2,
+                 stop_buffer_pct=0.0,risk_usdt=10.0,fee_pct=0.0,volumes=None,**_ignored):
+    n=len(closes)
+    if not all(len(x)==n for x in (highs,lows,opens,times)): raise ValueError('Todas las series OHLC y tiempos deben coincidir')
+    if n<rsi_period+2: return []
+    if risk_usdt<=0: raise ValueError('risk_usdt debe ser > 0')
+    if fee_pct<0: raise ValueError('fee_pct debe ser >= 0')
+    sigs=generate_rsi_signals(closes,highs,lows,rsi_period=rsi_period,oversold=oversold,
+        overbought=overbought,pivot_left=pivot_left,pivot_right=pivot_right,
+        stop_buffer_pct=stop_buffer_pct,volume=volumes)
+    rsi=rsi_indicator(list(map(float,closes)),rsi_period=rsi_period,ma_type='None',ma_period=1,volume=volumes)['rsi']
+    trades=[]
+    for i,sig in enumerate(sigs[:-1]):
+        if sig is None: continue
+        ei=i+1; entry=float(opens[ei]); stop=float(sig.stop_loss)
+        dist=entry-stop if sig.side=='LONG' else stop-entry
+        if dist<=0: continue
+        qty=float(risk_usdt)/dist
+        end=n-1 if horizon is None else min(n-1,ei+int(horizon)-1)
+        outcome= PENDING; xt=None; xp=None
+        for j in range(ei,end+1):
+            # Stop intrabar tiene prioridad conservadora si la misma vela también confirma salida RSI.
+            hit_sl=(float(lows[j])<=stop) if sig.side=='LONG' else (float(highs[j])>=stop)
+            if hit_sl:
+                outcome=SL; xt=int(times[j]); xp=stop; break
+            prev_rsi=rsi[j-1] if j>0 else None; curr_rsi=rsi[j]
+            # Long sale cuando RSI abandona sobrecompra; short cuando abandona sobreventa.
+            hit_tp=(prev_rsi is not None and curr_rsi is not None and
+                    ((sig.side=='LONG' and prev_rsi>=overbought and curr_rsi<overbought) or
+                     (sig.side=='SHORT' and prev_rsi<=oversold and curr_rsi>oversold)))
+            if hit_tp:
+                outcome=TP; xt=int(times[j]); xp=float(closes[j]); break
+        if outcome==PENDING and horizon is not None and ei+int(horizon)-1<=n-1:
+            j=end; outcome=HORIZON; xt=int(times[j]); xp=float(closes[j])
+        if xp is None:
+            pnl_pct=r_mult=pnl_usdt=None
         else:
-            signed = exit_price-entry if sig.side == "LONG" else entry-exit_price
-            pnl_pct = signed / entry * 100 if entry else None
-            r_multiple = signed / risk_distance
-        trades.append(RSITrade(int(times[i]), int(times[entry_i]), sig.side, entry, stop, target,
-            sig.rsi, sig.rsi_ma, risk_distance / entry * 100 if entry else 0, 2.0,
-            outcome, exit_time, exit_price, pnl_pct, r_multiple, sig.signal_type))
-    return sorted(trades, key=lambda t: (t.entry_time, t.time))
+            signed=(xp-entry) if sig.side=='LONG' else (entry-xp)
+            gross=signed*qty
+            fees=(entry*qty+xp*qty)*fee_pct/100.0
+            pnl_usdt=gross-fees
+            pnl_pct=(signed/entry*100 if entry else None)-2*fee_pct
+            r_mult=pnl_usdt/risk_usdt
+        trades.append(RSITrade(int(times[i]),int(times[ei]),sig.side,entry,stop,None,
+            sig.rsi,None,dist/entry*100 if entry else 0,None,outcome,xt,xp,pnl_pct,r_mult,
+            sig.signal_type,float(risk_usdt),qty,pnl_usdt,sig.pivot_used))
+    return sorted(trades,key=lambda x:(x.entry_time,x.time))
 
 
 def summarize(trades):
+    resolved=[t for t in trades if t.r_multiple is not None]
+    wins=[t for t in resolved if t.pnl_usdt>0]; losses=[t for t in resolved if t.pnl_usdt<0]
     def group(items):
-        resolved = [t for t in items if t.r_multiple is not None]
-        wins = [t for t in resolved if t.r_multiple > 0]
-        losses = [t for t in resolved if t.r_multiple < 0]
-        gross_profit = sum(t.r_multiple for t in wins)
-        gross_loss = abs(sum(t.r_multiple for t in losses))
-        cumulative = peak = max_dd = 0.0
-        for t in sorted(resolved, key=lambda x: x.exit_time or 0):
-            cumulative += t.r_multiple; peak = max(peak, cumulative); max_dd = max(max_dd, peak-cumulative)
-        return {"total":len(items), "resueltas":len(resolved), "tp":sum(t.outcome==TP for t in items),
-            "sl":sum(t.outcome==SL for t in items), "horizonte":sum(t.outcome==HORIZON for t in items),
-            "pendientes":sum(t.outcome==PENDING for t in items),
-            "win_rate":len(wins)/len(resolved)*100 if resolved else None,
-            "r_total":sum(t.r_multiple for t in resolved) if resolved else None,
-            "r_medio":sum(t.r_multiple for t in resolved)/len(resolved) if resolved else None,
-            "profit_factor":gross_profit/gross_loss if gross_loss else (float('inf') if gross_profit else None),
-            "max_drawdown_r":max_dd if resolved else None,
-            "pnl_pct_total":sum(t.pnl_pct for t in resolved if t.pnl_pct is not None) if resolved else None}
-    return {"total":group(trades), "long":group([t for t in trades if t.side=="LONG"]), "short":group([t for t in trades if t.side=="SHORT"])}
+        done=[t for t in items if t.r_multiple is not None]
+        w=[t for t in done if t.pnl_usdt>0]; l=[t for t in done if t.pnl_usdt<0]
+        gp=sum(t.pnl_usdt for t in w); gl=abs(sum(t.pnl_usdt for t in l))
+        return {'total':len(items),'resueltas':len(done),'tp':sum(t.outcome==TP for t in items),
+          'sl':sum(t.outcome==SL for t in items),'horizonte':sum(t.outcome==HORIZON for t in items),
+          'pendientes':sum(t.outcome==PENDING for t in items),'win_rate':len(w)/len(done)*100 if done else None,
+          'pnl_usdt':sum(t.pnl_usdt for t in done) if done else None,
+          'r_total':sum(t.r_multiple for t in done) if done else None,
+          'profit_factor':gp/gl if gl else (float('inf') if gp else None)}
+    return {'total':group(trades),'long':group([t for t in trades if t.side=='LONG']),
+            'short':group([t for t in trades if t.side=='SHORT'])}

@@ -477,3 +477,37 @@ Nota: el TP live usa la misma aproximación Python de fractales/engulfing que el
 - El último TP configurado liquida todo el margen que aún quede en esa operación y la registra como `CLOSED` (`TP_EXHAUSTED`), aunque la suma de los porcentajes parciales configurados sea inferior al 100%.
 - `/ttr_restart` muestra primero una advertencia; para confirmar el borrado irreversible usa `/ttr_restart CONFIRMAR`. El reinicio elimina todas las suscripciones, estados, operaciones abiertas/cerradas, eventos e históricos y registros de salud de TTR Live. No borra datos de las demás estrategias ni ejecuta órdenes en Bitunix.
 - El comando `/ttr_health` responde en texto plano para que nombres de componentes y mensajes con caracteres especiales no provoquen errores de parseo Markdown de Telegram.
+
+## RSI Extremos — nuevo motor independiente
+
+La estrategia RSI usa RSI(14) Wilder/RMA sobre `close`, niveles configurables 30/70,
+entrada en el primer giro del RSI después de entrar en una zona extrema, stop estructural
+y salida a mercado cuando el RSI **abandona la zona extrema opuesta**:
+
+- LONG: entra tras RSI <= 30 y primer RSI superior al anterior; stop bajo el último
+  pivote low confirmado formado desde el inicio del régimen, o bajo el mínimo de ese
+  régimen si todavía no existe pivote confirmado. TP al cruzar de >= 70 a < 70.
+- SHORT: entra tras RSI >= 70 y primer RSI inferior al anterior; stop sobre el último
+  pivote high confirmado, o sobre el máximo del régimen si no existe. TP al cruzar de
+  <= 30 a > 30.
+- Backtest: señal al cierre y entrada en apertura siguiente. Si stop y TP ocurren en
+  la misma vela, se prioriza el stop por prudencia OHLC. Riesgo fijo por operación,
+  cantidad = riesgo USDT / distancia al stop.
+- Live: paper trading, nunca envía órdenes a Bitunix. Stop supervisado por precio
+  de mercado y TP confirmado al cierre de la temporalidad elegida.
+- Las posiciones RSI se guardan en tablas `rsi_live_*` de la misma base PostgreSQL
+  configurada para TTR, pero su ledger/estado es independiente; no se pisan posiciones
+  ni configuraciones TTR. Se admiten simultáneamente varios símbolos y temporalidades.
+
+Comandos Telegram:
+
+```
+/backtest_rsi BTCUSDT 15m 1000 --risk-usdt 10 --rsi 14 --oversold 30 --overbought 70
+/rsi_live add BTCUSDT 15m 10
+/rsi_live add ETHUSDT 1h 20
+/rsi_live list
+/rsi_live remove BTCUSDT 15m
+/rsi_status [BTCUSDT]
+```
+
+API adicional: `GET /api/rsi/live/status` y `GET /api/rsi/live/history[/SIMBOLO]`.
