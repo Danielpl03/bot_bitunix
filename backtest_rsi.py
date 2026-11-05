@@ -1,4 +1,4 @@
-"""Backtest RSI: entrada al open siguiente, SL estructural y TP al cierre al salir del extremo opuesto."""
+"""Backtest RSI: entrada al open siguiente, SL estructural y TP al cierre al entrar en la zona extrema opuesta."""
 from __future__ import annotations
 from dataclasses import dataclass
 from strategy_rsi import generate_rsi_signals
@@ -55,9 +55,12 @@ def run_backtest(closes,highs,lows,opens,times,horizon=None,*,rsi_period=14,
                 last_sl_exit_idx=i; reentry_armed=True
                 continue
             prev_rsi=rsi[i-1] if i>0 else None; curr_rsi=rsi[i]
-            hit_tp=(prev_rsi is not None and curr_rsi is not None and
-                ((tr['signal'].side=='LONG' and prev_rsi>=overbought and curr_rsi<overbought) or
-                 (tr['signal'].side=='SHORT' and prev_rsi<=oversold and curr_rsi>oversold)))
+            # TP por zona extrema opuesta: se liquida al cierre de la primera
+            # vela que TERMINA dentro de la zona, no al salir de ella.
+            # LONG -> RSI >= sobrecompra; SHORT -> RSI <= sobreventa.
+            hit_tp=(curr_rsi is not None and
+                ((tr['signal'].side=='LONG' and curr_rsi>=overbought) or
+                 (tr['signal'].side=='SHORT' and curr_rsi<=oversold)))
             if hit_tp:
                 finish(tr,TP,i,float(closes[i])); continue
             if horizon is not None and i>=tr['entry_idx']+int(horizon)-1:

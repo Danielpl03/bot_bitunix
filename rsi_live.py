@@ -122,13 +122,15 @@ async def monitor_subscription(context,cfg,client,store=STORE,ws_feed=None,marke
         stop_buffer_pct=float(params.get('stop_buffer_pct',0)),volume=volumes)
     latest=len(bars)-1; sig=signals[latest]
     rsi=rsi_indicator(closes,rsi_period=int(params.get('rsi_period',14)),ma_type='None',ma_period=1)['rsi']
-    # Exit is evaluated on a closed candle at market close; stop has already been checked intrabar.
+    # TP se evalúa al cierre de vela; SL ya fue comprobado intrabar.
     previous_rsi=rsi[latest-1] if latest>0 else None
     current_rsi=rsi[latest]
     for t in await asyncio.to_thread(store.open_trades,symbol,interval):
-        hit_tp=(previous_rsi is not None and current_rsi is not None and
-                ((t['side']=='LONG' and previous_rsi>=float(params.get('overbought',70)) and current_rsi<float(params.get('overbought',70))) or
-                 (t['side']=='SHORT' and previous_rsi<=float(params.get('oversold',30)) and current_rsi>float(params.get('oversold',30)))))
+        # TP al cierre de la primera vela que termina dentro de la zona
+        # extrema opuesta. No esperar a que el RSI salga de dicha zona.
+        hit_tp=(current_rsi is not None and
+                ((t['side']=='LONG' and current_rsi>=float(params.get('overbought',70))) or
+                 (t['side']=='SHORT' and current_rsi<=float(params.get('oversold',30)))))
         if hit_tp:
             exit_px=closes[latest]; signed=(exit_px-float(t['entry_price'])) if t['side']=='LONG' else (float(t['entry_price'])-exit_px)
             pnl=signed*float(t['quantity'])

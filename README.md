@@ -11,6 +11,7 @@ Reglas actuales:
 - La primera entrada de cada régimen se genera por giro del RSI. Las entradas adicionales se generan con cruces RSI/media: LONG si RSI termina por debajo de 55; SHORT si termina por encima de 45.
 - Opcionalmente, `--omitir-primer-cruce` descarta el primer cruce RSI/media válido de cada régimen y permite señales de cruce desde el segundo.
 - Si el RSI sale de un extremo y vuelve a entrar en ese mismo extremo sin haber tocado el opuesto, se reinicia el giro inicial y el contador de cruces. Las operaciones que ya estaban abiertas no se cancelan por este reinicio.
+- **Take Profit:** una operación LONG se cierra al cierre de la primera vela cuyo RSI termina en sobrecompra (RSI >= nivel configurado); una SHORT se cierra al cierre de la primera vela cuyo RSI termina en sobreventa (RSI <= nivel configurado). No se espera a que el RSI salga de la zona extrema. El SL conserva su comprobación intrabar.
 - Entrada en la apertura de la vela siguiente. Se permiten varias operaciones simultáneas. TP fijo 2R.
 - Stop por defecto en el mínimo/máximo de las últimas 10 velas, incluida la señal. Opcionalmente `--stop-mode pivot` utiliza el último pivote local confirmado; `--pivot-left` y `--pivot-right` determinan las velas a cada lado y `--pivot-buffer` define el colchón porcentual (por defecto 0.1%). Si no hay pivote confirmado, usa el extremo de la ventana como alternativa.
 - Si una vela toca stop y objetivo, se considera stop primero. No se modelan comisiones, funding ni deslizamiento.

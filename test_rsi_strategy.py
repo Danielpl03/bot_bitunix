@@ -45,9 +45,9 @@ class RSIStrategyTests(unittest.TestCase):
         self.assertEqual(trades[0].entry,100)
         self.assertEqual(trades[0].quantity,4.0)
         self.assertEqual(trades[0].outcome,TP)
-        self.assertEqual(trades[0].exit_price,112.0)
+        self.assertEqual(trades[0].exit_price,110.0)  # cierre en la primera vela dentro de sobrecompra
 
-    def test_long_tp_only_when_rsi_exits_overbought(self):
+    def test_long_tp_at_first_candle_close_inside_overbought(self):
         rsis=[None,28,25,26,75,72,68]
         closes=[100,99,98,99,105,107,106]
         highs=[101,100,99,100,106,108,107]
@@ -55,10 +55,27 @@ class RSIStrategyTests(unittest.TestCase):
         opens=[100,99,98,99,104,106,107]
         times=list(range(len(rsis)))
         from strategy_rsi import RSISignal
-        sigs=[None]*len(rsis); sigs[3]=RSISignal('LONG',99,26,95,1,3)
+        # Entry at candle 3 open; candle 4 is the first close inside overbought.
+        sigs=[None]*len(rsis); sigs[2]=RSISignal('LONG',98,25,95,1,2)
         with patch('backtest_rsi.generate_rsi_signals',return_value=sigs), patch('backtest_rsi.rsi_indicator',return_value={'rsi':rsis,'ma':[None]*len(rsis)}):
             trades=run_backtest(closes,highs,lows,opens,times,rsi_period=1)
-        self.assertEqual(trades[0].exit_time,6)  # no exit at 75 or 72; exit only after crossing below 70
+        self.assertEqual(trades[0].exit_time,4)
+        self.assertEqual(trades[0].exit_price,105)
+        self.assertEqual(trades[0].outcome,TP)
+
+    def test_short_tp_at_first_candle_close_inside_oversold(self):
+        rsis=[None,72,75,74,25,28,32]
+        closes=[100,101,102,101,95,93,94]
+        highs=[101,102,103,102,96,94,95]
+        lows=[99,100,101,100,94,92,93]
+        opens=[100,101,102,101,100,95,93]
+        times=list(range(len(rsis)))
+        from strategy_rsi import RSISignal
+        sigs=[None]*len(rsis); sigs[2]=RSISignal('SHORT',102,75,105,1,2)
+        with patch('backtest_rsi.generate_rsi_signals',return_value=sigs), patch('backtest_rsi.rsi_indicator',return_value={'rsi':rsis,'ma':[None]*len(rsis)}):
+            trades=run_backtest(closes,highs,lows,opens,times,rsi_period=1)
+        self.assertEqual(trades[0].exit_time,4)
+        self.assertEqual(trades[0].exit_price,95)
         self.assertEqual(trades[0].outcome,TP)
 
     def test_no_fixed_price_target(self):
