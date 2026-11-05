@@ -59,12 +59,22 @@ def _is_low(s,i):
     return i>=4 and s[i-4]>s[i-2] and s[i-3]>=s[i-2] and s[i-2]<=s[i-1] and s[i-2]<s[i]
 
 def fractal_snapshots(highs,lows,opens,closes,times,*,src_high=None,src_low=None,hh_lookback=2,ll_lookback=2,hh_start=None,ll_start=None):
-    """Build latest HH/LL candidate arrays per bar, including Pine's breakout delay."""
+    """Replay tac/21 BWFractals.eval() bar by bar.
+
+    Important Pine details preserved here:
+    - only HH and LL structures enter the signal arrays;
+    - breakout is confirmed from the *previous* candle;
+    - the arrays are scanned newest-to-oldest for breakout marking;
+    - Pine inserts the same UDT reference at the scanned index (it does not
+      replace it), so the duplicate reference is intentional;
+    - the time-limit counters and the original hhBoTimeLimit expression are
+      preserved, including Pine's use of llBoLb in that expression.
+    """
     sh=list(map(float,src_high if src_high is not None else highs))
     sl=list(map(float,src_low if src_low is not None else lows))
     hh=[]; ll=[]; last_high=None; last_low=None
-    hstart=int(times[0] if hh_start is None and times else hh_start or 0)
-    lstart=int(times[0] if ll_start is None and times else ll_start or 0)
+    hstart=int(times[0] if hh_start is None and times else (hh_start or 0))
+    lstart=int(times[0] if ll_start is None and times else (ll_start or 0))
     hs=[]; ls=[]
     for i in range(len(times)):
         is_h=_is_high(sh,i); is_l=_is_low(sl,i); mark_h=mark_l=0
@@ -76,26 +86,39 @@ def fractal_snapshots(highs,lows,opens,closes,times,*,src_high=None,src_low=None
         if is_l:
             mark_l=-2 if last_low is not None and low_value<last_low else (-1 if last_low is not None and low_value>last_low else 0)
             last_low=low_value
-        # Tac creates one UDT object per confirmed candle. If high and low
-        # fractals confirm together, its price field prefers the high source
-        # and the same object reference is pushed to both collections.
         if is_h or is_l:
             f=Fractal(float(high_value if is_h else low_value),int(times[i-2]),i-2,int(times[i]),i)
-            if mark_h==2: hh.append(f)
-            if mark_l==-2: ll.append(f)
-        if i>0:
-            if hh_lookback>0 and hh:
-                # Pine scans newest to oldest; all eligible unbroken fractals can be
-                # broken by the same previous candle.
-                for f in list(reversed(hh)):
-                    if f.bo_price is None and f.when>=hstart and closes[i-1]>opens[i-1] and closes[i-1]>f.price:
-                        f.bo_price=float(closes[i-1]); f.bo_time=int(times[i-1]); f.bo_index=i-1
-                        hh.insert(hh.index(f),f)  # exact reference insertion used by tac
-            if ll_lookback>0 and ll:
-                for f in list(reversed(ll)):
-                    if f.bo_price is None and f.when>=lstart and closes[i-1]<opens[i-1] and closes[i-1]<f.price:
-                        f.bo_price=float(closes[i-1]); f.bo_time=int(times[i-1]); f.bo_index=i-1
-                        ll.insert(ll.index(f),f)
+            if mark_h > 0:
+                # tac pushes every high mark into hh only when it is HH;
+                # LH structures go to a separate array not used by TTR TP.
+                if mark_h == 2: hh.append(f)
+            if mark_l < 0:
+                if mark_l == -2: ll.append(f)
+
+        if hh_lookback > 0 and hh:
+            initial_size=len(hh)
+            counter=0
+            time_limit=ll_lookback + (1 if mark_h == 2 else 0)  # exact tac/21 expression
+            for j in range(initial_size-1,-1,-1):
+                counter += 1
+                f=hh[j]
+                if f.when < hstart and counter > time_limit:
+                    break
+                if f.bo_price is None and i > 0 and closes[i-1] > opens[i-1] and closes[i-1] > f.price:
+                    f.bo_price=float(closes[i-1]); f.bo_time=int(times[i-1]); f.bo_index=i-1
+                    hh.insert(j,f)  # Pine array.insert(i, same UDT reference)
+        if ll_lookback > 0 and ll:
+            initial_size=len(ll)
+            counter=0
+            time_limit=ll_lookback + (1 if mark_l == -2 else 0)
+            for j in range(initial_size-1,-1,-1):
+                counter += 1
+                f=ll[j]
+                if f.when < lstart and counter > time_limit:
+                    break
+                if f.bo_price is None and i > 0 and closes[i-1] < opens[i-1] and closes[i-1] < f.price:
+                    f.bo_price=float(closes[i-1]); f.bo_time=int(times[i-1]); f.bo_index=i-1
+                    ll.insert(j,f)
         hs.append(list(hh)); ls.append(list(ll))
     return hs,ls
 
@@ -120,17 +143,19 @@ def ttr_bar_action(i, *, side, entry_price, entry_time, closes, opens, lagging, 
     up=closes[i-1]>opens[i-1] and closes[i]<=opens[i]
     down=closes[i-1]<opens[i-1] and closes[i]>=opens[i]
     if up:
-        for f in reversed(hh_by_bar[i][-frac_lb_high:]):
-            if f.when<entry_time or f.bo_price is None or f.bo_time<entry_time: continue
+        # Pine iterates the selected tail in ascending array-index order.
+        for f in hh_by_bar[i][-frac_lb_high:]:
+            if f.bo_price is None or f.bo_time is None or f.bo_time<entry_time: continue
             if side=='buy' and closes[i]>entry_price and f.when not in marked_tp and (last_tp is None or closes[i]>last_tp):
                 return 'TP',f
             if side=='sell' and proximity>sig_re_min_proximity and f.when not in marked_re and (last_tp is not None or sig_re_sell_no_tp) and (last_re is None or closes[i]>last_re):
                 return 'RE',f
     if down:
-        for f in reversed(ll_by_bar[i][-frac_lb_low:]):
-            if f.when<entry_time or f.bo_price is None or f.bo_time<entry_time: continue
+        # Pine iterates the selected tail in ascending array-index order.
+        for f in ll_by_bar[i][-frac_lb_low:]:
+            if f.bo_price is None or f.bo_time is None or f.bo_time<entry_time: continue
             if side=='sell' and closes[i]<entry_price and f.when not in marked_tp and (last_tp is None or closes[i]<last_tp):
                 return 'TP',f
-            if side=='buy' and proximity>sig_re_min_proximity and f.when not in marked_re and (last_tp is not None or sig_re_buy_no_tp) and (last_re is None or closes[i]<last_re):
+            if side=='buy' and proximity>sig_re_min_proximity and f.when not in marked_re and (last_tp is not None or sig_re_sell_no_tp) and (last_re is None or closes[i]<last_re):
                 return 'RE',f
     return None,None
