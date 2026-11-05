@@ -44,6 +44,10 @@ class RSILiveStore:
         with self.db._db() as c: return [dict(x) for x in self.db._execute(c,"SELECT * FROM rsi_live_trades WHERE symbol=? AND interval=? AND status='OPEN' ORDER BY id",(symbol,interval)).fetchall()]
     def all_open(self):
         with self.db._db() as c: return [dict(x) for x in self.db._execute(c,"SELECT * FROM rsi_live_trades WHERE status='OPEN' ORDER BY id").fetchall()]
+    def last_closed_trade(self,symbol,interval):
+        with self.db._db() as c:
+            row=self.db._execute(c,"SELECT * FROM rsi_live_trades WHERE symbol=? AND interval=? AND status='CLOSED' ORDER BY exit_time DESC,id DESC LIMIT 1",(symbol,interval)).fetchone()
+            return dict(row) if row else None
     def open_trade(self, symbol, interval, side, ts, entry, stop, qty, risk, payload):
         with self.db._db() as c:
             q='INSERT INTO rsi_live_trades(symbol,interval,side,entry_time,entry_price,stop_price,quantity,risk_usdt,status,payload) VALUES(?,?,?,?,?,?,?,?,?,?)'
@@ -132,16 +136,32 @@ async def monitor_subscription(context,cfg,client,store=STORE,ws_feed=None,marke
             await asyncio.to_thread(store.event,symbol,interval,ts[latest],'TP_RSI_OPUESTO',t['side'],exit_px,{'trade_id':t['id'],'rsi':rsi[latest],'pnl_usdt':pnl})
             await _notify(context,cfg['chat_id'],f'🎯 RSI {symbol} {interval} · TP RSI zona opuesta\n{t["side"]} @ {exit_px:.8g} · RSI {rsi[latest]:.2f} · PnL {pnl:+.4f} USDT')
     if sig and bool(cfg.get('enabled')):
-        # A market paper entry using latest available quote; backtests use next candle open.
-        entry=price if price>0 else closes[latest]; stop=float(sig.stop_loss)
-        dist=(entry-stop) if sig.side=='LONG' else (stop-entry)
-        risk=float(params.get('risk_usdt',10))
-        if dist>0 and risk>0:
-            qty=risk/dist
-            payload={'rsi':sig.rsi,'extreme_start_index':sig.extreme_start_index,'pivot_used':sig.pivot_used,'engine':'RSI_EXTREME_V1'}
-            tid=await asyncio.to_thread(store.open_trade,symbol,interval,sig.side,now,entry,stop,qty,risk,payload)
-            await asyncio.to_thread(store.event,symbol,interval,now,'ENTRY',sig.side,entry,{'trade_id':tid,**payload,'stop':stop,'quantity':qty,'risk_usdt':risk})
-            await _notify(context,cfg['chat_id'],f'📍 RSI {symbol} {interval} · ENTRADA {sig.side}\nRSI {sig.rsi:.2f} · entrada {entry:.8g} · stop {stop:.8g}\nRiesgo fijo {risk:.2f} USDT · cantidad {qty:.8g} · pivote: {"sí" if sig.pivot_used else "extremo del régimen"}')
+        # Los candidatos de reentrada solo se aceptan tras un SL previo, una
+        # vez cerrada la vela posterior al stop y sin otra posición abierta.
+        is_reentry=sig.signal_type in ('RSI_REENTRY','RSI_DIVERGENCE')
+        current_open=await asyncio.to_thread(store.open_trades,symbol,interval)
+        last_closed=await asyncio.to_thread(store.last_closed_trade,symbol,interval)
+        reentry_allowed=(not is_reentry or (
+            not current_open and last_closed is not None and last_closed.get('exit_reason')=='SL'
+            and int(last_closed.get('exit_time') or 0) < int(ts[latest])))
+        if reentry_allowed:
+            # Entrada paper a mercado; el backtest ejecuta en la apertura siguiente.
+            entry=price if price>0 else closes[latest]; stop=float(sig.stop_loss)
+            dist=(entry-stop) if sig.side=='LONG' else (stop-entry)
+            risk=float(params.get('risk_usdt',10))
+            if dist>0 and risk>0:
+                qty=risk/dist
+                payload={'rsi':sig.rsi,'extreme_start_index':sig.extreme_start_index,
+                         'pivot_used':sig.pivot_used,'signal_type':sig.signal_type,'engine':'RSI_EXTREME_V2'}
+                tid=await asyncio.to_thread(store.open_trade,symbol,interval,sig.side,now,entry,stop,qty,risk,payload)
+                await asyncio.to_thread(store.event,symbol,interval,now,'ENTRY',sig.side,entry,
+                    {'trade_id':tid,**payload,'stop':stop,'quantity':qty,'risk_usdt':risk})
+                label={'RSI_TURN':'giro inicial','RSI_REENTRY':'reentrada por nuevo giro',
+                       'RSI_DIVERGENCE':'reentrada por divergencia'}.get(sig.signal_type,sig.signal_type)
+                await _notify(context,cfg['chat_id'],
+                    f'📍 RSI {symbol} {interval} · ENTRADA {sig.side} ({label})\\n'
+                    f'RSI {sig.rsi:.2f} · entrada {entry:.8g} · stop {stop:.8g}\\n'
+                    f'Riesgo fijo {risk:.2f} USDT · cantidad {qty:.8g} · pivote: {"sí" if sig.pivot_used else "extremo del régimen"}')
     await asyncio.to_thread(store.commit_bar,symbol,interval,ts[-1])
 
 async def monitor_job(context):

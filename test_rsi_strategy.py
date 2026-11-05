@@ -67,6 +67,49 @@ class RSIStrategyTests(unittest.TestCase):
             sigs=generate_rsi_signals(closes,highs,lows)
         self.assertIsNone(sigs[3].target)
 
+
+    def test_reentry_candidate_on_second_rsi_turn_without_reentering_extreme(self):
+        rsis=[None,28,25,26,27,24,26,28]
+        closes=[100,99,98,99,100,97,99,101]
+        highs=[101,100,99,100,101,98,100,102]
+        lows=[99,98,95,96,97,93,95,98]
+        with patch('strategy_rsi.rsi_indicator',return_value={'rsi':rsis,'ma':[None]*len(rsis)}):
+            sigs=generate_rsi_signals(closes,highs,lows,pivot_left=2,pivot_right=2)
+        self.assertEqual(sigs[3].signal_type,'RSI_TURN')
+        self.assertEqual(sigs[6].signal_type,'RSI_REENTRY')
+        self.assertEqual(sigs[6].side,'LONG')
+
+    def test_bullish_divergence_generates_reentry_candidate(self):
+        rsis=[None,28,25,26,27,28,29]
+        closes=[100,99,98,99,98,97,99]
+        highs=[101,100,99,100,99,98,100]
+        lows=[99,98,95,96,94,90,93]
+        with patch('strategy_rsi.rsi_indicator',return_value={'rsi':rsis,'ma':[None]*len(rsis)}):
+            sigs=generate_rsi_signals(closes,highs,lows,pivot_left=1,pivot_right=1)
+        self.assertEqual(sigs[3].signal_type,'RSI_TURN')
+        self.assertEqual(sigs[6].signal_type,'RSI_DIVERGENCE')
+        self.assertEqual(sigs[6].stop_loss,90.0)
+
+
+    def test_reentry_is_only_taken_after_previous_trade_hits_stop(self):
+        from strategy_rsi import RSISignal
+        rsis=[None,28,26,25,27,35,72,68]
+        closes=[100,99,98,97,99,101,106,105]
+        highs=[101,100,99,98,100,102,107,106]
+        lows=[99,98,97,94,98,100,105,104]
+        opens=[100,99,98,100,98,99,102,106]
+        times=list(range(len(rsis)))
+        sigs=[None]*len(rsis)
+        sigs[2]=RSISignal('LONG',98,26,95,1,2,'RSI_TURN')
+        sigs[4]=RSISignal('LONG',99,27,92,1,4,'RSI_REENTRY')
+        with patch('backtest_rsi.generate_rsi_signals',return_value=sigs), patch(
+            'backtest_rsi.rsi_indicator',return_value={'rsi':rsis,'ma':[None]*len(rsis)}):
+            trades=run_backtest(closes,highs,lows,opens,times,rsi_period=1,risk_usdt=10)
+        self.assertEqual(len(trades),2)
+        self.assertEqual(trades[0].outcome,SL)
+        self.assertEqual(trades[1].signal_type,'RSI_REENTRY')
+        self.assertEqual(trades[1].outcome,TP)
+
     def test_summary_groups(self):
         self.assertEqual(set(summarize([])),{'total','long','short'})
 

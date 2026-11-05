@@ -1905,6 +1905,9 @@ def _evaluate_rsi_alert_history(symbol: str, interval: str = "4h"):
         closes, highs, lows, rsi_period=14, oversold=30, overbought=70,
         pivot_left=2, pivot_right=2, stop_buffer_pct=0,
     )
+    # Las alertas genéricas no mantienen el ledger ni conocen si hubo SL;
+    # por eso solo publican la entrada inicial, nunca candidatos de reentrada.
+    signals = [sig if sig is None or sig.signal_type == "RSI_TURN" else None for sig in signals]
     indicator = rsi_indicator(closes, rsi_period=14, ma_type="SMA", ma_period=14)
     rows = []
     for i, candle in enumerate(closed):

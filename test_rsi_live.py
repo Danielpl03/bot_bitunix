@@ -29,4 +29,15 @@ class RSILiveStoreTests(unittest.TestCase):
         self.assertEqual(len(rows),1)
         self.assertEqual(rows[0]['enabled'],0)
 
+
+    def test_last_closed_trade_is_available_for_sl_reentry_gate(self):
+        self.store.subscribe('ETHUSDT','15m',22,{'risk_usdt':5})
+        now=int(time.time()*1000)
+        tid=self.store.open_trade('ETHUSDT','15m','LONG',now,100,95,1,5,{})
+        self.assertIsNone(self.store.last_closed_trade('ETHUSDT','15m'))
+        self.store.close_trade(tid,now+1000,95,'SL',-5)
+        last=self.store.last_closed_trade('ETHUSDT','15m')
+        self.assertEqual(last['exit_reason'],'SL')
+        self.assertEqual(last['id'],tid)
+
 if __name__=='__main__': unittest.main()

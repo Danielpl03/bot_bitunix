@@ -493,8 +493,20 @@ y salida a mercado cuando el RSI **abandona la zona extrema opuesta**:
 - Backtest: señal al cierre y entrada en apertura siguiente. Si stop y TP ocurren en
   la misma vela, se prioriza el stop por prudencia OHLC. Riesgo fijo por operación,
   cantidad = riesgo USDT / distancia al stop.
+- Tras el primer giro, el motor también identifica candidatos de reentrada mientras
+  se mantiene el mismo régimen: un nuevo giro local del RSI o una divergencia regular
+  precio/RSI (LONG: precio marca mínimo menor y RSI mínimo mayor; SHORT: precio marca
+  máximo mayor y RSI máximo menor). No exige salir de la zona extrema y volver a entrar.
+- Los candidatos de reentrada solo se convierten en operación si la operación anterior
+  de ese símbolo/temporalidad cerró por SL; no se dispara una reentrada mientras exista
+  otra posición abierta. Cada nuevo SL vuelve a habilitar una única oportunidad.
+- La primera entrada conserva el giro inicial y el stop estructural. Las reentradas usan
+  el último pivote confirmado desde el último patrón, o el extremo local de ese tramo,
+  con el mismo buffer configurado.
 - Live: paper trading, nunca envía órdenes a Bitunix. Stop supervisado por precio
-  de mercado y TP confirmado al cierre de la temporalidad elegida.
+  de mercado; TP confirmado exclusivamente al cierre de la vela que sale de la zona
+  extrema opuesta (LONG: RSI cruza de >= sobrecompra a < sobrecompra; SHORT: RSI cruza
+  de <= sobreventa a > sobreventa).
 - Las posiciones RSI se guardan en tablas `rsi_live_*` de la misma base PostgreSQL
   configurada para TTR, pero su ledger/estado es independiente; no se pisan posiciones
   ni configuraciones TTR. Se admiten simultáneamente varios símbolos y temporalidades.

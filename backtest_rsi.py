@@ -1,4 +1,4 @@
-"""Backtest RSI: entry next open, fixed USDT risk, SL structural, TP by RSI opposite extreme."""
+"""Backtest RSI: entrada al open siguiente, SL estructural y TP al cierre al salir del extremo opuesto."""
 from __future__ import annotations
 from dataclasses import dataclass
 from strategy_rsi import generate_rsi_signals
@@ -24,46 +24,71 @@ def run_backtest(closes,highs,lows,opens,times,horizon=None,*,rsi_period=14,
     if n<rsi_period+2: return []
     if risk_usdt<=0: raise ValueError('risk_usdt debe ser > 0')
     if fee_pct<0: raise ValueError('fee_pct debe ser >= 0')
-    sigs=generate_rsi_signals(closes,highs,lows,rsi_period=rsi_period,oversold=oversold,
-        overbought=overbought,pivot_left=pivot_left,pivot_right=pivot_right,
-        stop_buffer_pct=stop_buffer_pct,volume=volumes)
+    sigs=generate_rsi_signals(closes,highs,lows,rsi_period=rsi_period,oversold=oversold,overbought=overbought,
+        pivot_left=pivot_left,pivot_right=pivot_right,stop_buffer_pct=stop_buffer_pct,volume=volumes)
     rsi=rsi_indicator(list(map(float,closes)),rsi_period=rsi_period,ma_type='None',ma_period=1,volume=volumes)['rsi']
-    trades=[]
-    for i,sig in enumerate(sigs[:-1]):
-        if sig is None: continue
-        ei=i+1; entry=float(opens[ei]); stop=float(sig.stop_loss)
-        dist=entry-stop if sig.side=='LONG' else stop-entry
-        if dist<=0: continue
-        qty=float(risk_usdt)/dist
-        end=n-1 if horizon is None else min(n-1,ei+int(horizon)-1)
-        outcome= PENDING; xt=None; xp=None
-        for j in range(ei,end+1):
-            # Stop intrabar tiene prioridad conservadora si la misma vela también confirma salida RSI.
-            hit_sl=(float(lows[j])<=stop) if sig.side=='LONG' else (float(highs[j])>=stop)
+    active=[]; pending=[]; completed=[]; last_sl_exit_idx=None; reentry_armed=False
+
+    def finish(tr, outcome, idx, exit_price):
+        signed=(exit_price-tr['entry']) if tr['signal'].side=='LONG' else (tr['entry']-exit_price)
+        gross=signed*tr['quantity']; fees=(tr['entry']*tr['quantity']+exit_price*tr['quantity'])*fee_pct/100.0
+        pnl=gross-fees
+        completed.append(RSITrade(int(times[tr['signal_idx']]),int(times[tr['entry_idx']]),tr['signal'].side,
+            tr['entry'],tr['stop'],None,tr['signal'].rsi,None,tr['dist']/tr['entry']*100 if tr['entry'] else 0,
+            None,outcome,int(times[idx]),float(exit_price),signed/tr['entry']*100-2*fee_pct if tr['entry'] else None,
+            pnl/risk_usdt,tr['signal'].signal_type,float(risk_usdt),tr['quantity'],pnl,tr['signal'].pivot_used))
+
+    for i in range(n):
+        # Señales de la vela anterior se ejecutan en la apertura de esta vela.
+        for sig_idx,sig in pending:
+            entry=float(opens[i]); stop=float(sig.stop_loss)
+            dist=(entry-stop) if sig.side=='LONG' else (stop-entry)
+            if dist<=0: continue
+            active.append({'signal':sig,'signal_idx':sig_idx,'entry_idx':i,'entry':entry,'stop':stop,
+                           'dist':dist,'quantity':float(risk_usdt)/dist})
+
+        still=[]
+        for tr in active:
+            hit_sl=(float(lows[i])<=tr['stop']) if tr['signal'].side=='LONG' else (float(highs[i])>=tr['stop'])
             if hit_sl:
-                outcome=SL; xt=int(times[j]); xp=stop; break
-            prev_rsi=rsi[j-1] if j>0 else None; curr_rsi=rsi[j]
-            # Long sale cuando RSI abandona sobrecompra; short cuando abandona sobreventa.
+                finish(tr,SL,i,tr['stop'])
+                last_sl_exit_idx=i; reentry_armed=True
+                continue
+            prev_rsi=rsi[i-1] if i>0 else None; curr_rsi=rsi[i]
             hit_tp=(prev_rsi is not None and curr_rsi is not None and
-                    ((sig.side=='LONG' and prev_rsi>=overbought and curr_rsi<overbought) or
-                     (sig.side=='SHORT' and prev_rsi<=oversold and curr_rsi>oversold)))
+                ((tr['signal'].side=='LONG' and prev_rsi>=overbought and curr_rsi<overbought) or
+                 (tr['signal'].side=='SHORT' and prev_rsi<=oversold and curr_rsi>oversold)))
             if hit_tp:
-                outcome=TP; xt=int(times[j]); xp=float(closes[j]); break
-        if outcome==PENDING and horizon is not None and ei+int(horizon)-1<=n-1:
-            j=end; outcome=HORIZON; xt=int(times[j]); xp=float(closes[j])
-        if xp is None:
-            pnl_pct=r_mult=pnl_usdt=None
-        else:
-            signed=(xp-entry) if sig.side=='LONG' else (entry-xp)
-            gross=signed*qty
-            fees=(entry*qty+xp*qty)*fee_pct/100.0
-            pnl_usdt=gross-fees
-            pnl_pct=(signed/entry*100 if entry else None)-2*fee_pct
-            r_mult=pnl_usdt/risk_usdt
-        trades.append(RSITrade(int(times[i]),int(times[ei]),sig.side,entry,stop,None,
-            sig.rsi,None,dist/entry*100 if entry else 0,None,outcome,xt,xp,pnl_pct,r_mult,
-            sig.signal_type,float(risk_usdt),qty,pnl_usdt,sig.pivot_used))
-    return sorted(trades,key=lambda x:(x.entry_time,x.time))
+                finish(tr,TP,i,float(closes[i])); continue
+            if horizon is not None and i>=tr['entry_idx']+int(horizon)-1:
+                finish(tr,HORIZON,i,float(closes[i])); continue
+            still.append(tr)
+        active=still
+
+        sig=sigs[i]
+        if sig is None or i+1>=n: 
+            pending=[]
+            continue
+        is_reentry=sig.signal_type in ('RSI_REENTRY','RSI_DIVERGENCE')
+        if not is_reentry:
+            # Un nuevo giro inicial inicia un ciclo independiente y consume
+            # cualquier ventana de reentrada pendiente del régimen anterior.
+            reentry_armed=False
+        if is_reentry:
+            # Solo se permite una reentrada por cada SL y nunca mientras quede
+            # otra posición abierta en este símbolo/estrategia.
+            if not reentry_armed or last_sl_exit_idx is None or last_sl_exit_idx>=i or active:
+                pending=[]; continue
+            reentry_armed=False
+        pending=[(i,sig)]
+
+    # Pendientes al final del histórico y operaciones sin salida quedan abiertas.
+    for tr in active:
+        completed.append(RSITrade(int(times[tr['signal_idx']]),int(times[tr['entry_idx']]),tr['signal'].side,
+            tr['entry'],tr['stop'],None,tr['signal'].rsi,None,tr['dist']/tr['entry']*100 if tr['entry'] else 0,
+            None,PENDING,None,None,None,None,tr['signal'].signal_type,float(risk_usdt),tr['quantity'],None,
+            tr['signal'].pivot_used))
+    return sorted(completed,key=lambda x:(x.entry_time,x.time))
 
 
 def summarize(trades):
