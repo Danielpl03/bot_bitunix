@@ -1,0 +1,76 @@
+// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)
+// https://creativecommons.org/licenses/by-nc-sa/4.0/
+// © Zeiierman
+//@version=6
+indicator("Trend Impulse Channels (Zeiierman)", overlay=true)
+
+flipMult = input.float(2.86, step=0.01, title="Trigger Threshold")
+maxStepAtr = input.float(-0.034, step=0.001, title="Max Step Size")
+bandMult = input.float(2.02, step=0.01, title="Band Multiplier")
+holdBars = input.int(0, minval=0, title="Trend Hold")
+colorUp = input.color(color.lime, title="Up Color")
+colorDown = input.color(color.red, title="Down Color")
+showFill = input.bool(true, title="Channel Fill")
+ChannelRetestSignal = input.bool(true, title="Retest Signals")
+TrendFilter = input.bool(true, title="Filter by Trend")
+colorUp2 = input.color(color.lime, title="Lower Retest Color")
+colorDown2 = input.color(color.red, title="Upper Retest Color")
+TrendStepSignal = input.bool(false, title="Trend Step Signals")
+colorUp3 = input.color(color.lime, title="Bullish Step Color")
+colorDown3 = input.color(color.red, title="Bearish Step Color")
+
+atr = ta.atr(200)
+stepBase = atr * 2.52
+maxStep = atr * maxStepAtr
+trigger = atr * flipMult
+
+var float trend = na
+var int dir = 0
+var int barsInTrend = 0
+var float hold = na
+var int extension = 0
+
+startLong = close > nz(trend) + trigger
+startShort = close < nz(trend) - trigger
+flip = (startLong or startShort) and barsInTrend >= 0
+stepSize = math.min(stepBase + 0.0093 * barsInTrend * atr, maxStep)
+
+if na(trend)
+    trend := close
+    dir := 0
+    barsInTrend := 0
+    hold := trigger
+    extension := 0
+else
+    if flip and extension <= 0
+        trend := close
+        dir := startLong ? 1 : -1
+        barsInTrend := 1
+        hold := trigger
+        extension := holdBars
+    else
+        trend := trend + (dir == 1 ? stepSize : dir == -1 ? -stepSize : 0)
+        barsInTrend += 1
+        extension := math.max(extension - 1, 0)
+
+trendDirection = dir == 1 ? 1 : dir == -1 ? -1 : 0
+upper = trend + atr * bandMult
+lower = trend - atr * bandMult
+trendColor = dir == 1 ? colorUp : dir == -1 ? colorDown : color.gray
+trendStep = (dir != 0) and (trend != trend[1]) and ((trend > trend[1] and dir == 1) or (trend < trend[1] and dir == -1))
+plotMid = plot(trend, "Trend Line", color=trendColor, linewidth=2)
+plotUpper = plot(showFill ? upper : na, "Upper Band", color=na)
+plotLower = plot(showFill ? lower : na, "Lower Band", color=na)
+fill(plotUpper, plotMid, upper, trend, showFill ? color.new(trendColor, 60) : na, na)
+fill(plotLower, plotMid, lower, trend, showFill ? color.new(trendColor, 60) : na, na)
+Crossunder = ta.crossunder(low, lower)
+Crossover = ta.crossover(high, upper)
+if TrendFilter
+    Crossunder := ta.crossunder(low, lower) and trendDirection == 1
+    Crossover := ta.crossover(high, upper) and trendDirection == -1
+plotshape(Crossunder and ChannelRetestSignal ? low : na, title="Lower Retest", color=colorUp2, style=shape.triangleup, size=size.tiny, location=location.belowbar)
+plotshape(Crossover and ChannelRetestSignal ? high : na, title="Upper Retest", color=colorDown2, style=shape.triangledown, size=size.tiny, location=location.abovebar)
+plotshape(trendStep and dir == 1 and TrendStepSignal ? high : na, title="Bullish Step", location=location.absolute, style=shape.circle, color=colorUp3, size=size.tiny)
+plotshape(trendStep and dir == -1 and TrendStepSignal ? low : na, title="Bearish Step", location=location.absolute, style=shape.circle, color=colorDown3, size=size.tiny)
+plotshape(trendStep and dir == 1 and TrendStepSignal ? high : na, title="Bullish Step", location=location.absolute, style=shape.circle, color=color.new(colorUp3, 50), size=size.small)
+plotshape(trendStep and dir == -1 and TrendStepSignal ? low : na, title="Bearish Step", location=location.absolute, style=shape.circle, color=color.new(colorDown3, 50), size=size.small)
