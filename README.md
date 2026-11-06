@@ -524,3 +524,15 @@ Comandos Telegram:
 ```
 
 API adicional: `GET /api/rsi/live/status` y `GET /api/rsi/live/history[/SIMBOLO]`.
+
+## Indicador Trend Impulse Channels (Zeiierman)
+
+El port Python del indicador Pine v6 y sus pruebas viven aislados en
+`strategies/trend_impulse_channels/`. Expone las series ATR, línea de tendencia,
+bandas superior/inferior, dirección, retests y pasos estructurales para que un
+futuro motor breakout las consuma. Por ahora no incorpora reglas de trading.
+Consulta `strategies/trend_impulse_channels/README.md` para la API y parámetros.
+
+### Trend Impulse Channels Breakout
+
+La carpeta `strategies/trend_impulse_channels/` contiene indicador Pine-portado, motor breakout, exportador Excel y motor Live paper persistente. Comandos: `/backtest_tic`, `/tic_live add|remove|list` y `/tic_status`. El porcentaje de TP1 se configura por ejecución/suscripción. Ver `strategies/trend_impulse_channels/README.md` para las reglas y ejemplos.

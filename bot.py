@@ -83,6 +83,7 @@ from ttr_live import (
 from rsi_live import STORE as RSI_LIVE_STORE, monitor_job as rsi_live_monitor_job
 from backtest_common import (parse_backtest_request, load_backtest_klines, filter_signals_to_period, filter_signals_by_density, filter_signals_by_opposite_band, filter_signals_by_channel_width)
 from risk_management import RiskConfig
+from strategies.trend_impulse_channels import latest_trend_impulse_channels
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -96,12 +97,15 @@ BOT_COMMANDS = [
     BotCommand("start", "Ver ayuda y todos los comandos"),
     BotCommand("price", "Precio de monedas (/price BTCUSDT)"),
     BotCommand("watchlist", "Ver o editar la watchlist de /price"),
-    BotCommand("indicators", "RSI, media RSI, Estocástico y Bandas de Bollinger (/indicators BTCUSDT 1h)"),
+    BotCommand("indicators", "RSI, Estocástico, Bollinger y Trend Impulse Channels (/indicators BTCUSDT 1h)"),
     BotCommand("alerts", "Suscripciones de alertas Keltner y RSI (add/remove/check)"),
     BotCommand("backtest", "Backtest Bollinger por velas o fechas"),
     BotCommand("backtest_keltner", "Backtest Keltner por velas o fechas"),
     BotCommand("backtest_reversion", "Backtest reversión Bollinger + Estocástico"),
     BotCommand("backtest_rsi", "Backtest RSI por zonas extremas"),
+    BotCommand("backtest_tic", "Backtest Trend Impulse Channels Breakout"),
+    BotCommand("tic_live", "Paper Live Trend Impulse Channels"),
+    BotCommand("tic_status", "Historial de operaciones Trend Impulse"),
     BotCommand("backtest_squeeze", "Backtest Squeeze Bollinger + Keltner"),
     BotCommand("backtest_dual_thrust", "Backtest ruptura de rango Dual Thrust"),
     BotCommand("backtest_ttr", "Backtest TTR Pine v6 con TP parciales y reversiones"),
@@ -2080,7 +2084,7 @@ async def indicators_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Bitunix no expone indicadores calculados por su API, solo el
         # histórico de velas — el estocástico y las Bandas de Bollinger se
         # calculan aquí a partir de ese histórico (ver indicators.py).
-        klines = bitunix.get_kline(symbol, interval=interval, limit=100)
+        klines = bitunix.get_kline(symbol, interval=interval, limit=200)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Error consultando velas de Bitunix")
         await update.message.reply_text(f"⚠️ Error consultando velas de Bitunix: {exc}")
@@ -2102,8 +2106,16 @@ async def indicators_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         k_value, d_value = stochastic_oscillator(closes, highs, lows)
         lower, middle, upper = bollinger_bands(closes)
         rsi_data = rsi_indicator(closes, rsi_period=14, ma_type="SMA", ma_period=14)
+        tic = latest_trend_impulse_channels(None, highs, lows, closes)
     except ValueError as exc:
         await update.message.reply_text(f"⚠️ {exc}")
+        return
+
+    if tic["atr"] is None or tic["trend"] is None:
+        await update.message.reply_text(
+            f"Trend Impulse Channels necesita al menos 200 velas cerradas para ATR(200); "
+            f"Bitunix devolvió {len(klines)}. Prueba de nuevo cuando haya más histórico."
+        )
         return
 
     rsi_value = rsi_data["rsi"][-1]
@@ -2130,7 +2142,16 @@ async def indicators_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"  Superior: `{upper:.4f}`\n"
         f"  Media: `{middle:.4f}`\n"
         f"  Inferior: `{lower:.4f}`\n"
-        f"  Precio actual: `{last_close:.4f}` — {bb_position}"
+        f"  Precio actual: `{last_close:.4f}` — {bb_position}\n\n"
+        f"*Trend Impulse Channels (Zeiierman)*\n"
+        f"  Dirección: `{'ALCISTA' if tic['direction'] == 1 else 'BAJISTA' if tic['direction'] == -1 else 'NEUTRAL' if tic['direction'] == 0 else 'CALENTANDO'}`\n"
+        f"  Trend: `{tic['trend']:.4f}`\n"
+        f"  Canal superior: `{tic['upper']:.4f}`\n"
+        f"  Canal inferior: `{tic['lower']:.4f}`\n"
+        f"  ATR(200): `{tic['atr']:.4f}`\n"
+        f"  Parámetros: `2.86 / -0.034 / 2.02 / 0`\n"
+        f"  Retest inferior: `{'SÍ' if tic['lower_retest'] else 'NO'}` · retest superior: `{'SÍ' if tic['upper_retest'] else 'NO'}`\n"
+        f"  Nuevo paso: `{'ALCISTA' if tic['bullish_step'] else 'BAJISTA' if tic['bearish_step'] else 'NO'}`"
     )
     await update.message.reply_text(message, parse_mode="Markdown")
 
@@ -2447,6 +2468,9 @@ def main() -> None:
     application.add_handler(CommandHandler("backtest_keltner", backtest_keltner_command))
     application.add_handler(CommandHandler("backtest_reversion", backtest_reversion_command))
     application.add_handler(CommandHandler("backtest_rsi", backtest_rsi_command))
+    application.add_handler(CommandHandler("backtest_tic", backtest_tic_command))
+    application.add_handler(CommandHandler("tic_live", tic_live_command))
+    application.add_handler(CommandHandler("tic_status", tic_status_command))
     application.add_handler(CommandHandler("backtest_squeeze", backtest_squeeze_command))
     application.add_handler(CommandHandler("backtest_dual_thrust", backtest_dual_thrust_command))
     application.add_handler(CommandHandler("backtest_ttr", backtest_ttr_command))
@@ -2481,6 +2505,8 @@ def main() -> None:
             },
         )
         application.job_queue.run_repeating(rsi_live_monitor_job, interval=10, first=3, name="rsi_live_monitor", job_kwargs={"max_instances":1,"coalesce":True,"misfire_grace_time":30})
+        from strategies.trend_impulse_channels.live import monitor_job as tic_live_monitor_job
+        application.job_queue.run_repeating(tic_live_monitor_job, interval=10, first=5, name="tic_live_monitor", job_kwargs={"max_instances":1,"coalesce":True,"misfire_grace_time":30})
         logger.info("Monitor RSI paper trading activo (supervisor cada 10 segundos; sin órdenes reales).")
         logger.info(
             "Monitor TTR paper trading: WebSocket prioritario, REST fallback; "
@@ -2522,6 +2548,64 @@ def main() -> None:
     else:
         logger.info("Modo polling (local). Esperando mensajes...")
         application.run_polling()
+
+
+async def backtest_tic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Backtest Trend Impulse Channels breakout con TP1 configurable."""
+    from strategies.trend_impulse_channels.engine import run_backtest, summarize
+    from strategies.trend_impulse_channels.xlsx_export import build_workbook
+    raw=list(context.args); positional=[]; opts={'tp1_pct':50.0,'risk_usdt':10.0,'fee_pct':0.0}; keys={'--tp1':'tp1_pct','--tp1-pct':'tp1_pct','--risk-usdt':'risk_usdt','--fee':'fee_pct'}; i=0
+    try:
+        while i<len(raw):
+            if raw[i].lower() in keys:
+                if i+1>=len(raw):raise ValueError(f'Falta valor para {raw[i]}')
+                opts[keys[raw[i].lower()]]=float(raw[i+1]);i+=2
+            else:positional.append(raw[i]);i+=1
+        req=parse_backtest_request(positional,normalize_symbol=_normalize_symbol,default_interval='1h',max_candles=BACKTEST_MAX_CANDLES)
+        if not 0<opts['tp1_pct']<100 or opts['risk_usdt']<=0 or opts['fee_pct']<0:raise ValueError('TP1 debe estar entre 0 y 100; riesgo > 0 y comisión >= 0')
+        if req.interval not in VALID_INTERVALS:raise ValueError(f'Intervalo no válido: {req.interval}')
+    except ValueError as exc:
+        await update.message.reply_text('Uso: /backtest_tic SIMBOLO INTERVALO VELAS [--tp1 50] [--risk-usdt 10] [--fee 0]\n'+str(exc));return
+    await update.message.reply_text(f'Descargando histórico Trend Impulse Breakout de {req.symbol} ({req.interval})…')
+    try:
+        klines,signal_start,signal_end=load_backtest_klines(bitunix,req,warmup_candles=220,followup_candles=10)
+        o=[float(x['open']) for x in klines];h=[float(x['high']) for x in klines];l=[float(x['low']) for x in klines];c=[float(x['close']) for x in klines];ts=[int(x['time']) for x in klines]
+        trades,ind=run_backtest(o,h,l,c,ts,tp1_pct=opts['tp1_pct'],risk_usdt=opts['risk_usdt'],fee_pct=opts['fee_pct'])
+        trades=[t for t in trades if signal_start is None or signal_start<=t.signal_time<=signal_end]
+        st=summarize(trades)
+        await update.message.reply_text(f'Trend Impulse Breakout · {req.symbol} {req.interval}\nTP1: {opts["tp1_pct"]:g}% · TP2: resto en banda nueva · Riesgo: {opts["risk_usdt"]:g} USDT\nOperaciones: {st["total"]} · TP1: {st["tp1"]} · TP2: {st["tp2"]} · SL: {st["sl"]} · abiertas: {st["open"]}\nPnL: {st["pnl_usdt"]:+.4f} USDT')
+        wb=build_workbook(req.symbol,req.interval,klines,trades,tp1_pct=opts['tp1_pct'],risk_usdt=opts['risk_usdt'],fee_pct=opts['fee_pct'],indicator=ind)
+        await update.message.reply_document(document=wb,filename=f'backtest_tic_{req.symbol}_{req.interval}_{datetime.now(timezone.utc):%Y%m%d_%H%M}.xlsx')
+    except Exception as exc:
+        logger.exception('Error backtest TIC');await update.message.reply_text(f'Error en backtest Trend Impulse: {exc}')
+
+async def tic_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Paper Live: /tic_live add|remove SYMBOL TF [TP1_PCT] [RISK_USDT] | list"""
+    from strategies.trend_impulse_channels.live import STORE, TF_MS
+    a=list(context.args)
+    if not a or a[0].lower()=='help':
+        await update.message.reply_text('Trend Impulse Channels Live (paper, sin órdenes reales):\n/tic_live add BTCUSDT 1h 50 [10]\n/tic_live remove BTCUSDT 1h\n/tic_live list\nTP1 es porcentaje liquidado; TP2 liquida el resto en la banda del canal nuevo.');return
+    action=a[0].lower()
+    if action=='list':
+        rows=await asyncio.to_thread(STORE.status);await update.message.reply_text('\n'.join(f'{x["symbol"]} {x["interval"]} · {"ACTIVO" if x["enabled"] else "DETENIDO"} · {json.loads(x["config"]).get("tp1_pct",50):g}% TP1' for x in rows) or 'No hay suscripciones TIC.');return
+    if len(a)<3 or action not in ('add','remove'):
+        await update.message.reply_text('Uso: /tic_live add|remove SIMBOLO TF [TP1_PCT] [RIESGO_USDT]');return
+    sym=_normalize_symbol(a[1]);tf=a[2].lower()
+    if tf not in TF_MS:await update.message.reply_text('Temporalidad no soportada.');return
+    if action=='remove':await asyncio.to_thread(STORE.unsubscribe,sym,tf);await update.message.reply_text(f'TIC Live detenido para {sym} {tf}.');return
+    try:tpct=float(a[3]) if len(a)>3 else 50.0;risk=float(a[4]) if len(a)>4 else 10.0
+    except ValueError:await update.message.reply_text('TP1 y riesgo deben ser números.');return
+    if not 0<tpct<100 or risk<=0:await update.message.reply_text('TP1 debe estar entre 0 y 100 y riesgo > 0.');return
+    await asyncio.to_thread(STORE.subscribe,sym,tf,update.effective_chat.id,{'tp1_pct':tpct,'risk_usdt':risk})
+    await update.message.reply_text(f'✅ TIC Live activado: {sym} {tf}\nTP1 {tpct:g}% · TP2 resto · riesgo {risk:g} USDT. Paper trading; no envía órdenes.')
+
+async def tic_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from strategies.trend_impulse_channels.live import STORE
+    a=list(context.args);rows=await asyncio.to_thread(STORE.history,a[0].upper() if a else None)
+    if not rows:await update.message.reply_text('No hay operaciones TIC.');return
+    lines=[]
+    for t in rows[:20]:lines.append(f'#{t["id"]} {t["symbol"]} {t["interval"]} {t["side"]} {t["status"]} · entrada {t["entry_price"]:.8g} · SL {t["stop_price"]:.8g} · PnL {t["pnl_usdt"]:+.4f}')
+    await update.message.reply_text('\n'.join(lines))
 
 
 if __name__ == "__main__":
