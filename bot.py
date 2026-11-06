@@ -2084,7 +2084,11 @@ async def indicators_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Bitunix no expone indicadores calculados por su API, solo el
         # histórico de velas — el estocástico y las Bandas de Bollinger se
         # calculan aquí a partir de ese histórico (ver indicators.py).
-        klines = bitunix.get_kline(symbol, interval=interval, limit=200)
+        # TIC tiene estado recursivo: no basta con ATR(200). El valor trend
+        # depende de la secuencia completa desde el inicio del histórico.
+        # Cargar hasta 10.000 velas reduce el error de reiniciar el estado
+        # demasiado cerca de la vela actual y permite comparar con TradingView.
+        klines = bitunix.get_kline_history(symbol, interval=interval, total=10000)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Error consultando velas de Bitunix")
         await update.message.reply_text(f"⚠️ Error consultando velas de Bitunix: {exc}")
@@ -2568,7 +2572,21 @@ async def backtest_tic_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text('Uso: /backtest_tic SIMBOLO INTERVALO VELAS [--tp1 50] [--risk-usdt 10] [--fee 0]\n'+str(exc));return
     await update.message.reply_text(f'Descargando histórico Trend Impulse Breakout de {req.symbol} ({req.interval})…')
     try:
-        klines,signal_start,signal_end=load_backtest_klines(bitunix,req,warmup_candles=220,followup_candles=10)
+        if req.is_date_range:
+            # El canal es recursivo y no converge solo con 200 velas de ATR.
+            # Se usa un calentamiento largo antes del período solicitado.
+            klines,signal_start,signal_end=load_backtest_klines(
+                bitunix,req,max_range_candles=10000,warmup_candles=9000,followup_candles=10
+            )
+        else:
+            # En modo N velas calculamos el indicador sobre hasta 10.000 velas
+            # históricas, pero solo contamos operaciones dentro de las últimas
+            # N velas solicitadas.
+            klines=bitunix.get_kline_history(req.symbol,interval=req.interval,total=10000)
+            if not klines:
+                raise ValueError('Bitunix no devolvió histórico para este símbolo/intervalo.')
+            signal_start=int(klines[max(0,len(klines)-(req.candle_count or 500))]['time'])
+            signal_end=int(klines[-1]['time'])
         o=[float(x['open']) for x in klines];h=[float(x['high']) for x in klines];l=[float(x['low']) for x in klines];c=[float(x['close']) for x in klines];ts=[int(x['time']) for x in klines]
         trades,ind=run_backtest(o,h,l,c,ts,tp1_pct=opts['tp1_pct'],risk_usdt=opts['risk_usdt'],fee_pct=opts['fee_pct'])
         trades=[t for t in trades if signal_start is None or signal_start<=t.signal_time<=signal_end]
