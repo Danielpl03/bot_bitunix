@@ -97,3 +97,10 @@ velas. Para una paridad estricta en Live será necesario inicializar y persistir
 estado recursivo del indicador desde el histórico completo y actualizarlo vela a
 vela; no se debe interpretar el cambio de esta versión como una garantía de
 paridad histórica en Live.
+
+
+### Correcciones de ejecución (V2.2)
+- Se considera cambio/reinicio de canal cuando `bars_in_trend` vuelve a 1. Esto detecta también un nuevo canal que conserva la dirección anterior; comparar solamente `direction` no era suficiente.
+- Una vela que reinicia el canal no puede abrir una operación, aunque su ruptura y su color cumplan los demás filtros.
+- Al ejecutarse TP1 al cierre de una vela de reinicio de canal, el stop de la cantidad restante se mueve al precio de entrada (break-even). El nuevo stop se aplica desde la vela siguiente, no retroactivamente dentro de la vela que ejecutó TP1.
+- El Excel distingue `SL inicial` y `SL actual`, para que el movimiento a break-even no oculte el stop de riesgo original.

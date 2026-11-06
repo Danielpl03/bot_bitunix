@@ -11,7 +11,7 @@ class TICTrade:
     tp2_target:float|None=None; tp2_time:int|None=None; tp2_price:float|None=None
     exit_time:int|None=None; exit_price:float|None=None; outcome:str='OPEN'
     quantity:float=0.0; remaining_qty:float=0.0; pnl_usdt:float=0.0
-    pnl_pct:float|None=None; risk_usdt:float=10.0
+    pnl_pct:float|None=None; risk_usdt:float=10.0; initial_stop_loss:float|None=None
 
 
 def run_backtest(opens, highs, lows, closes, times, *, tp1_pct=50.0, risk_usdt=10.0,
@@ -33,14 +33,17 @@ def run_backtest(opens, highs, lows, closes, times, *, tp1_pct=50.0, risk_usdt=1
                 _realize(active,active.remaining_qty,active.stop_loss,fee_pct)
                 active.exit_time=int(times[i]); active.exit_price=active.stop_loss; active.outcome='SL'; active=None
             else:
-                direction=ind['direction'][i]
-                changed=(prev_dir is not None and direction in (-1,1) and prev_dir in (-1,1) and direction!=prev_dir)
-                # TP1 al cierre de la vela que cambia el canal; nunca en la vela de entrada.
-                if changed and active.tp1_time is None and i>0 and int(times[i])>active.entry_time:
+                # Un cambio de canal en Pine reinicia bars_in_trend a 1.
+                # Puede conservar la misma dirección (p. ej. un nuevo impulso alcista),
+                # por lo que comparar únicamente direction deja pasar falsas entradas.
+                channel_reset = i > 0 and int(ind['bars_in_trend'][i] or 0) == 1
+                # TP1 al cierre de cualquier reinicio de canal posterior a la entrada.
+                if channel_reset and active.tp1_time is None and int(times[i])>active.entry_time:
                     part=active.quantity*active.tp1_pct/100.0
                     px=float(closes[i]); _realize(active,part,px,fee_pct)
-                    active.remaining_qty=max(0.0,active.remaining_qty-part)
                     active.tp1_time=int(times[i]); active.tp1_price=px
+                    # Tras cobrar TP1, el riesgo del remanente queda protegido en break-even.
+                    active.stop_loss=active.entry
                     active.tp2_target=ind['upper'][i] if active.side=='LONG' else ind['lower'][i]
                 # TP2 en la banda extrema del canal nuevo capturado en TP1.
                 if active is not None and active.tp1_time is not None and active.tp1_time < int(times[i]) and active.tp2_target is not None:
@@ -52,20 +55,22 @@ def run_backtest(opens, highs, lows, closes, times, *, tp1_pct=50.0, risk_usdt=1
                         active.exit_time=int(times[i]); active.exit_price=px; active.outcome='TP2'; active=None
         # Detección de ruptura: la misma vela no puede cambiar el canal.
         direction=ind['direction'][i]
-        changed_now=(prev_dir is not None and direction in (-1,1) and direction!=prev_dir)
-        if active is None and pending is None and not changed_now and i>0:
+        # bars_in_trend == 1 identifica el reinicio del canal, incluso si
+        # la dirección nueva coincide con la anterior.
+        channel_reset_now = i > 0 and int(ind['bars_in_trend'][i] or 0) == 1
+        if active is None and pending is None and not channel_reset_now and i>0:
             upper=ind['upper'][i]; lower=ind['lower'][i]
             if upper is not None and float(highs[i])>float(upper) and float(closes[i])>float(opens[i]):
                 stop=min(float(lows[i]),float(lows[i-1])); entry=float(closes[i]); dist=entry-stop
                 if dist>0:
                     qty=float(risk_usdt)/dist
-                    active=TICTrade(int(times[i]),int(times[i]),'LONG',entry,stop,tp1_pct=float(tp1_pct),quantity=qty,remaining_qty=qty,risk_usdt=float(risk_usdt))
+                    active=TICTrade(int(times[i]),int(times[i]),'LONG',entry,stop,tp1_pct=float(tp1_pct),quantity=qty,remaining_qty=qty,risk_usdt=float(risk_usdt),initial_stop_loss=stop)
                     trades.append(active)
             elif lower is not None and float(lows[i])<float(lower) and float(closes[i])<float(opens[i]):
                 stop=max(float(highs[i]),float(highs[i-1])); entry=float(closes[i]); dist=stop-entry
                 if dist>0:
                     qty=float(risk_usdt)/dist
-                    active=TICTrade(int(times[i]),int(times[i]),'SHORT',entry,stop,tp1_pct=float(tp1_pct),quantity=qty,remaining_qty=qty,risk_usdt=float(risk_usdt))
+                    active=TICTrade(int(times[i]),int(times[i]),'SHORT',entry,stop,tp1_pct=float(tp1_pct),quantity=qty,remaining_qty=qty,risk_usdt=float(risk_usdt),initial_stop_loss=stop)
                     trades.append(active)
         prev_dir=direction
     return trades, ind

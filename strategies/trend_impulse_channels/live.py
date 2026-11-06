@@ -36,7 +36,7 @@ class TICLiveStore:
  def open_trades(self,sym,tf):
   with self.db._db() as c:return [dict(x) for x in self.db._execute(c,"SELECT * FROM tic_live_trades WHERE symbol=? AND interval=? AND status='OPEN' ORDER BY id",(sym,tf)).fetchall()]
  def update_trade(self,t):
-  with self.db._db() as c:self.db._execute(c,'UPDATE tic_live_trades SET remaining_qty=?,tp1_time=?,tp1_price=?,tp2_target=?,tp2_time=?,tp2_price=?,exit_time=?,exit_price=?,status=?,pnl_usdt=? WHERE id=?',(t['remaining_qty'],t.get('tp1_time'),t.get('tp1_price'),t.get('tp2_target'),t.get('tp2_time'),t.get('tp2_price'),t.get('exit_time'),t.get('exit_price'),t['status'],t['pnl_usdt'],t['id']))
+  with self.db._db() as c:self.db._execute(c,'UPDATE tic_live_trades SET stop_price=?,remaining_qty=?,tp1_time=?,tp1_price=?,tp2_target=?,tp2_time=?,tp2_price=?,exit_time=?,exit_price=?,status=?,pnl_usdt=? WHERE id=?',(t['stop_price'],t['remaining_qty'],t.get('tp1_time'),t.get('tp1_price'),t.get('tp2_target'),t.get('tp2_time'),t.get('tp2_price'),t.get('exit_time'),t.get('exit_price'),t['status'],t['pnl_usdt'],t['id']))
  def commit(self,sym,tf,ts):
   with self.db._db() as c:self.db._execute(c,'UPDATE tic_live_config SET last_bar_time=?,updated_at=? WHERE symbol=? AND interval=?',(ts,int(time.time()*1000),sym,tf))
  def status(self):
@@ -62,18 +62,22 @@ async def monitor_subscription(context,cfg,client,store=STORE):
   i=idx_by_time.get(int(bar['time']))
   if i is None or i<1:continue
   o,h,l,c=map(float,(bar['open'],bar['high'],bar['low'],bar['close'])); d=ind['direction'][i]; prev=ind['direction'][i-1]
-  changed=d in (-1,1) and prev in (-1,1) and d!=prev
-  channel_change=d in (-1,1) and d!=prev
+  # Pine reinicia bars_in_trend a 1 cada vez que construye un canal nuevo.
+  # El canal puede reiniciarse en la misma dirección, no solo al invertirla.
+  channel_change=i>0 and int(ind['bars_in_trend'][i] or 0)==1
   opened=await asyncio.to_thread(store.open_trades,sym,tf)
   for t in opened:
    if (l<=float(t['stop_price']) if t['side']=='LONG' else h>=float(t['stop_price'])):
     px=float(t['stop_price']); qty=float(t['remaining_qty']); signed=(px-float(t['entry_price'])) if t['side']=='LONG' else (float(t['entry_price'])-px)
     t.update(remaining_qty=0,exit_time=int(bar['time']),exit_price=px,status='CLOSED',pnl_usdt=float(t['pnl_usdt'])+signed*qty);await asyncio.to_thread(store.update_trade,t)
     await _notify(context,cfg['chat_id'],f'🛑 TIC {sym} {tf} · SL {t["side"]}\nPrecio {px:.8g} · PnL {t["pnl_usdt"]:+.4f} USDT');continue
-   if changed and t.get('tp1_time') is None:
+   if channel_change and t.get('tp1_time') is None and int(bar['time'])>int(t['entry_time']):
     qty=float(t['quantity'])*float(t['tp1_pct'])/100; px=c; signed=(px-float(t['entry_price'])) if t['side']=='LONG' else (float(t['entry_price'])-px)
-    t['pnl_usdt']=float(t['pnl_usdt'])+signed*qty;t['remaining_qty']=max(0,float(t['remaining_qty'])-qty);t['tp1_time']=int(bar['time']);t['tp1_price']=px;t['tp2_target']=ind['upper'][i] if t['side']=='LONG' else ind['lower'][i]
-    await asyncio.to_thread(store.update_trade,t);await _notify(context,cfg['chat_id'],f'🎯 TIC {sym} {tf} · TP1 {t["side"]}\nCierre {px:.8g} · {t["tp1_pct"]:g}% liquidado · objetivo TP2 {t["tp2_target"]:.8g}')
+    t['pnl_usdt']=float(t['pnl_usdt'])+signed*qty;t['remaining_qty']=max(0,float(t['remaining_qty'])-qty);t['tp1_time']=int(bar['time']);t['tp1_price']=px
+    # Proteger el remanente en el precio de entrada después de realizar TP1.
+    t['stop_price']=float(t['entry_price'])
+    t['tp2_target']=ind['upper'][i] if t['side']=='LONG' else ind['lower'][i]
+    await asyncio.to_thread(store.update_trade,t);await _notify(context,cfg['chat_id'],f'🎯 TIC {sym} {tf} · TP1 {t["side"]}\nCierre {px:.8g} · {t["tp1_pct"]:g}% liquidado · SL restante a break-even {t["stop_price"]:.8g} · objetivo TP2 {t["tp2_target"]:.8g}')
    if t.get('tp1_time') is not None and int(t['tp1_time']) < int(bar['time']) and t.get('tp2_target') is not None:
     target=float(t['tp2_target']); hit=h>=target if t['side']=='LONG' else l<=target
     if hit:
