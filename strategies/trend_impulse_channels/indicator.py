@@ -63,9 +63,10 @@ def calculate_trend_impulse_channels(
 ) -> dict[str, list[Any]]:
     """Calcula cada serie del indicador en orden cronológico (antigua→nueva).
 
-    Se conserva intencionadamente la expresión Pine `math.min(stepBase +
+    Se conserva la expresión Pine `math.min(stepBase +
     0.0093 * barsInTrend * atr, maxStep)`, incluso cuando `max_step_atr` es
-    negativo: cambiarla por abs/max sería dejar de replicar el original.
+    negativo. También se replica el reinicio recurrente `if na(trend)`, que
+    ocurre en todas las velas del calentamiento ATR, no solo en la primera.
     """
     n = len(closes)
     if not (len(highs) == len(lows) == n) or (opens is not None and len(opens) != n):
@@ -117,7 +118,12 @@ def calculate_trend_impulse_channels(
         start_short = trigger is not None and c[i] < trend_for_signal - trigger
         flip = (start_long or start_short) and bars_in_trend >= 0
 
-        if trend is None and i == 0:
+        # Pine usa `if na(trend)` en CADA vela, no solamente en la primera.
+        # Mientras ATR(200) sea na, la rama `else` convierte trend en na;
+        # por tanto Pine vuelve a inicializar trend/dir/bars/extension en la
+        # siguiente vela. La primera vela con ATR válido también inicializa
+        # trend al close y NO evalúa flip en esa misma vela.
+        if trend is None:
             trend = c[i]
             direction = 0
             bars_in_trend = 0

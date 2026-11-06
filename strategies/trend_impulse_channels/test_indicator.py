@@ -16,8 +16,12 @@ class TrendImpulseChannelsTests(unittest.TestCase):
             self.assertEqual(len(result[key]), len(closes))
         self.assertTrue(all(x is None for x in result["atr"][:199]))
         self.assertAlmostEqual(result["atr"][199], 2.0)
+        # Pine reinicializa trend mientras ATR es na. En la primera vela
+        # con ATR válido también entra por `if na(trend)`, así que direction
+        # permanece neutral y trend toma el close de esa vela.
         self.assertEqual(result["direction"][198], 0)
-        self.assertEqual(result["direction"][199], 1)
+        self.assertEqual(result["direction"][199], 0)
+        self.assertAlmostEqual(result["trend"][199], 100.0)
 
     def test_default_negative_max_step_is_preserved_exactly(self):
         closes = [100.0] * 202
@@ -26,9 +30,11 @@ class TrendImpulseChannelsTests(unittest.TestCase):
         result = calculate_trend_impulse_channels(None, highs, lows, closes)
         self.assertAlmostEqual(result["max_step"][199], -0.068)
         self.assertAlmostEqual(result["step_size"][200], -0.068)
-        self.assertAlmostEqual(result["trend"][200], 99.932)
-        self.assertAlmostEqual(result["upper"][200], 103.972)
-        self.assertAlmostEqual(result["lower"][200], 95.892)
+        # Con closes constantes no hay flip; dir sigue neutral, por lo que
+        # Pine no aplica el step negativo a trend.
+        self.assertAlmostEqual(result["trend"][200], 100.0)
+        self.assertAlmostEqual(result["upper"][200], 104.04)
+        self.assertAlmostEqual(result["lower"][200], 95.96)
 
     def test_hold_bars_blocks_immediate_flip(self):
         closes = [100.0] * 200 + [110.0, 90.0, 90.0]
@@ -37,14 +43,15 @@ class TrendImpulseChannelsTests(unittest.TestCase):
         result = calculate_trend_impulse_channels(None, highs, lows, closes, hold_bars=2)
         self.assertEqual(result["direction"][200], 1)
         self.assertEqual(result["direction"][201], 1)
-        self.assertEqual(result["extension"][200], 1)
+        self.assertEqual(result["extension"][200], 2)
 
     def test_latest_helper_returns_last_values(self):
         closes = [100.0] * 200
         highs = [101.0] * 200
         lows = [99.0] * 200
         latest = latest_trend_impulse_channels(None, highs, lows, closes)
-        self.assertEqual(latest["direction"], 1)
+        self.assertEqual(latest["direction"], 0)
+        self.assertAlmostEqual(latest["trend"], 100.0)
         self.assertAlmostEqual(latest["atr"], 2.0)
 
     def test_invalid_ohlc_lengths_raise(self):

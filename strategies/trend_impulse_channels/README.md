@@ -76,3 +76,24 @@ Comandos Telegram:
 ```
 
 El porcentaje TP1 se configura individualmente en cada backtest o suscripción Live. Live es paper trading y no envía órdenes a Bitunix.
+
+
+## Paridad con TradingView (corrección V2.1)
+
+El indicador es recursivo: `trend` depende del estado acumulado de velas anteriores.
+La implementación replica ahora el `if na(trend)` del Pine en cada vela mientras
+la serie siga siendo `na`, incluida la primera vela con ATR(200) válido.
+
+Para reducir diferencias por un punto de inicio distinto, `/indicators` carga hasta
+10.000 velas y `/backtest_tic` calcula sobre hasta 10.000 velas históricas; en
+backtests por fechas reserva hasta 9.000 velas anteriores como calentamiento.
+La coincidencia exacta con TradingView requiere además que ambos usen el mismo
+mercado, fuente de OHLC, vela inicial, zona horaria y velas cerradas. Si TradingView
+tiene más histórico cargado que Bitunix, la línea `trend` puede seguir difiriendo
+porque su estado no es un promedio que se estabilice solo con ATR(200).
+
+**Nota Live:** el monitor Live todavía recalcula desde su ventana operativa de 450
+velas. Para una paridad estricta en Live será necesario inicializar y persistir el
+estado recursivo del indicador desde el histórico completo y actualizarlo vela a
+vela; no se debe interpretar el cambio de esta versión como una garantía de
+paridad histórica en Live.
