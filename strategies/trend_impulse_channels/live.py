@@ -28,11 +28,15 @@ class TICLiveStore:
  def get_config(self,sym,tf):
   with self.db._db() as c:
    x=self.db._execute(c,'SELECT * FROM tic_live_config WHERE symbol=? AND interval=?',(sym,tf)).fetchone();return dict(x) if x else None
- def open_trade(self,sym,tf,side,ts,entry,stop,qty,tpct):
+ def open_trade(self,sym,tf,side,ts,entry,stop,qty,tpct,sl_candles=2):
   with self.db._db() as c:
    q='INSERT INTO tic_live_trades(symbol,interval,side,entry_time,entry_price,stop_price,quantity,remaining_qty,tp1_pct,status) VALUES(?,?,?,?,?,?,?,?,?,?)';a=(sym,tf,side,ts,entry,stop,qty,qty,tpct,'OPEN')
-   if self.db.backend=='postgres':return self.db._execute(c,q+' RETURNING id',a).fetchone()['id']
-   return self.db._execute(c,q,a).lastrowid
+   if self.db.backend=='postgres':
+    tid=self.db._execute(c,q+' RETURNING id',a).fetchone()['id']
+   else:
+    tid=self.db._execute(c,q,a).lastrowid
+   self.db._execute(c,"UPDATE tic_live_trades SET payload=? WHERE id=?",(json.dumps({'sl_candles':int(sl_candles)}),tid))
+   return tid
  def open_trades(self,sym,tf):
   with self.db._db() as c:return [dict(x) for x in self.db._execute(c,"SELECT * FROM tic_live_trades WHERE symbol=? AND interval=? AND status='OPEN' ORDER BY id",(sym,tf)).fetchall()]
  def update_trade(self,t):
@@ -87,13 +91,16 @@ async def monitor_subscription(context,cfg,client,store=STORE):
   if cfg.get('enabled') and not opened and not channel_change and i>0:
    upper,lower=ind['upper'][i],ind['lower'][i]
    side=None;stop=None
-   if upper is not None and h>upper and c>o:side='LONG';stop=min(l,float(all_bars[i-1]['low']))
-   elif lower is not None and l<lower and c<o:side='SHORT';stop=max(h,float(all_bars[i-1]['high']))
+   sl_candles=max(1,min(200,int(params.get('sl_candles',2))))
+   if upper is not None and h>upper and c>o and i>=sl_candles-1:
+    side='LONG';stop=min(float(x['low']) for x in all_bars[i-sl_candles+1:i+1])
+   elif lower is not None and l<lower and c<o and i>=sl_candles-1:
+    side='SHORT';stop=max(float(x['high']) for x in all_bars[i-sl_candles+1:i+1])
    if side:
     entry=c;dist=entry-stop if side=='LONG' else stop-entry;risk=float(params.get('risk_usdt',10))
     if dist>0 and risk>0:
-     qty=risk/dist;tid=await asyncio.to_thread(store.open_trade,sym,tf,side,int(bar['time']),entry,stop,qty,float(params['tp1_pct']))
-     await _notify(context,cfg['chat_id'],f'📍 TIC {sym} {tf} · ENTRADA {side}\nPrecio {entry:.8g} · SL {stop:.8g} · TP1 {params["tp1_pct"]:g}% · cantidad {qty:.8g}')
+     qty=risk/dist;tid=await asyncio.to_thread(store.open_trade,sym,tf,side,int(bar['time']),entry,stop,qty,float(params['tp1_pct']),sl_candles)
+     await _notify(context,cfg['chat_id'],f'📍 TIC {sym} {tf} · ENTRADA {side}\nPrecio {entry:.8g} · SL {stop:.8g} ({sl_candles} velas) · TP1 {params["tp1_pct"]:g}% · cantidad {qty:.8g}')
   await asyncio.to_thread(store.commit,sym,tf,int(bar['time']))
 async def _notify(context,chat,msg):
  try:await context.bot.send_message(chat_id=chat,text=msg)

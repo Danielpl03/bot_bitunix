@@ -47,6 +47,27 @@ class BreakoutEngineTests(unittest.TestCase):
   self.assertEqual(t.remaining_qty,t.quantity*0.6)
   self.assertEqual(t.outcome,'OPEN')
 
+
+ def test_long_stop_uses_configured_lookback_including_breakout_candle(self):
+  fake=self.fake([1]*5)
+  with patch('strategies.trend_impulse_channels.engine.calculate_trend_impulse_channels',return_value=fake):
+   trades,_=run_backtest([5,6,7,8,9],[6,7,8,12,9],[4,3,5,2,6],[5,6,7,11,8],[0,1,2,3,4],sl_candles=3)
+  self.assertEqual(len(trades),1)
+  self.assertEqual(trades[0].stop_loss,2)
+  self.assertEqual(trades[0].sl_candles,3)
+
+ def test_short_stop_uses_configured_lookback(self):
+  fake=self.fake([-1]*5)
+  with patch('strategies.trend_impulse_channels.engine.calculate_trend_impulse_channels',return_value=fake):
+   trades,_=run_backtest([5,4,3,2,3],[6,7,8,12,9],[4,3,5,1,6],[5,4,3,1.5,4],[0,1,2,3,4],sl_candles=3)
+  self.assertEqual(len(trades),1)
+  self.assertEqual(trades[0].stop_loss,12)
+  self.assertEqual(trades[0].sl_candles,3)
+
+ def test_sl_lookback_must_be_between_one_and_two_hundred(self):
+  with self.assertRaises(ValueError):run_backtest([],[],[],[],[],sl_candles=0)
+  with self.assertRaises(ValueError):run_backtest([],[],[],[],[],sl_candles=201)
+
  def test_reject_invalid_tp1(self):
   with self.assertRaises(ValueError):run_backtest([],[],[],[],[],tp1_pct=100)
 

@@ -11,15 +11,18 @@ class TICTrade:
     tp2_target:float|None=None; tp2_time:int|None=None; tp2_price:float|None=None
     exit_time:int|None=None; exit_price:float|None=None; outcome:str='OPEN'
     quantity:float=0.0; remaining_qty:float=0.0; pnl_usdt:float=0.0
-    pnl_pct:float|None=None; risk_usdt:float=10.0; initial_stop_loss:float|None=None
+    pnl_pct:float|None=None; risk_usdt:float=10.0; initial_stop_loss:float|None=None; sl_candles:int=2
 
 
 def run_backtest(opens, highs, lows, closes, times, *, tp1_pct=50.0, risk_usdt=10.0,
-                 fee_pct=0.0, indicator_params=None):
+                 fee_pct=0.0, indicator_params=None, sl_candles=2):
     n=len(closes)
     if not all(len(x)==n for x in (opens,highs,lows,times)): raise ValueError('OHLC y tiempos deben tener igual longitud')
     if not 0 < float(tp1_pct) < 100: raise ValueError('tp1_pct debe ser mayor que 0 y menor que 100')
     if risk_usdt<=0 or fee_pct<0: raise ValueError('Riesgo debe ser >0 y comisión >=0')
+    if isinstance(sl_candles, bool) or int(sl_candles) != sl_candles or not 1 <= int(sl_candles) <= 200:
+        raise ValueError('sl_candles debe ser un entero entre 1 y 200')
+    sl_candles=int(sl_candles)
     p=indicator_params or {}
     ind=calculate_trend_impulse_channels(opens,highs,lows,closes,**p)
     trades=[]; active=None; pending=None
@@ -60,17 +63,17 @@ def run_backtest(opens, highs, lows, closes, times, *, tp1_pct=50.0, risk_usdt=1
         channel_reset_now = i > 0 and int(ind['bars_in_trend'][i] or 0) == 1
         if active is None and pending is None and not channel_reset_now and i>0:
             upper=ind['upper'][i]; lower=ind['lower'][i]
-            if upper is not None and float(highs[i])>float(upper) and float(closes[i])>float(opens[i]):
-                stop=min(float(lows[i]),float(lows[i-1])); entry=float(closes[i]); dist=entry-stop
+            if upper is not None and float(highs[i])>float(upper) and float(closes[i])>float(opens[i]) and i>=sl_candles-1:
+                stop=min(float(x) for x in lows[i-sl_candles+1:i+1]); entry=float(closes[i]); dist=entry-stop
                 if dist>0:
                     qty=float(risk_usdt)/dist
-                    active=TICTrade(int(times[i]),int(times[i]),'LONG',entry,stop,tp1_pct=float(tp1_pct),quantity=qty,remaining_qty=qty,risk_usdt=float(risk_usdt),initial_stop_loss=stop)
+                    active=TICTrade(int(times[i]),int(times[i]),'LONG',entry,stop,tp1_pct=float(tp1_pct),quantity=qty,remaining_qty=qty,risk_usdt=float(risk_usdt),initial_stop_loss=stop,sl_candles=sl_candles)
                     trades.append(active)
-            elif lower is not None and float(lows[i])<float(lower) and float(closes[i])<float(opens[i]):
-                stop=max(float(highs[i]),float(highs[i-1])); entry=float(closes[i]); dist=stop-entry
+            elif lower is not None and float(lows[i])<float(lower) and float(closes[i])<float(opens[i]) and i>=sl_candles-1:
+                stop=max(float(x) for x in highs[i-sl_candles+1:i+1]); entry=float(closes[i]); dist=stop-entry
                 if dist>0:
                     qty=float(risk_usdt)/dist
-                    active=TICTrade(int(times[i]),int(times[i]),'SHORT',entry,stop,tp1_pct=float(tp1_pct),quantity=qty,remaining_qty=qty,risk_usdt=float(risk_usdt),initial_stop_loss=stop)
+                    active=TICTrade(int(times[i]),int(times[i]),'SHORT',entry,stop,tp1_pct=float(tp1_pct),quantity=qty,remaining_qty=qty,risk_usdt=float(risk_usdt),initial_stop_loss=stop,sl_candles=sl_candles)
                     trades.append(active)
         prev_dir=direction
     return trades, ind

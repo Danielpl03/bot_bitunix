@@ -7,20 +7,20 @@ from .engine import summarize
 from .indicator import calculate_trend_impulse_channels
 
 DARK=PatternFill('solid',fgColor='1F2937'); WHITE=Font(bold=True,color='FFFFFF')
-def build_workbook(symbol,interval,klines,trades,*,tp1_pct,risk_usdt,fee_pct=0,indicator_params=None,indicator=None):
+def build_workbook(symbol,interval,klines,trades,*,tp1_pct,risk_usdt,fee_pct=0,indicator_params=None,indicator=None,sl_candles=2):
     wb=Workbook(); ws=wb.active; ws.title='Resumen'; s=summarize(trades)
     ws['A1']=f'Trend Impulse Breakout — {symbol} {interval}'; ws['A1'].font=Font(bold=True,size=14)
-    meta=[('TP1 cierre posición %',tp1_pct),('TP2','Resto en banda del canal nuevo'),('Riesgo USDT',risk_usdt),('Comisión por lado %',fee_pct),('Entrada','Cierre de vela de ruptura'),('SL','Extremo entre vela de ruptura y anterior'),('Regla ruptura','High > upper / Low < lower; vela direccional; sin flip de canal')]
+    meta=[('TP1 cierre posición %',tp1_pct),('TP2','Resto en banda del canal nuevo'),('Riesgo USDT',risk_usdt),('Comisión por lado %',fee_pct),('Entrada','Cierre de vela de ruptura'),('Velas para SL',int(sl_candles)),('SL','Extremo de las últimas N velas, incluida la ruptura'),('Regla ruptura','High > upper / Low < lower; vela direccional; sin flip de canal')]
     for r,(k,v) in enumerate(meta,3): ws.cell(r,1,k); ws.cell(r,2,v)
     row=13
     for c,h in enumerate(['Métrica','Valor'],1): ws.cell(row,c,h).fill=DARK; ws.cell(row,c).font=WHITE
     for r,(k,v) in enumerate(s.items(),row+1): ws.cell(r,1,k); ws.cell(r,2,v)
-    op=wb.create_sheet('Operaciones'); headers=['Señal UTC','Entrada UTC','Lado','Entrada','SL inicial','SL actual','TP1 %','TP1 UTC','TP1 precio','TP2 objetivo','TP2 UTC','TP2 precio','Cierre UTC','Cierre precio','Resultado','Cantidad','Restante','PnL USDT','PnL %']
+    op=wb.create_sheet('Operaciones'); headers=['Señal UTC','Entrada UTC','Lado','Entrada','SL inicial','SL actual','Velas SL','TP1 %','TP1 UTC','TP1 precio','TP2 objetivo','TP2 UTC','TP2 precio','Cierre UTC','Cierre precio','Resultado','Cantidad','Restante','PnL USDT','PnL %']
     for c,h in enumerate(headers,1): op.cell(1,c,h).fill=DARK; op.cell(1,c).font=WHITE
     for r,t in enumerate(trades,2):
-        vals=[t.signal_time,t.entry_time,t.side,t.entry,t.initial_stop_loss if t.initial_stop_loss is not None else t.stop_loss,t.stop_loss,t.tp1_pct,t.tp1_time,t.tp1_price,t.tp2_target,t.tp2_time,t.tp2_price,t.exit_time,t.exit_price,t.outcome,t.quantity,t.remaining_qty,t.pnl_usdt,t.pnl_pct]
+        vals=[t.signal_time,t.entry_time,t.side,t.entry,t.initial_stop_loss if t.initial_stop_loss is not None else t.stop_loss,t.stop_loss,getattr(t,'sl_candles',2),t.tp1_pct,t.tp1_time,t.tp1_price,t.tp2_target,t.tp2_time,t.tp2_price,t.exit_time,t.exit_price,t.outcome,t.quantity,t.remaining_qty,t.pnl_usdt,t.pnl_pct]
         for c,v in enumerate(vals,1):
-            if c in (1,2,8,11,13) and v: v=datetime.fromtimestamp(v/1000,timezone.utc).replace(tzinfo=None)
+            if c in (1,2,9,12,14) and v: v=datetime.fromtimestamp(v/1000,timezone.utc).replace(tzinfo=None)
             op.cell(r,c,v)
     op.freeze_panes='A2'; op.auto_filter.ref=op.dimensions
     for c in range(1,len(headers)+1): op.column_dimensions[get_column_letter(c)].width=18

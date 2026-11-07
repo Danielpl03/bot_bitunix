@@ -60,7 +60,7 @@ El motor se encuentra en `engine.py`, el paper Live persistente en `live.py` y e
 - LONG: `high > upper` y vela alcista (`close > open`). SHORT: `low < lower` y vela bajista (`close < open`). No se filtra por dirección del canal.
 - La vela de ruptura no puede ser también la vela de cambio de dirección del canal.
 - Entrada al cierre de la vela de ruptura.
-- SL LONG: mínimo de la vela de ruptura y la anterior. SL SHORT: máximo de ambas.
+- SL configurable mediante `sl_candles` (1–200): LONG usa el mínimo de las últimas N velas, incluida la vela de ruptura; SHORT usa el máximo de esas mismas N velas. El valor predeterminado es 2, que conserva el comportamiento anterior.
 - TP1: al cierre de la primera vela posterior a la entrada que cambia la dirección del canal; liquida `tp1_pct`.
 - TP2: liquida el resto cuando el precio alcanza la banda superior (LONG) o inferior (SHORT) del canal nuevo capturado en TP1.
 - Si SL y otro evento coinciden dentro de una vela, SL tiene prioridad en el backtest OHLC.
@@ -68,14 +68,14 @@ El motor se encuentra en `engine.py`, el paper Live persistente en `live.py` y e
 Comandos Telegram:
 
 ```text
-/backtest_tic ETHUSDT 1h 1000 --tp1 50 --risk-usdt 10 --fee 0
-/tic_live add ETHUSDT 1h 50 10
+/backtest_tic ETHUSDT 1h 1000 --tp1 50 --risk-usdt 10 --fee 0 --sl-candles 5
+/tic_live add ETHUSDT 1h 50 10 5
 /tic_live remove ETHUSDT 1h
 /tic_live list
 /tic_status [ETHUSDT]
 ```
 
-El porcentaje TP1 se configura individualmente en cada backtest o suscripción Live. Live es paper trading y no envía órdenes a Bitunix.
+El porcentaje TP1 y el número de velas para el SL se configuran individualmente en cada backtest o suscripción Live. `--sl-candles` admite 1–200 y por defecto es 2. En Live el formato es `/tic_live add SIMBOLO TF TP1_PCT RIESGO_USDT VELAS_SL`. Live es paper trading y no envía órdenes a Bitunix.
 
 
 ## Paridad con TradingView (corrección V2.1)
@@ -104,3 +104,10 @@ paridad histórica en Live.
 - Una vela que reinicia el canal no puede abrir una operación, aunque su ruptura y su color cumplan los demás filtros.
 - Al ejecutarse TP1 al cierre de una vela de reinicio de canal, el stop de la cantidad restante se mueve al precio de entrada (break-even). El nuevo stop se aplica desde la vela siguiente, no retroactivamente dentro de la vela que ejecutó TP1.
 - El Excel distingue `SL inicial` y `SL actual`, para que el movimiento a break-even no oculte el stop de riesgo original.
+
+### SL configurable (V2.3)
+- Backtest: `--sl-candles N` (alias `--sl-lookback N`), rango 1–200; se incluyen la vela de ruptura y las N-1 velas inmediatamente anteriores.
+- Live: `/tic_live add SYMBOL TF TP1_PCT RISK_USDT N`; el valor se guarda en la configuración de esa suscripción.
+- LONG: SL en el menor `low` de la ventana. SHORT: SL en el mayor `high` de la ventana.
+- Predeterminado: 2 velas, equivalente al stop anterior.
+- El Excel registra el parámetro en Resumen y en cada fila de Operaciones.
