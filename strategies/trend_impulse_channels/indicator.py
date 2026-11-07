@@ -183,3 +183,92 @@ def latest_trend_impulse_channels(*args, **kwargs) -> dict[str, Any]:
     """Devuelve los valores de la última vela, además de la serie completa."""
     series = calculate_trend_impulse_channels(*args, **kwargs)
     return {key: (values[-1] if values else None) for key, values in series.items()}
+
+
+def initialize_incremental_state(opens, highs, lows, closes, **params):
+    """Warm-up once from historical candles and return a compact recursive checkpoint."""
+    series = calculate_trend_impulse_channels(opens, highs, lows, closes, **params)
+    if not closes:
+        return {}, series
+    period = int(params.get('atr_period', DEFAULTS['atr_period']))
+    # Reconstruct the Wilder seed/previous close. After warmup only the latest RMA is needed.
+    tr_values = []
+    for i in range(len(closes)):
+        tr = float(highs[i])-float(lows[i]) if i == 0 else max(
+            float(highs[i])-float(lows[i]),
+            abs(float(highs[i])-float(closes[i-1])),
+            abs(float(lows[i])-float(closes[i-1])))
+        tr_values.append(tr)
+    valid = [x for x in series['atr'] if x is not None]
+    state = {
+        'version': 1, 'count': len(closes), 'prev_close': float(closes[-1]),
+        'atr_count': min(len(tr_values), period),
+        'atr_seed_sum': sum(tr_values[:period]) if len(tr_values) < period else 0.0,
+        'atr': float(valid[-1]) if valid else None,
+        'trend': series['trend'][-1], 'direction': int(series['direction'][-1] or 0),
+        'bars_in_trend': int(series['bars_in_trend'][-1] or 0),
+        'extension': int(series['extension'][-1] or 0),
+        'prev_high': float(highs[-1]), 'prev_low': float(lows[-1]),
+        'prev_upper': series['upper'][-1], 'prev_lower': series['lower'][-1],
+        'prev_trend': series['trend'][-1],
+        'params': {k: params[k] for k in params if k in DEFAULTS},
+    }
+    return state, series
+
+
+def update_incremental_state(state, opens, highs, lows, closes, **overrides):
+    """Append closed candles using the persisted ATR-RMA and Pine recursive trend state."""
+    if not state or state.get('version') != 1:
+        raise ValueError('Estado TIC incremental inexistente o incompatible')
+    p = dict(state.get('params') or {}); p.update(overrides)
+    flip_mult=float(p.get('flip_mult',DEFAULTS['flip_mult'])); max_step_atr=float(p.get('max_step_atr',DEFAULTS['max_step_atr']))
+    band_mult=float(p.get('band_mult',DEFAULTS['band_mult'])); hold_bars=int(p.get('hold_bars',DEFAULTS['hold_bars']))
+    period=int(p.get('atr_period',DEFAULTS['atr_period'])); step_base_mult=float(p.get('step_base_mult',DEFAULTS['step_base_mult']))
+    growth=float(p.get('step_growth_per_bar',DEFAULTS['step_growth_per_bar']))
+    n=len(closes)
+    if not all(len(x)==n for x in (opens,highs,lows)): raise ValueError('OHLC incremental debe tener igual longitud')
+    out={k:[] for k in ('atr','trigger','step_base','max_step','step_size','trend','direction','trend_direction','bars_in_trend','extension','upper','lower','trend_step','lower_retest','upper_retest','bullish_step','bearish_step')}
+    for j in range(n):
+        o,h,lo,c=map(float,(opens[j],highs[j],lows[j],closes[j]))
+        prev_close=state.get('prev_close')
+        tr=(h-lo) if prev_close is None else max(h-lo,abs(h-float(prev_close)),abs(lo-float(prev_close)))
+        atr_count=int(state.get('atr_count',0)); atr=state.get('atr')
+        if atr is None:
+            atr_count += 1
+            seed=float(state.get('atr_seed_sum',0.0))+tr
+            state['atr_seed_sum']=seed
+            if atr_count>=period:
+                atr=seed/period; state['atr_seed_sum']=0.0
+        else:
+            atr=(float(atr)*(period-1)+tr)/period
+        state['atr_count']=atr_count; state['atr']=atr
+        trigger=atr*flip_mult if atr is not None else None
+        step_base=atr*step_base_mult if atr is not None else None
+        max_step=atr*max_step_atr if atr is not None else None
+        step_size=min(step_base+growth*int(state.get('bars_in_trend',0))*atr,max_step) if atr is not None else None
+        trend=state.get('trend'); bars=int(state.get('bars_in_trend',0)); direction=int(state.get('direction',0)); extension=int(state.get('extension',0))
+        trend_for_signal=float(trend) if trend is not None else 0.0
+        start_long=trigger is not None and c>trend_for_signal+trigger
+        start_short=trigger is not None and c<trend_for_signal-trigger
+        flip=(start_long or start_short) and bars>=0
+        if trend is None:
+            trend=c; direction=0; bars=0; extension=0
+        elif flip and extension<=0:
+            trend=c; direction=1 if start_long else -1; bars=1; extension=hold_bars
+        else:
+            trend=(float(trend)+(step_size if direction==1 else -step_size if direction==-1 else 0.0)) if step_size is not None else None
+            bars+=1; extension=max(extension-1,0)
+        upper=trend+atr*band_mult if trend is not None and atr is not None else None
+        lower=trend-atr*band_mult if trend is not None and atr is not None else None
+        prev_trend=state.get('prev_trend'); prev_upper=state.get('prev_upper'); prev_lower=state.get('prev_lower')
+        prev_high=state.get('prev_high'); prev_low=state.get('prev_low')
+        trend_step=bool(trend is not None and prev_trend is not None and direction!=0 and trend!=prev_trend and ((trend>prev_trend and direction==1) or (trend<prev_trend and direction==-1)))
+        crossunder=bool(lower is not None and prev_lower is not None and prev_low is not None and lo<lower and float(prev_low)>=float(prev_lower))
+        crossover=bool(upper is not None and prev_upper is not None and prev_high is not None and h>upper and float(prev_high)<=float(prev_upper))
+        if bool(p.get('trend_filter',DEFAULTS['trend_filter'])):
+            crossunder=crossunder and direction==1; crossover=crossover and direction==-1
+        vals={'atr':atr,'trigger':trigger,'step_base':step_base,'max_step':max_step,'step_size':step_size,'trend':trend,'direction':direction,'trend_direction':direction,'bars_in_trend':bars,'extension':extension,'upper':upper,'lower':lower,'trend_step':trend_step,'lower_retest':bool(crossunder and p.get('show_retest_signals',True)),'upper_retest':bool(crossover and p.get('show_retest_signals',True)),'bullish_step':bool(trend_step and direction==1 and p.get('show_trend_step_signals',False)),'bearish_step':bool(trend_step and direction==-1 and p.get('show_trend_step_signals',False))}
+        for k,v in vals.items(): out[k].append(v)
+        state.update({'prev_close':c,'trend':trend,'direction':direction,'bars_in_trend':bars,'extension':extension,'prev_high':h,'prev_low':lo,'prev_upper':upper,'prev_lower':lower,'prev_trend':trend,'count':int(state.get('count',0))+1})
+    state['params']={**p,'atr_period':period}
+    return out,state

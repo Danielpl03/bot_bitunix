@@ -111,3 +111,28 @@ paridad histórica en Live.
 - LONG: SL en el menor `low` de la ventana. SHORT: SL en el mayor `high` de la ventana.
 - Predeterminado: 2 velas, equivalente al stop anterior.
 - El Excel registra el parámetro en Resumen y en cada fila de Operaciones.
+
+
+## TIC Live: comandos, recuperación y calentamiento persistente
+
+Comandos equivalentes a la supervisión TTR:
+
+- `/tic_live add BTCUSDT 1h 50 10 5` activa/actualiza una suscripción (TP1 %, riesgo USDT, velas SL).
+- `/tic_live list` lista las suscripciones.
+- `/tic_stop BTCUSDT [1h]` o `/tic_live stop BTCUSDT [1h]` detiene nuevas entradas. Si hay operaciones abiertas, la suscripción permanece en supervisión hasta cerrarlas.
+- `/tic_status [BTCUSDT]` muestra estado, posiciones y último valor del indicador.
+- `/tic_history [BTCUSDT]` consulta operaciones.
+- `/tic_stats` muestra estadísticas globales y por símbolo.
+- `/tic_notify BTCUSDT 1h [open|close|tp|stop] [on|off]` configura notificaciones por evento.
+- `/tic_health` comprueba base de datos, monitor y checkpoints.
+- `/tic_restart CONFIRMAR` elimina únicamente configuraciones, checkpoints, operaciones y eventos TIC.
+
+### Calentamiento incremental
+
+La primera activación descarga hasta 10.000 velas cerradas, calcula el indicador una sola vez y persiste un checkpoint compacto (ATR Wilder/RMA, cierre previo, línea de tendencia, dirección, contador de tendencia, extensión y bandas previas), junto con las últimas 200 velas para el SL configurable. Cada vela cerrada posterior actualiza ese checkpoint de forma incremental y lo guarda junto al cursor temporal. Tras un redespliegue se recupera el checkpoint y se procesan las velas cerradas pendientes; las entradas retroactivas se omiten, pero las operaciones ya abiertas siguen procesándose para detectar SL/TP. Si el hueco supera el histórico recuperable, se reconstruye el calentamiento y se registra una advertencia, sin abrir operaciones retroactivas.
+
+Para persistencia entre despliegues de Render, configura `DATABASE_URL` o `SUPABASE_DB_URL` para usar PostgreSQL persistente. SQLite en almacenamiento efímero no garantiza conservar operaciones/checkpoints.
+
+### Excel de backtesting
+
+El Excel está desactivado por defecto. Ejemplo: `/backtest_tic ETHUSDT 1h 1000 --tp1 50`. Para solicitar el archivo: añade `--excel true`. También se admite `--no-excel`. El resumen de resultados se envía siempre por Telegram.
