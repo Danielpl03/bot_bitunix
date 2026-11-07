@@ -105,7 +105,13 @@ BOT_COMMANDS = [
     BotCommand("backtest_rsi", "Backtest RSI por zonas extremas"),
     BotCommand("backtest_tic", "Backtest Trend Impulse Channels Breakout"),
     BotCommand("tic_live", "Paper Live Trend Impulse Channels"),
-    BotCommand("tic_status", "Historial de operaciones Trend Impulse"),
+    BotCommand("tic_stop", "Detener TIC Live sin borrar posiciones"),
+    BotCommand("tic_status", "Estado y operaciones abiertas TIC"),
+    BotCommand("tic_history", "Historial global o por símbolo TIC"),
+    BotCommand("tic_stats", "Estadísticas globales y por símbolo TIC"),
+    BotCommand("tic_notify", "Configurar notificaciones TIC"),
+    BotCommand("tic_health", "Salud del monitor y checkpoints TIC"),
+    BotCommand("tic_restart", "Borrar y reiniciar TIC Live desde cero"),
     BotCommand("backtest_squeeze", "Backtest Squeeze Bollinger + Keltner"),
     BotCommand("backtest_dual_thrust", "Backtest ruptura de rango Dual Thrust"),
     BotCommand("backtest_ttr", "Backtest TTR Pine v6 con TP parciales y reversiones"),
@@ -2475,6 +2481,12 @@ def main() -> None:
     application.add_handler(CommandHandler("backtest_tic", backtest_tic_command))
     application.add_handler(CommandHandler("tic_live", tic_live_command))
     application.add_handler(CommandHandler("tic_status", tic_status_command))
+    application.add_handler(CommandHandler("tic_stop", tic_stop_command))
+    application.add_handler(CommandHandler("tic_history", tic_history_command))
+    application.add_handler(CommandHandler("tic_stats", tic_stats_command))
+    application.add_handler(CommandHandler("tic_notify", tic_notify_command))
+    application.add_handler(CommandHandler("tic_health", tic_health_command))
+    application.add_handler(CommandHandler("tic_restart", tic_restart_command))
     application.add_handler(CommandHandler("backtest_squeeze", backtest_squeeze_command))
     application.add_handler(CommandHandler("backtest_dual_thrust", backtest_dual_thrust_command))
     application.add_handler(CommandHandler("backtest_ttr", backtest_ttr_command))
@@ -2558,10 +2570,15 @@ async def backtest_tic_command(update: Update, context: ContextTypes.DEFAULT_TYP
     """Backtest Trend Impulse Channels breakout con TP1 configurable."""
     from strategies.trend_impulse_channels.engine import run_backtest, summarize
     from strategies.trend_impulse_channels.xlsx_export import build_workbook
-    raw=list(context.args); positional=[]; opts={'tp1_pct':50.0,'risk_usdt':10.0,'fee_pct':0.0,'sl_candles':2}; keys={'--tp1':'tp1_pct','--tp1-pct':'tp1_pct','--risk-usdt':'risk_usdt','--fee':'fee_pct','--sl-candles':'sl_candles','--sl-lookback':'sl_candles'}; i=0
+    raw=list(context.args); positional=[]; opts={'tp1_pct':50.0,'risk_usdt':10.0,'fee_pct':0.0,'sl_candles':2,'excel':False}; keys={'--tp1':'tp1_pct','--tp1-pct':'tp1_pct','--risk-usdt':'risk_usdt','--fee':'fee_pct','--sl-candles':'sl_candles','--sl-lookback':'sl_candles'}; i=0
     try:
         while i<len(raw):
-            if raw[i].lower() in keys:
+            if raw[i].lower()=='--excel':
+                if i+1<len(raw) and raw[i+1].lower() in ('true','false','on','off','yes','no'):
+                    opts['excel']=raw[i+1].lower() in ('true','on','yes');i+=2
+                else: opts['excel']=True;i+=1
+            elif raw[i].lower()=='--no-excel': opts['excel']=False;i+=1
+            elif raw[i].lower() in keys:
                 if i+1>=len(raw):raise ValueError(f'Falta valor para {raw[i]}')
                 opts[keys[raw[i].lower()]]=float(raw[i+1]);i+=2
             else:positional.append(raw[i]);i+=1
@@ -2569,7 +2586,7 @@ async def backtest_tic_command(update: Update, context: ContextTypes.DEFAULT_TYP
         if not 0<opts['tp1_pct']<100 or opts['risk_usdt']<=0 or opts['fee_pct']<0 or not 1<=int(opts['sl_candles'])<=200 or int(opts['sl_candles'])!=opts['sl_candles']:raise ValueError('TP1 debe estar entre 0 y 100; riesgo > 0; comisión >= 0; --sl-candles entre 1 y 200')
         if req.interval not in VALID_INTERVALS:raise ValueError(f'Intervalo no válido: {req.interval}')
     except ValueError as exc:
-        await update.message.reply_text('Uso: /backtest_tic SIMBOLO INTERVALO VELAS [--tp1 50] [--risk-usdt 10] [--fee 0] [--sl-candles 2]\n'+str(exc));return
+        await update.message.reply_text('Uso: /backtest_tic SIMBOLO INTERVALO VELAS [--tp1 50] [--risk-usdt 10] [--fee 0] [--sl-candles 2] [--excel true]\n'+str(exc));return
     await update.message.reply_text(f'Descargando histórico Trend Impulse Breakout de {req.symbol} ({req.interval})…')
     try:
         if req.is_date_range:
@@ -2592,38 +2609,115 @@ async def backtest_tic_command(update: Update, context: ContextTypes.DEFAULT_TYP
         trades=[t for t in trades if signal_start is None or signal_start<=t.signal_time<=signal_end]
         st=summarize(trades)
         await update.message.reply_text(f"""Trend Impulse Breakout · {req.symbol} {req.interval}\nTP1: {opts['tp1_pct']:g}% · TP2: resto en banda nueva · SL: extremo de {int(opts['sl_candles'])} velas · Riesgo: {opts['risk_usdt']:g} USDT\nOperaciones: {st['total']} · TP1: {st['tp1']} · TP2: {st['tp2']} · SL: {st['sl']} · abiertas: {st['open']}\nPnL: {st['pnl_usdt']:+.4f} USDT""")
-        wb=build_workbook(req.symbol,req.interval,klines,trades,tp1_pct=opts['tp1_pct'],risk_usdt=opts['risk_usdt'],fee_pct=opts['fee_pct'],indicator=ind,sl_candles=int(opts['sl_candles']))
-        await update.message.reply_document(document=wb,filename=f'backtest_tic_{req.symbol}_{req.interval}_{datetime.now(timezone.utc):%Y%m%d_%H%M}.xlsx')
+        if opts['excel']:
+            wb=build_workbook(req.symbol,req.interval,klines,trades,tp1_pct=opts['tp1_pct'],risk_usdt=opts['risk_usdt'],fee_pct=opts['fee_pct'],indicator=ind,sl_candles=int(opts['sl_candles']))
+            await update.message.reply_document(document=wb,filename=f'backtest_tic_{req.symbol}_{req.interval}_{datetime.now(timezone.utc):%Y%m%d_%H%M}.xlsx')
+        else:
+            await update.message.reply_text('Excel omitido (opción por defecto). Añade --excel true para recibir el informe.')
     except Exception as exc:
         logger.exception('Error backtest TIC');await update.message.reply_text(f'Error en backtest Trend Impulse: {exc}')
 
 async def tic_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Paper Live: /tic_live add|remove SYMBOL TF [TP1_PCT] [RISK_USDT] | list"""
+    """Paper Live TIC: add|remove|stop SYMBOL TF [TP1_PCT] [RISK_USDT] [SL_CANDLES]."""
+    if not _is_authorized(update):
+        await update.message.reply_text("No autorizado."); return
     from strategies.trend_impulse_channels.live import STORE, TF_MS
     a=list(context.args)
     if not a or a[0].lower()=='help':
-        await update.message.reply_text('Trend Impulse Channels Live (paper, sin órdenes reales):\n/tic_live add BTCUSDT 1h 50 [10] [2]  (TP1%, riesgo USDT, velas SL)\n/tic_live remove BTCUSDT 1h\n/tic_live list\nTP1 es porcentaje liquidado; TP2 liquida el resto en la banda del canal nuevo. El último argumento es la cantidad de velas para calcular el SL (1–200; incluye la vela de ruptura).');return
+        await update.message.reply_text('TIC Live (paper, sin órdenes reales):\n/tic_live add BTCUSDT 1h 50 [10] [2]\n/tic_live list\n/tic_live stop BTCUSDT [1h]\n/tic_stop BTCUSDT [1h]\n/tic_status [BTCUSDT]\n/tic_history [BTCUSDT]\n/tic_stats\n/tic_notify BTCUSDT 1h [open|close|tp|stop] [on|off]\n/tic_health\n/tic_restart CONFIRMAR'); return
     action=a[0].lower()
     if action=='list':
-        rows=await asyncio.to_thread(STORE.status);await update.message.reply_text('\n'.join(f'{x["symbol"]} {x["interval"]} · {"ACTIVO" if x["enabled"] else "DETENIDO"} · {json.loads(x["config"]).get("tp1_pct",50):g}% TP1 · SL {json.loads(x["config"]).get("sl_candles",2)} velas' for x in rows) or 'No hay suscripciones TIC.');return
-    if len(a)<3 or action not in ('add','remove'):
-        await update.message.reply_text('Uso: /tic_live add|remove SIMBOLO TF [TP1_PCT] [RIESGO_USDT] [VELAS_SL]');return
+        rows=await asyncio.to_thread(STORE.status)
+        await update.message.reply_text('\n'.join(f"{x['symbol']} {x['interval']} · {'ACTIVO' if x['enabled'] else 'DETENIDO'} · {json.loads(x['config']).get('tp1_pct',50):g}% TP1 · SL {json.loads(x['config']).get('sl_candles',2)} velas · última vela {x.get('last_bar_time') or 'calentando'}" for x in rows) or 'No hay suscripciones TIC.');return
+    if action in ('stop','remove'):
+        if len(a)<2: await update.message.reply_text('Uso: /tic_live stop SIMBOLO [TF]');return
+        sym=_normalize_symbol(a[1]);tf=a[2].lower() if len(a)>2 else None
+        if tf and tf not in TF_MS: await update.message.reply_text('Temporalidad no soportada.');return
+        await asyncio.to_thread(STORE.unsubscribe,sym,tf)
+        await update.message.reply_text(f'⏹ TIC detenido para {sym}'+(f' {tf}' if tf else '')+'. Las posiciones abiertas se siguen supervisando hasta cerrarse; historial y checkpoint conservados.');return
+    if action!='add' or len(a)<3:
+        await update.message.reply_text('Uso: /tic_live add SIMBOLO TF [TP1_PCT] [RIESGO_USDT] [VELAS_SL]');return
     sym=_normalize_symbol(a[1]);tf=a[2].lower()
-    if tf not in TF_MS:await update.message.reply_text('Temporalidad no soportada.');return
-    if action=='remove':await asyncio.to_thread(STORE.unsubscribe,sym,tf);await update.message.reply_text(f'TIC Live detenido para {sym} {tf}.');return
-    try:tpct=float(a[3]) if len(a)>3 else 50.0;risk=float(a[4]) if len(a)>4 else 10.0;sl_candles=int(a[5]) if len(a)>5 else 2
-    except ValueError:await update.message.reply_text('TP1 y riesgo deben ser números.');return
-    if not 0<tpct<100 or risk<=0 or not 1<=sl_candles<=200:await update.message.reply_text('TP1 debe estar entre 0 y 100, riesgo > 0 y velas SL entre 1 y 200.');return
-    await asyncio.to_thread(STORE.subscribe,sym,tf,update.effective_chat.id,{'tp1_pct':tpct,'risk_usdt':risk,'sl_candles':sl_candles})
-    await update.message.reply_text(f'✅ TIC Live activado: {sym} {tf}\nTP1 {tpct:g}% · TP2 resto · riesgo {risk:g} USDT · SL: {sl_candles} velas. Paper trading; no envía órdenes.')
+    if tf not in TF_MS: await update.message.reply_text('Temporalidad no soportada.');return
+    try: tpct=float(a[3]) if len(a)>3 else 50.0; risk=float(a[4]) if len(a)>4 else 10.0; sln=int(a[5]) if len(a)>5 else 2
+    except ValueError: await update.message.reply_text('TP1, riesgo y velas SL deben ser números válidos.');return
+    if not 0<tpct<100 or risk<=0 or not 1<=sln<=200: await update.message.reply_text('TP1 debe estar entre 0 y 100, riesgo > 0 y velas SL entre 1 y 200.');return
+    existing=await asyncio.to_thread(STORE.get_config,sym,tf)
+    await asyncio.to_thread(STORE.subscribe,sym,tf,update.effective_chat.id,{'tp1_pct':tpct,'risk_usdt':risk,'sl_candles':sln})
+    await update.message.reply_text(f"✅ TIC Live {'actualizado' if existing else 'activado'}: {sym} {tf}\nTP1 {tpct:g}% · TP2 resto · riesgo {risk:g} USDT · SL {sln} velas. Se conservan operaciones abiertas y calentamiento persistido. Paper trading.")
+
+async def tic_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update): await update.message.reply_text('No autorizado.'); return
+    from strategies.trend_impulse_channels.live import STORE, TF_MS
+    if not context.args: await update.message.reply_text('Uso: /tic_stop SIMBOLO [TF]'); return
+    sym=_normalize_symbol(context.args[0]);tf=context.args[1].lower() if len(context.args)>1 else None
+    if tf and tf not in TF_MS: await update.message.reply_text('Temporalidad no soportada.'); return
+    await asyncio.to_thread(STORE.unsubscribe,sym,tf)
+    await update.message.reply_text(f'⏹ TIC detenido para {sym}'+(f' {tf}' if tf else '')+'. Las posiciones abiertas continúan bajo supervisión; no se borró ningún dato.')
 
 async def tic_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update): await update.message.reply_text('No autorizado.'); return
     from strategies.trend_impulse_channels.live import STORE
-    a=list(context.args);rows=await asyncio.to_thread(STORE.history,a[0].upper() if a else None)
-    if not rows:await update.message.reply_text('No hay operaciones TIC.');return
-    lines=[]
-    for t in rows[:20]:lines.append(f'#{t["id"]} {t["symbol"]} {t["interval"]} {t["side"]} {t["status"]} · entrada {t["entry_price"]:.8g} · SL {t["stop_price"]:.8g} · PnL {t["pnl_usdt"]:+.4f}')
+    sym=_normalize_symbol(context.args[0]) if context.args else None
+    rows=await asyncio.to_thread(STORE.status); rows=[r for r in rows if not sym or r['symbol']==sym]
+    if not rows: await update.message.reply_text('No hay configuraciones TIC.'); return
+    lines=['📡 TIC Live · estado']
+    for r in rows:
+        cfg=json.loads(r.get('config') or '{}'); ind=json.loads(r.get('last_indicator') or '{}'); trades=await asyncio.to_thread(STORE.open_trades,r['symbol'],r['interval'])
+        lines.append(f"{r['symbol']} {r['interval']} · {'ACTIVO' if r['enabled'] else ('SUPERVISANDO POSICIONES' if trades else 'DETENIDO')} · abiertas {len(trades)}")
+        lines.append(f"TP1 {cfg.get('tp1_pct',50):g}% · riesgo {cfg.get('risk_usdt',10):g} USDT · SL {cfg.get('sl_candles',2)} velas")
+        lines.append(f"Trend {ind.get('trend','N/D')} · Upper {ind.get('upper','N/D')} · Lower {ind.get('lower','N/D')} · dirección {ind.get('direction','N/D')}")
+        lines.append(f"Última vela UTC: {r.get('last_bar_time') or 'calentando'}")
+        for t in trades: lines.append(f"  #{t['id']} {t['side']} entrada {t['entry_price']:.8g} · SL {t['stop_price']:.8g} · restante {t['remaining_qty']:.8g}")
     await update.message.reply_text('\n'.join(lines))
+
+async def tic_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update): await update.message.reply_text('No autorizado.'); return
+    from strategies.trend_impulse_channels.live import STORE
+    sym=_normalize_symbol(context.args[0]) if context.args else None; rows=await asyncio.to_thread(STORE.history,sym,None,100)
+    if not rows: await update.message.reply_text('No hay operaciones TIC en el historial.'); return
+    lines=['📚 TIC · historial']
+    for t in rows[:40]: lines.append(f"#{t['id']} {t['symbol']} {t['interval']} {t['side']} {t['status']} · entrada {t['entry_price']:.8g} · salida {t.get('exit_price') or '—'} · PnL {t['pnl_usdt']:+.4f} USDT")
+    await update.message.reply_text('\n'.join(lines))
+
+async def tic_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update): await update.message.reply_text('No autorizado.'); return
+    from strategies.trend_impulse_channels.live import STORE
+    data=await asyncio.to_thread(STORE.stats); o=data['overall']; lines=['📊 TIC · estadísticas globales',f"Operaciones {o['total']} · abiertas {o['open']} · cerradas {o['closed']}",f"Acierto {o['win_rate']:.2f}% · ganadoras {o['wins']} · PnL {o['pnl']:+.4f} USDT"]
+    for sym,m in data['by_symbol'].items(): lines.append(f"{sym}: {m['total']} ops · {m['win_rate']:.1f}% acierto · {m['pnl']:+.4f} USDT · abiertas {m['open']}")
+    await update.message.reply_text('\n'.join(lines))
+
+async def tic_notify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update): await update.message.reply_text('No autorizado.'); return
+    from strategies.trend_impulse_channels.live import STORE
+    a=list(context.args)
+    if len(a)<2: await update.message.reply_text('Uso: /tic_notify SIMBOLO TF [open|close|tp|stop] [on|off]'); return
+    sym=_normalize_symbol(a[0]);tf=a[1].lower();row=await asyncio.to_thread(STORE.get_config,sym,tf)
+    if not row: await update.message.reply_text('TIC no está configurado para ese símbolo/temporalidad.'); return
+    prefs=json.loads(row.get('config') or '{}')
+    if len(a)==2:
+        await update.message.reply_text('Notificaciones TIC '+sym+' '+tf+'\n'+'\n'.join(f"{k}: {'ACTIVADA' if prefs.get(v,True) else 'DESACTIVADA'}" for k,v in [('open','notify_open'),('close','notify_close'),('tp','notify_tp'),('stop','notify_stop')]));return
+    if len(a)!=4 or a[2].lower() not in ('open','close','tp','stop') or a[3].lower() not in ('on','off'): await update.message.reply_text('Categorías: open, close, tp, stop; valores: on, off.');return
+    await asyncio.to_thread(STORE.set_notification,sym,tf,a[2].lower(),a[3].lower()=='on')
+    await update.message.reply_text(f"Notificación {a[2].lower()} para {sym} {tf}: {a[3].upper()}")
+
+async def tic_health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update): await update.message.reply_text('No autorizado.'); return
+    from strategies.trend_impulse_channels.live import STORE
+    try:
+        rows=await asyncio.to_thread(STORE.status); configs=await asyncio.to_thread(STORE.configs); opened=0
+        for r in configs: opened += len(await asyncio.to_thread(STORE.open_trades,r['symbol'],r['interval']))
+        warm=sum(bool(json.loads(r.get('indicator_state') or '{}').get('version')==1) for r in rows)
+        await update.message.reply_text(f"TIC health: OK\nConfiguraciones: {len(rows)} · monitorizables: {len(configs)} · operaciones abiertas: {opened}\nCheckpoints de indicador: {warm}/{len(rows)}\nBase de datos: {STORE.db.backend.upper()}\nCalentamiento inicial: hasta 10.000 velas; estado incremental persistido.")
+    except Exception as exc: await update.message.reply_text(f'TIC health ERROR: {exc}')
+
+async def tic_restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_authorized(update): await update.message.reply_text('No autorizado.'); return
+    if len(context.args)!=1 or context.args[0].upper()!='CONFIRMAR':
+        await update.message.reply_text('⚠️ Elimina todas las suscripciones TIC, checkpoints, posiciones, operaciones e históricos TIC. No afecta TTR ni RSI. Confirma con /tic_restart CONFIRMAR'); return
+    from strategies.trend_impulse_channels.live import STORE
+    await asyncio.to_thread(STORE.reset_all)
+    await update.message.reply_text('♻️ TIC Live reiniciado desde cero: se eliminaron configuraciones, checkpoints, operaciones, eventos e históricos TIC. TTR y RSI no se modificaron.')
 
 
 if __name__ == "__main__":
