@@ -145,3 +145,7 @@ El Excel está desactivado por defecto. Ejemplo: `/backtest_tic ETHUSDT 1h 1000 
 - `/tic_status` identifica el timestamp de apertura de la última vela cerrada procesada y advierte si la API todavía no ha entregado la vela que acaba de cerrar.
 - La regla de breakout queda explícita: LONG requiere perforación de banda superior y cierre alcista; SHORT requiere perforación de banda inferior y cierre bajista. Una vela alcista que perfore la banda inferior no puede abrir SHORT.
 - La migración añade `activation_time` sin borrar configuraciones, checkpoints, operaciones ni eventos existentes.
+
+
+### V2.6 — fuente de velas
+TIC Live obtiene el histórico reciente sin pasar `endTime` a Bitunix y filtra localmente las velas cerradas. Esto evita que el límite de la API excluya la última vela por confundir el timestamp de apertura con el límite temporal del endpoint.

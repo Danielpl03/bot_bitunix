@@ -12,6 +12,18 @@ def entry_candle_is_eligible(bar_open_time:int, interval_ms:int, activation_time
  """Only allow a fresh signal on the just-closed candle after activation."""
  return int(bar_open_time)==int(expected_latest_open) and int(bar_open_time)+int(interval_ms)>int(activation_time)
 
+def fetch_closed_candles(client, symbol:str, interval:str, *, total:int, now_ms:int, start_time:int|None=None):
+ """Fetch the newest history without an API endTime cursor, then filter locally.
+
+ Bitunix's endTime boundary can exclude the candle whose OPEN timestamp equals
+ the expected latest closed bar. Passing our open-time boundary as endTime can
+ therefore leave the indicator one full candle behind.
+ """
+ width=TF_MS[interval]
+ rows=client.get_kline_history(symbol, interval, total=total, start_time=start_time)
+ latest_closed_open=(int(now_ms)//width)*width-width
+ return [x for x in rows if int(x['time'])<=latest_closed_open and int(x['time'])+width<=int(now_ms)]
+
 def breakout_entry_side(open_price, high, low, close, upper, lower):
  """TIC breakout: band penetration AND candle close in breakout direction."""
  if upper is not None and high>upper and close>open_price: return 'LONG'
@@ -115,8 +127,7 @@ async def monitor_subscription(context,cfg,client,store=STORE):
  saved_state=json.loads(cfg.get('indicator_state') or '{}')
  # First activation: warm up once on a deep history and persist the recursive checkpoint.
  if not saved_state or saved_state.get('version')!=1:
-  rows=await asyncio.to_thread(client.get_kline_history,sym,tf,total=WARMUP_CANDLES,end_time=closed_boundary)
-  bars=[x for x in rows if int(x['time'])+width<=now]
+  bars=await asyncio.to_thread(fetch_closed_candles,client,sym,tf,total=WARMUP_CANDLES,now_ms=now)
   if len(bars)<202:return
   arrays=[[float(x[k]) for x in bars] for k in ('open','high','low','close')]
   state,series=initialize_incremental_state(*arrays,**{})
@@ -126,8 +137,8 @@ async def monitor_subscription(context,cfg,client,store=STORE):
   log.info('TIC warmup completed %s %s: %s candles, checkpoint persisted',sym,tf,len(bars))
   return
  # Fetch only bars newer than checkpoint. If downtime is long, API pagination fills the gap (up to 10k).
- rows=await asyncio.to_thread(client.get_kline_history,sym,tf,total=WARMUP_CANDLES,start_time=last+1,end_time=closed_boundary)
- bars=[x for x in rows if int(x['time'])>last and int(x['time'])+width<=now]
+ bars=await asyncio.to_thread(fetch_closed_candles,client,sym,tf,total=WARMUP_CANDLES,start_time=last+1,now_ms=now)
+ bars=[x for x in bars if int(x['time'])>last]
  if not bars:return
  recent=list(saved_state.pop('recent_bars',[]) or [])
  if recent and int(recent[-1]['time'])!=last:
@@ -137,8 +148,7 @@ async def monitor_subscription(context,cfg,client,store=STORE):
  expected=last+width
  if int(bars[0]['time'])>expected:
   log.warning('TIC history gap %s %s: expected %s got %s; rebuilding warmup and skipping offline events',sym,tf,expected,bars[0]['time'])
-  warm=await asyncio.to_thread(client.get_kline_history,sym,tf,total=WARMUP_CANDLES,end_time=closed_boundary)
-  warm=[x for x in warm if int(x['time'])+width<=now]
+  warm=await asyncio.to_thread(fetch_closed_candles,client,sym,tf,total=WARMUP_CANDLES,now_ms=now)
   if len(warm)>=202:
    arrays=[[float(x[k]) for x in warm] for k in ('open','high','low','close')]
    rebuilt,series=initialize_incremental_state(*arrays)
