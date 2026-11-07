@@ -2657,7 +2657,7 @@ async def tic_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def tic_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_authorized(update): await update.message.reply_text('No autorizado.'); return
-    from strategies.trend_impulse_channels.live import STORE
+    from strategies.trend_impulse_channels.live import STORE, TF_MS
     sym=_normalize_symbol(context.args[0]) if context.args else None
     rows=await asyncio.to_thread(STORE.status); rows=[r for r in rows if not sym or r['symbol']==sym]
     if not rows: await update.message.reply_text('No hay configuraciones TIC.'); return
@@ -2667,7 +2667,12 @@ async def tic_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append(f"{r['symbol']} {r['interval']} · {'ACTIVO' if r['enabled'] else ('SUPERVISANDO POSICIONES' if trades else 'DETENIDO')} · abiertas {len(trades)}")
         lines.append(f"TP1 {cfg.get('tp1_pct',50):g}% · riesgo {cfg.get('risk_usdt',10):g} USDT · SL {cfg.get('sl_candles',2)} velas")
         lines.append(f"Trend {ind.get('trend','N/D')} · Upper {ind.get('upper','N/D')} · Lower {ind.get('lower','N/D')} · dirección {ind.get('direction','N/D')}")
-        lines.append(f"Última vela UTC: {r.get('last_bar_time') or 'calentando'}")
+        last_bar=int(r.get('last_bar_time') or 0)
+        lines.append(f"Última vela cerrada UTC (apertura): {last_bar or 'calentando'}")
+        width=TF_MS.get(r['interval'],0)
+        expected=(int(time.time()*1000)//width)*width-width if width else 0
+        if expected and last_bar and last_bar < expected:
+            lines.append(f"⚠️ Indicador pendiente: la API aún no entrega la última vela cerrada ({expected}); se bloquean entradas retroactivas.")
         for t in trades: lines.append(f"  #{t['id']} {t['side']} entrada {t['entry_price']:.8g} · SL {t['stop_price']:.8g} · restante {t['remaining_qty']:.8g}")
     await update.message.reply_text('\n'.join(lines))
 
