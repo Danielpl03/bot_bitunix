@@ -2558,7 +2558,7 @@ async def backtest_tic_command(update: Update, context: ContextTypes.DEFAULT_TYP
     """Backtest Trend Impulse Channels breakout con TP1 configurable."""
     from strategies.trend_impulse_channels.engine import run_backtest, summarize
     from strategies.trend_impulse_channels.xlsx_export import build_workbook
-    raw=list(context.args); positional=[]; opts={'tp1_pct':50.0,'risk_usdt':10.0,'fee_pct':0.0}; keys={'--tp1':'tp1_pct','--tp1-pct':'tp1_pct','--risk-usdt':'risk_usdt','--fee':'fee_pct'}; i=0
+    raw=list(context.args); positional=[]; opts={'tp1_pct':50.0,'risk_usdt':10.0,'fee_pct':0.0,'sl_candles':2}; keys={'--tp1':'tp1_pct','--tp1-pct':'tp1_pct','--risk-usdt':'risk_usdt','--fee':'fee_pct','--sl-candles':'sl_candles','--sl-lookback':'sl_candles'}; i=0
     try:
         while i<len(raw):
             if raw[i].lower() in keys:
@@ -2566,10 +2566,10 @@ async def backtest_tic_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 opts[keys[raw[i].lower()]]=float(raw[i+1]);i+=2
             else:positional.append(raw[i]);i+=1
         req=parse_backtest_request(positional,normalize_symbol=_normalize_symbol,default_interval='1h',max_candles=BACKTEST_MAX_CANDLES)
-        if not 0<opts['tp1_pct']<100 or opts['risk_usdt']<=0 or opts['fee_pct']<0:raise ValueError('TP1 debe estar entre 0 y 100; riesgo > 0 y comisión >= 0')
+        if not 0<opts['tp1_pct']<100 or opts['risk_usdt']<=0 or opts['fee_pct']<0 or not 1<=int(opts['sl_candles'])<=200 or int(opts['sl_candles'])!=opts['sl_candles']:raise ValueError('TP1 debe estar entre 0 y 100; riesgo > 0; comisión >= 0; --sl-candles entre 1 y 200')
         if req.interval not in VALID_INTERVALS:raise ValueError(f'Intervalo no válido: {req.interval}')
     except ValueError as exc:
-        await update.message.reply_text('Uso: /backtest_tic SIMBOLO INTERVALO VELAS [--tp1 50] [--risk-usdt 10] [--fee 0]\n'+str(exc));return
+        await update.message.reply_text('Uso: /backtest_tic SIMBOLO INTERVALO VELAS [--tp1 50] [--risk-usdt 10] [--fee 0] [--sl-candles 2]\n'+str(exc));return
     await update.message.reply_text(f'Descargando histórico Trend Impulse Breakout de {req.symbol} ({req.interval})…')
     try:
         if req.is_date_range:
@@ -2588,11 +2588,11 @@ async def backtest_tic_command(update: Update, context: ContextTypes.DEFAULT_TYP
             signal_start=int(klines[max(0,len(klines)-(req.candle_count or 500))]['time'])
             signal_end=int(klines[-1]['time'])
         o=[float(x['open']) for x in klines];h=[float(x['high']) for x in klines];l=[float(x['low']) for x in klines];c=[float(x['close']) for x in klines];ts=[int(x['time']) for x in klines]
-        trades,ind=run_backtest(o,h,l,c,ts,tp1_pct=opts['tp1_pct'],risk_usdt=opts['risk_usdt'],fee_pct=opts['fee_pct'])
+        trades,ind=run_backtest(o,h,l,c,ts,tp1_pct=opts['tp1_pct'],risk_usdt=opts['risk_usdt'],fee_pct=opts['fee_pct'],sl_candles=int(opts['sl_candles']))
         trades=[t for t in trades if signal_start is None or signal_start<=t.signal_time<=signal_end]
         st=summarize(trades)
-        await update.message.reply_text(f'Trend Impulse Breakout · {req.symbol} {req.interval}\nTP1: {opts["tp1_pct"]:g}% · TP2: resto en banda nueva · Riesgo: {opts["risk_usdt"]:g} USDT\nOperaciones: {st["total"]} · TP1: {st["tp1"]} · TP2: {st["tp2"]} · SL: {st["sl"]} · abiertas: {st["open"]}\nPnL: {st["pnl_usdt"]:+.4f} USDT')
-        wb=build_workbook(req.symbol,req.interval,klines,trades,tp1_pct=opts['tp1_pct'],risk_usdt=opts['risk_usdt'],fee_pct=opts['fee_pct'],indicator=ind)
+        await update.message.reply_text(f"""Trend Impulse Breakout · {req.symbol} {req.interval}\nTP1: {opts['tp1_pct']:g}% · TP2: resto en banda nueva · SL: extremo de {int(opts['sl_candles'])} velas · Riesgo: {opts['risk_usdt']:g} USDT\nOperaciones: {st['total']} · TP1: {st['tp1']} · TP2: {st['tp2']} · SL: {st['sl']} · abiertas: {st['open']}\nPnL: {st['pnl_usdt']:+.4f} USDT""")
+        wb=build_workbook(req.symbol,req.interval,klines,trades,tp1_pct=opts['tp1_pct'],risk_usdt=opts['risk_usdt'],fee_pct=opts['fee_pct'],indicator=ind,sl_candles=int(opts['sl_candles']))
         await update.message.reply_document(document=wb,filename=f'backtest_tic_{req.symbol}_{req.interval}_{datetime.now(timezone.utc):%Y%m%d_%H%M}.xlsx')
     except Exception as exc:
         logger.exception('Error backtest TIC');await update.message.reply_text(f'Error en backtest Trend Impulse: {exc}')
@@ -2602,20 +2602,20 @@ async def tic_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     from strategies.trend_impulse_channels.live import STORE, TF_MS
     a=list(context.args)
     if not a or a[0].lower()=='help':
-        await update.message.reply_text('Trend Impulse Channels Live (paper, sin órdenes reales):\n/tic_live add BTCUSDT 1h 50 [10]\n/tic_live remove BTCUSDT 1h\n/tic_live list\nTP1 es porcentaje liquidado; TP2 liquida el resto en la banda del canal nuevo.');return
+        await update.message.reply_text('Trend Impulse Channels Live (paper, sin órdenes reales):\n/tic_live add BTCUSDT 1h 50 [10] [2]  (TP1%, riesgo USDT, velas SL)\n/tic_live remove BTCUSDT 1h\n/tic_live list\nTP1 es porcentaje liquidado; TP2 liquida el resto en la banda del canal nuevo. El último argumento es la cantidad de velas para calcular el SL (1–200; incluye la vela de ruptura).');return
     action=a[0].lower()
     if action=='list':
-        rows=await asyncio.to_thread(STORE.status);await update.message.reply_text('\n'.join(f'{x["symbol"]} {x["interval"]} · {"ACTIVO" if x["enabled"] else "DETENIDO"} · {json.loads(x["config"]).get("tp1_pct",50):g}% TP1' for x in rows) or 'No hay suscripciones TIC.');return
+        rows=await asyncio.to_thread(STORE.status);await update.message.reply_text('\n'.join(f'{x["symbol"]} {x["interval"]} · {"ACTIVO" if x["enabled"] else "DETENIDO"} · {json.loads(x["config"]).get("tp1_pct",50):g}% TP1 · SL {json.loads(x["config"]).get("sl_candles",2)} velas' for x in rows) or 'No hay suscripciones TIC.');return
     if len(a)<3 or action not in ('add','remove'):
-        await update.message.reply_text('Uso: /tic_live add|remove SIMBOLO TF [TP1_PCT] [RIESGO_USDT]');return
+        await update.message.reply_text('Uso: /tic_live add|remove SIMBOLO TF [TP1_PCT] [RIESGO_USDT] [VELAS_SL]');return
     sym=_normalize_symbol(a[1]);tf=a[2].lower()
     if tf not in TF_MS:await update.message.reply_text('Temporalidad no soportada.');return
     if action=='remove':await asyncio.to_thread(STORE.unsubscribe,sym,tf);await update.message.reply_text(f'TIC Live detenido para {sym} {tf}.');return
-    try:tpct=float(a[3]) if len(a)>3 else 50.0;risk=float(a[4]) if len(a)>4 else 10.0
+    try:tpct=float(a[3]) if len(a)>3 else 50.0;risk=float(a[4]) if len(a)>4 else 10.0;sl_candles=int(a[5]) if len(a)>5 else 2
     except ValueError:await update.message.reply_text('TP1 y riesgo deben ser números.');return
-    if not 0<tpct<100 or risk<=0:await update.message.reply_text('TP1 debe estar entre 0 y 100 y riesgo > 0.');return
-    await asyncio.to_thread(STORE.subscribe,sym,tf,update.effective_chat.id,{'tp1_pct':tpct,'risk_usdt':risk})
-    await update.message.reply_text(f'✅ TIC Live activado: {sym} {tf}\nTP1 {tpct:g}% · TP2 resto · riesgo {risk:g} USDT. Paper trading; no envía órdenes.')
+    if not 0<tpct<100 or risk<=0 or not 1<=sl_candles<=200:await update.message.reply_text('TP1 debe estar entre 0 y 100, riesgo > 0 y velas SL entre 1 y 200.');return
+    await asyncio.to_thread(STORE.subscribe,sym,tf,update.effective_chat.id,{'tp1_pct':tpct,'risk_usdt':risk,'sl_candles':sl_candles})
+    await update.message.reply_text(f'✅ TIC Live activado: {sym} {tf}\nTP1 {tpct:g}% · TP2 resto · riesgo {risk:g} USDT · SL: {sl_candles} velas. Paper trading; no envía órdenes.')
 
 async def tic_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from strategies.trend_impulse_channels.live import STORE
