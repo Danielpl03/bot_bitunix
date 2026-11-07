@@ -8,17 +8,27 @@ TF_MS={'1m':60_000,'3m':180_000,'5m':300_000,'15m':900_000,'30m':1_800_000,'1h':
 WARMUP_CANDLES=10000
 RECENT_CANDLES=200
 
+def entry_candle_is_eligible(bar_open_time:int, interval_ms:int, activation_time:int, expected_latest_open:int)->bool:
+ """Only allow a fresh signal on the just-closed candle after activation."""
+ return int(bar_open_time)==int(expected_latest_open) and int(bar_open_time)+int(interval_ms)>int(activation_time)
+
+def breakout_entry_side(open_price, high, low, close, upper, lower):
+ """TIC breakout: band penetration AND candle close in breakout direction."""
+ if upper is not None and high>upper and close>open_price: return 'LONG'
+ if lower is not None and low<lower and close<open_price: return 'SHORT'
+ return None
+
 class TICLiveStore:
  def __init__(self,db=DB):
   self.db=db
   if db.backend=='sqlite':
    ddl=[
-    "CREATE TABLE IF NOT EXISTS tic_live_config(symbol TEXT NOT NULL, interval TEXT NOT NULL, chat_id INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, config TEXT NOT NULL, last_bar_time INTEGER, updated_at INTEGER NOT NULL, indicator_state TEXT NOT NULL DEFAULT '{}', last_indicator TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(symbol,interval))",
+    "CREATE TABLE IF NOT EXISTS tic_live_config(symbol TEXT NOT NULL, interval TEXT NOT NULL, chat_id INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, config TEXT NOT NULL, last_bar_time INTEGER, updated_at INTEGER NOT NULL, indicator_state TEXT NOT NULL DEFAULT '{}', last_indicator TEXT NOT NULL DEFAULT '{}', activation_time INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(symbol,interval))",
     "CREATE TABLE IF NOT EXISTS tic_live_trades(id INTEGER PRIMARY KEY AUTOINCREMENT,symbol TEXT NOT NULL,interval TEXT NOT NULL,side TEXT NOT NULL,entry_time INTEGER NOT NULL,entry_price REAL NOT NULL,stop_price REAL NOT NULL,quantity REAL NOT NULL,remaining_qty REAL NOT NULL,tp1_pct REAL NOT NULL,tp1_time INTEGER,tp1_price REAL,tp2_target REAL,tp2_time INTEGER,tp2_price REAL,exit_time INTEGER,exit_price REAL,status TEXT NOT NULL,pnl_usdt REAL NOT NULL DEFAULT 0,payload TEXT NOT NULL DEFAULT '{}')",
     "CREATE TABLE IF NOT EXISTS tic_live_events(id INTEGER PRIMARY KEY AUTOINCREMENT,symbol TEXT NOT NULL,interval TEXT NOT NULL,event_time INTEGER NOT NULL,event_type TEXT NOT NULL,side TEXT,price REAL,payload TEXT NOT NULL DEFAULT '{}')"]
   else:
    ddl=[
-    "CREATE TABLE IF NOT EXISTS tic_live_config(symbol TEXT NOT NULL, interval TEXT NOT NULL, chat_id BIGINT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, config TEXT NOT NULL, last_bar_time BIGINT, updated_at BIGINT NOT NULL, indicator_state TEXT NOT NULL DEFAULT '{}', last_indicator TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(symbol,interval))",
+    "CREATE TABLE IF NOT EXISTS tic_live_config(symbol TEXT NOT NULL, interval TEXT NOT NULL, chat_id BIGINT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, config TEXT NOT NULL, last_bar_time BIGINT, updated_at BIGINT NOT NULL, indicator_state TEXT NOT NULL DEFAULT '{}', last_indicator TEXT NOT NULL DEFAULT '{}', activation_time BIGINT NOT NULL DEFAULT 0, PRIMARY KEY(symbol,interval))",
     "CREATE TABLE IF NOT EXISTS tic_live_trades(id BIGSERIAL PRIMARY KEY,symbol TEXT NOT NULL,interval TEXT NOT NULL,side TEXT NOT NULL,entry_time BIGINT NOT NULL,entry_price DOUBLE PRECISION NOT NULL,stop_price DOUBLE PRECISION NOT NULL,quantity DOUBLE PRECISION NOT NULL,remaining_qty DOUBLE PRECISION NOT NULL,tp1_pct DOUBLE PRECISION NOT NULL,tp1_time BIGINT,tp1_price DOUBLE PRECISION,tp2_target DOUBLE PRECISION,tp2_time BIGINT,tp2_price DOUBLE PRECISION,exit_time BIGINT,exit_price DOUBLE PRECISION,status TEXT NOT NULL,pnl_usdt DOUBLE PRECISION NOT NULL DEFAULT 0,payload TEXT NOT NULL DEFAULT '{}')",
     "CREATE TABLE IF NOT EXISTS tic_live_events(id BIGSERIAL PRIMARY KEY,symbol TEXT NOT NULL,interval TEXT NOT NULL,event_time BIGINT NOT NULL,event_type TEXT NOT NULL,side TEXT,price DOUBLE PRECISION,payload TEXT NOT NULL DEFAULT '{}')"]
   with db._db() as c:
@@ -26,11 +36,13 @@ class TICLiveStore:
    # Upgrade an existing V2.x database without dropping any trades/configuration.
    if db.backend=='sqlite':
     existing_cols={r['name'] for r in db._execute(c,'PRAGMA table_info(tic_live_config)').fetchall()}
-    for col,typ in [('indicator_state',"TEXT NOT NULL DEFAULT '{}'"),('last_indicator',"TEXT NOT NULL DEFAULT '{}'")]:
+    for col,typ in [('indicator_state',"TEXT NOT NULL DEFAULT '{}'"),('last_indicator',"TEXT NOT NULL DEFAULT '{}'"),('activation_time','INTEGER NOT NULL DEFAULT 0')]:
      if col not in existing_cols: db._execute(c,f'ALTER TABLE tic_live_config ADD COLUMN {col} {typ}')
+    db._execute(c,'UPDATE tic_live_config SET activation_time=updated_at WHERE activation_time=0')
    else:
-    for col,typ in [('indicator_state',"TEXT NOT NULL DEFAULT '{}'"),('last_indicator',"TEXT NOT NULL DEFAULT '{}'")]:
+    for col,typ in [('indicator_state',"TEXT NOT NULL DEFAULT '{}'"),('last_indicator',"TEXT NOT NULL DEFAULT '{}'"),('activation_time','BIGINT NOT NULL DEFAULT 0')]:
      db._execute(c,f'ALTER TABLE tic_live_config ADD COLUMN IF NOT EXISTS {col} {typ}')
+    db._execute(c,'UPDATE tic_live_config SET activation_time=updated_at WHERE activation_time=0')
  def subscribe(self,sym,tf,chat,cfg):
   now=int(time.time()*1000); width=TF_MS[tf]; baseline=(now//width)*width-width
   existing=self.get_config(sym,tf)
@@ -38,7 +50,7 @@ class TICLiveStore:
   merged={**old,**cfg}
   for key in ('notify_open','notify_close','notify_tp','notify_stop'): merged.setdefault(key,True)
   with self.db._db() as c:
-   self.db._execute(c,"INSERT INTO tic_live_config(symbol,interval,chat_id,enabled,config,last_bar_time,updated_at,indicator_state,last_indicator) VALUES(?,?,?,1,?,?,?,'{}','{}') ON CONFLICT(symbol,interval) DO UPDATE SET chat_id=excluded.chat_id,enabled=1,config=excluded.config,updated_at=excluded.updated_at",(sym,tf,chat,json.dumps(merged),baseline,now))
+   self.db._execute(c,"INSERT INTO tic_live_config(symbol,interval,chat_id,enabled,config,last_bar_time,updated_at,indicator_state,last_indicator,activation_time) VALUES(?,?,?,1,?,?,?,'{}','{}',?) ON CONFLICT(symbol,interval) DO UPDATE SET chat_id=excluded.chat_id,enabled=1,config=excluded.config,updated_at=excluded.updated_at,activation_time=excluded.activation_time",(sym,tf,chat,json.dumps(merged),baseline,now,now))
  def unsubscribe(self,sym,tf=None):
   with self.db._db() as c:
    if tf:self.db._execute(c,'UPDATE tic_live_config SET enabled=0,updated_at=? WHERE symbol=? AND interval=?',(int(time.time()*1000),sym,tf))
@@ -99,6 +111,7 @@ async def monitor_subscription(context,cfg,client,store=STORE):
  sym,tf=cfg['symbol'],cfg['interval']; params=json.loads(cfg['config'] or '{}'); width=TF_MS[tf]
  now=int(time.time()*1000); closed_boundary=(now//width)*width-width
  last=int(cfg.get('last_bar_time') or 0)
+ activation_time=int(cfg.get('activation_time') or cfg.get('updated_at') or 0)
  saved_state=json.loads(cfg.get('indicator_state') or '{}')
  # First activation: warm up once on a deep history and persist the recursive checkpoint.
  if not saved_state or saved_state.get('version')!=1:
@@ -108,6 +121,7 @@ async def monitor_subscription(context,cfg,client,store=STORE):
   arrays=[[float(x[k]) for x in bars] for k in ('open','high','low','close')]
   state,series=initialize_incremental_state(*arrays,**{})
   latest={k:v[-1] for k,v in series.items() if v}
+  latest['expected_last_bar_time']=closed_boundary;latest['data_current']=(int(bars[-1]['time'])==closed_boundary)
   await asyncio.to_thread(store.checkpoint,sym,tf,int(bars[-1]['time']),state,latest,bars[-RECENT_CANDLES:])
   log.info('TIC warmup completed %s %s: %s candles, checkpoint persisted',sym,tf,len(bars))
   return
@@ -129,6 +143,7 @@ async def monitor_subscription(context,cfg,client,store=STORE):
    arrays=[[float(x[k]) for x in warm] for k in ('open','high','low','close')]
    rebuilt,series=initialize_incremental_state(*arrays)
    latest={k:v[-1] for k,v in series.items() if v}
+   latest['expected_last_bar_time']=closed_boundary;latest['data_current']=(int(warm[-1]['time'])==closed_boundary)
    await asyncio.to_thread(store.checkpoint,sym,tf,int(warm[-1]['time']),rebuilt,latest,warm[-RECENT_CANDLES:])
   return
  # Process incremental indicator state candle by candle, persisting every closed bar.
@@ -161,13 +176,17 @@ async def monitor_subscription(context,cfg,client,store=STORE):
      await asyncio.to_thread(store.update_trade,t);await asyncio.to_thread(store.event,sym,tf,ts,'TP2',side,target)
      await _notify(context,cfg,f'🏁 TIC {sym} {tf} · TP2 · OPERACIÓN CERRADA\nPrecio {target:.8g} · PnL {t["pnl_usdt"]:+.4f} USDT')
   # Do not create entries for candles that closed while service was offline; only the newest closed candle is eligible.
-  is_latest=(index==len(bars)-1)
+  # Solo la vela cuyo cierre coincide con el último cierre teórico puede abrir
+  # operaciones. La API puede devolver histórico retrasado; no lo confundimos
+  # con la última vela cerrada. Además, el cierre debe ser posterior al alta.
+  entry_eligible=entry_candle_is_eligible(ts,width,activation_time,closed_boundary)
   active=await asyncio.to_thread(store.open_trades,sym,tf)
-  if cfg.get('enabled') and is_latest and not active and not channel_change and len(recent)>=int(params.get('sl_candles',2)):
+  if cfg.get('enabled') and entry_eligible and not active and not channel_change and len(recent)>=int(params.get('sl_candles',2)):
    sln=max(1,min(200,int(params.get('sl_candles',2))))
-   upper,lower=one['upper'][0],one['lower'][0];side=None;stop=None
-   if upper is not None and h>upper and c>o:side='LONG';stop=min(float(x['low']) for x in recent[-sln:])
-   elif lower is not None and l<lower and c<o:side='SHORT';stop=max(float(x['high']) for x in recent[-sln:])
+   upper,lower=one['upper'][0],one['lower'][0]
+   side=breakout_entry_side(o,h,l,c,upper,lower);stop=None
+   if side=='LONG':stop=min(float(x['low']) for x in recent[-sln:])
+   elif side=='SHORT':stop=max(float(x['high']) for x in recent[-sln:])
    if side:
     entry=c;dist=entry-stop if side=='LONG' else stop-entry;risk=float(params.get('risk_usdt',10))
     if dist>0 and risk>0:
@@ -175,6 +194,8 @@ async def monitor_subscription(context,cfg,client,store=STORE):
      await asyncio.to_thread(store.event,sym,tf,ts,'OPEN',side,entry,{'trade_id':tid,'sl_candles':sln})
      await _notify(context,cfg,f'📍 TIC {sym} {tf} · ENTRADA {side}\nPrecio {entry:.8g} · SL {stop:.8g} ({sln} velas) · TP1 {params["tp1_pct"]:g}% · cantidad {qty:.8g}')
   last_indicator={k:v[0] for k,v in one.items()}
+  last_indicator['expected_last_bar_time']=closed_boundary
+  last_indicator['data_current']=(ts==closed_boundary)
   await asyncio.to_thread(store.checkpoint,sym,tf,ts,state,last_indicator,recent)
   saved_state=state
 async def _notify(context,cfg,msg):

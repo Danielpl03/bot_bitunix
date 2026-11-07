@@ -21,6 +21,7 @@ class TICLiveStoreTests(unittest.TestCase):
         self.assertEqual(row['last_bar_time'],123456)
         self.assertEqual(json.loads(row['indicator_state'])['version'],1)
         self.assertEqual(json.loads(row['config'])['tp1_pct'],60)
+        self.assertGreater(row['activation_time'],0)
     def test_stop_keeps_open_trade_and_config_history(self):
         self.store.subscribe('BTCUSDT','4h',123,{'tp1_pct':50})
         self.store.open_trade('BTCUSDT','4h','LONG',1000,100,95,2,50,2)

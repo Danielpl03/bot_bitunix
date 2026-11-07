@@ -136,3 +136,12 @@ Para persistencia entre despliegues de Render, configura `DATABASE_URL` o `SUPAB
 ### Excel de backtesting
 
 El Excel está desactivado por defecto. Ejemplo: `/backtest_tic ETHUSDT 1h 1000 --tp1 50`. Para solicitar el archivo: añade `--excel true`. También se admite `--no-excel`. El resumen de resultados se envía siempre por Telegram.
+
+
+## Corrección Live: activación y sincronización de velas (V2.5)
+
+- Cada alta/reactivación registra `activation_time` en la base de datos. Las señales de velas cuyo cierre ocurrió antes de ese instante no pueden abrir operaciones. El checkpoint y las operaciones abiertas se conservan.
+- Una entrada nueva solo puede originarse en la vela cuyo timestamp de apertura coincide con el último cierre teórico de la temporalidad. Si Bitunix entrega velas retrasadas, el monitor no interpreta la última vela recibida como si fuera la última vela cerrada y bloquea entradas retroactivas.
+- `/tic_status` identifica el timestamp de apertura de la última vela cerrada procesada y advierte si la API todavía no ha entregado la vela que acaba de cerrar.
+- La regla de breakout queda explícita: LONG requiere perforación de banda superior y cierre alcista; SHORT requiere perforación de banda inferior y cierre bajista. Una vela alcista que perfore la banda inferior no puede abrir SHORT.
+- La migración añade `activation_time` sin borrar configuraciones, checkpoints, operaciones ni eventos existentes.
