@@ -199,3 +199,46 @@ def test_last_configured_tp_liquidates_all_remaining_margin():
     assert tp_close_percent(25, 25, True) == 25
     assert tp_close_percent(25, 10, True) == 25
     assert tp_close_percent(60, 30, False) == 30
+
+
+def test_postgres_store_reuses_bounded_connection_pool(monkeypatch):
+    import sys
+    import threading
+    import types
+    from ttr_live import TTRLiveStore
+
+    created=[]
+    class FakePool:
+        def __init__(self, **kwargs):
+            self.kwargs=kwargs
+            self.connections=0
+            created.append(self)
+        def connection(self):
+            self.connections += 1
+            return self
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def close(self): pass
+
+    pool_module=types.ModuleType('psycopg_pool')
+    pool_module.ConnectionPool=FakePool
+    psycopg_module=types.ModuleType('psycopg')
+    psycopg_module.__path__=[]
+    rows_module=types.ModuleType('psycopg.rows')
+    rows_module.dict_row=object()
+    monkeypatch.setitem(sys.modules,'psycopg',psycopg_module)
+    monkeypatch.setitem(sys.modules,'psycopg.rows',rows_module)
+    monkeypatch.setitem(sys.modules,'psycopg_pool',pool_module)
+
+    store=object.__new__(TTRLiveStore)
+    store.backend='postgres'
+    store.database_url='postgresql://example/db?sslmode=require'
+    store._pool=None
+    store._pool_lock=threading.Lock()
+    first=store._db()
+    second=store._db()
+    assert first is second
+    assert len(created)==1
+    assert created[0].kwargs['min_size']==1
+    assert created[0].kwargs['max_size']==4
+    assert created[0].connections==2

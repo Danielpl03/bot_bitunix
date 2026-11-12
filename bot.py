@@ -2520,10 +2520,10 @@ def main() -> None:
                 "misfire_grace_time": max(30, supervisor_interval * 2),
             },
         )
-        application.job_queue.run_repeating(rsi_live_monitor_job, interval=10, first=3, name="rsi_live_monitor", job_kwargs={"max_instances":1,"coalesce":True,"misfire_grace_time":30})
+        application.job_queue.run_repeating(rsi_live_monitor_job, interval=30, first=3, name="rsi_live_monitor", job_kwargs={"max_instances":1,"coalesce":True,"misfire_grace_time":30})
         from strategies.trend_impulse_channels.live import monitor_job as tic_live_monitor_job
-        application.job_queue.run_repeating(tic_live_monitor_job, interval=10, first=5, name="tic_live_monitor", job_kwargs={"max_instances":1,"coalesce":True,"misfire_grace_time":30})
-        logger.info("Monitor RSI paper trading activo (supervisor cada 10 segundos; sin órdenes reales).")
+        application.job_queue.run_repeating(tic_live_monitor_job, interval=30, first=5, name="tic_live_monitor", job_kwargs={"max_instances":1,"coalesce":True,"misfire_grace_time":30})
+        logger.info("Monitor RSI paper trading activo (supervisor cada 30 segundos; sin órdenes reales).")
         logger.info(
             "Monitor TTR paper trading: WebSocket prioritario, REST fallback; "
             "supervisor cada %s segundos (sin solapamientos).",

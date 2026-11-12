@@ -536,3 +536,12 @@ Consulta `strategies/trend_impulse_channels/README.md` para la API y parámetros
 ### Trend Impulse Channels Breakout
 
 La carpeta `strategies/trend_impulse_channels/` contiene indicador Pine-portado, motor breakout, exportador Excel y motor Live paper persistente. Comandos: `/backtest_tic`, `/tic_live add|remove|list` y `/tic_status`. El porcentaje de TP1 se configura por ejecución/suscripción. Ver `strategies/trend_impulse_channels/README.md` para las reglas y ejemplos.
+
+
+## Optimización de consumo (V2.7)
+
+- `get_kline_history(..., start_time=...)` pagina hacia delante desde el checkpoint. El histórico profundo (10.000 velas) solo se descarga al inicializar/reconstruir; las revisiones normales solicitan únicamente la página incremental (máximo 200 velas).
+- TIC Live y RSI Live revisan velas cerradas cada 30 segundos; TTR mantiene su supervisor y sus comprobaciones intrabar por WebSocket. No se modifican señales, SL, TP ni la recuperación de posiciones.
+- PostgreSQL/Supabase utiliza un pool compartido y acotado de conexiones (`psycopg_pool`) en lugar de abrir una conexión física por consulta. Variables opcionales: `TTR_DB_POOL_MIN=1` y `TTR_DB_POOL_MAX=4` (máximo permitido por el código: 6).
+- Las cotizaciones rápidas de TTR se mantienen en memoria y se persisten como máximo cada 60 segundos cuando no hay una vela nueva; los cambios de posición, operaciones, eventos y cierres de vela siguen persistiendo inmediatamente. Los mensajes INFO de finalización de cada ciclo TTR pasan a DEBUG para reducir ruido de logs. Los errores y transiciones de salud se conservan.
+- Se mantienen tablas, datos, checkpoints, historial y operaciones existentes; no hay borrados ni migraciones destructivas.

@@ -202,6 +202,43 @@ class BitunixClient:
         duplicados, recortadas a como mucho `total` y dentro de los límites
         temporales indicados.
         """
+        # Incremental consumers (Live) pass start_time. In that case paginate
+        # FORWARD from the checkpoint instead of paging backwards through the
+        # newest 10,000 candles and filtering them only after downloading them.
+        # A normal monitor tick therefore transfers at most one 200-candle page
+        # (usually a single new candle); longer outages are caught up in pages.
+        if start_time is not None:
+            all_candles: dict[int, dict] = {}
+            cursor_start_time = int(start_time)
+            while len(all_candles) < total:
+                page = self.get_kline(
+                    symbol,
+                    interval=interval,
+                    limit=min(200, total - len(all_candles)),
+                    start_time=cursor_start_time,
+                    end_time=end_time,
+                    kline_type=kline_type,
+                )
+                if not page:
+                    break
+                new_rows = [c for c in page if c.get('time') is not None
+                            and int(c['time']) >= cursor_start_time
+                            and (end_time is None or int(c['time']) <= int(end_time))]
+                added = 0
+                for candle in new_rows:
+                    ts = int(candle['time'])
+                    if ts not in all_candles:
+                        all_candles[ts] = candle
+                        added += 1
+                if not added:
+                    break
+                newest = max(all_candles)
+                cursor_start_time = newest + 1
+                if len(page) < 200:
+                    break
+            candles = sorted(all_candles.values(), key=lambda c: c.get('time', 0))
+            return candles[-total:]
+
         all_candles: dict[int, dict] = {}
         cursor_end_time = end_time
 

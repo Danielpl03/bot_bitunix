@@ -2,7 +2,7 @@
 No exchange orders are ever sent. State and event history are persisted in SQLite or PostgreSQL.
 """
 from __future__ import annotations
-import json, os, sqlite3, time, math, asyncio, logging
+import json, os, sqlite3, time, math, asyncio, logging, threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -71,6 +71,8 @@ class TTRLiveStore:
         self.backend = (backend or DB_BACKEND).lower()
         self.path = path or DB_PATH
         self.database_url = database_url or DATABASE_URL
+        self._pool = None
+        self._pool_lock = threading.Lock()
         if self.backend not in ('sqlite', 'postgres'):
             raise ValueError(f'Unsupported TTR_DB_BACKEND: {self.backend}')
         if self.backend == 'postgres' and not self.database_url:
@@ -91,7 +93,36 @@ class TTRLiveStore:
         url = self.database_url
         if 'sslmode=' not in url:
             url += ('&' if '?' in url else '?') + 'sslmode=require'
-        return psycopg.connect(url, row_factory=dict_row, connect_timeout=8, prepare_threshold=0)
+        # Reuse a small bounded pool instead of opening a fresh PostgreSQL
+        # connection for every SELECT/UPDATE. This substantially reduces
+        # Supavisor connection churn while preserving the existing `with
+        # self._db() as conn:` transaction/commit semantics.
+        with self._pool_lock:
+            if self._pool is None:
+                try:
+                    from psycopg_pool import ConnectionPool
+                except ImportError as exc:
+                    raise RuntimeError('Falta psycopg[pool,binary]; instala requirements.txt') from exc
+                min_size = max(1, min(2, int(os.environ.get('TTR_DB_POOL_MIN', '1'))))
+                max_size = max(min_size, min(6, int(os.environ.get('TTR_DB_POOL_MAX', '4'))))
+                self._pool = ConnectionPool(
+                    conninfo=url,
+                    min_size=min_size,
+                    max_size=max_size,
+                    timeout=8,
+                    kwargs={'row_factory': dict_row, 'connect_timeout': 8, 'prepare_threshold': 0},
+                    open=True,
+                    name='trading-bot-db',
+                )
+            pool = self._pool
+        return pool.connection()
+
+    def close(self):
+        """Close the PostgreSQL pool during a graceful application shutdown."""
+        with self._pool_lock:
+            if self._pool is not None:
+                self._pool.close()
+                self._pool = None
 
     def _sql(self, query):
         return query.replace('?', '%s') if self.backend == 'postgres' else query
@@ -337,6 +368,12 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
     cfg=await db_call('get_config',symbol)
     if not cfg or not cfg['enabled']: return
     params=json.loads(cfg['config']); state=json.loads(cfg['state'] or '{}'); pos=state.get('position')
+    # Keep the fast-changing quote in process memory and persist it at most
+    # once per minute. Position/trade/checkpoint changes are still committed
+    # immediately, so restart recovery and trading decisions remain durable.
+    market_cache=context.application.bot_data.setdefault('ttr_market_cache',{})
+    if symbol in market_cache:
+        state['market']=dict(market_cache[symbol])
     # Reconcile the durable ledger once per process/symbol. This still repairs
     # crashes after a restart, without opening another PostgreSQL connection on
     # every one-second market-data tick.
@@ -401,6 +438,7 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
         state.setdefault('market', {})
         state['market'].update({'last_price':price,'quote_time':now,'poll_seconds':poll_seconds(params),'source':source,'feed_health':ws_feed.health(symbol) if ws_feed else {'connected':False}})
         if source=='websocket_trade': state['market']['last_exchange_time']=quote_time
+        market_cache[symbol]=dict(state['market'])
         market_changed=True
     else:
         # Still evaluate a newly closed 15m bar even if there was no new quote.
@@ -416,7 +454,11 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
     retry_after=int(state.get('candles_retry_after',0) or 0)
     if latest_closed_start<=last_processed or (not last_processed and now_ms<retry_after):
         if market_changed:
-            await db_call('save_state',symbol,state)
+            persisted=int((state.get('market') or {}).get('persisted_quote_time',0) or 0)
+            if now_ms-persisted>=60_000:
+                state['market']['persisted_quote_time']=now_ms
+                market_cache[symbol]=dict(state['market'])
+                await db_call('save_state',symbol,state)
         return
     candles=await asyncio.to_thread(_closed_candles,client,symbol)
     if len(candles)<20:
@@ -552,6 +594,9 @@ async def monitor_symbol(context,symbol,client,store=STORE,ws_feed=None):
             await db_call('update_trade',pos['trade_id'],payload=json.dumps({'engine_version':PINE_ENGINE_VERSION,'position':pos, **{key:pos.get(key) for key in
                 ('avg_entry','tp_count','tp_marked_fractals','re_marked_fractals','last_tp','last_re')}}))
     state['position']=pos
+    if state.get('market'):
+        state['market']['persisted_quote_time']=now_ms
+        market_cache[symbol]=dict(state['market'])
     if pos:
         await db_call('update_trade',pos['trade_id'],payload=json.dumps({'engine_version':PINE_ENGINE_VERSION,'position':pos, **{key:pos.get(key) for key in ('avg_entry','tp_count','tp_marked_fractals','re_marked_fractals','last_tp','last_re')}}))
     await db_call('save_state',symbol,state,last_bar_time=bar_time)
@@ -600,7 +645,7 @@ async def monitor_job(context):
         try:
             await monitor_symbol(context,cfg['symbol'],bitunix,ws_feed=feed)
             symbol_elapsed=time.monotonic()-symbol_started
-            log.info('TTR monitor %s completado en %.2fs',cfg['symbol'],symbol_elapsed)
+            log.debug('TTR monitor %s completado en %.2fs',cfg['symbol'],symbol_elapsed)
             errors.pop(cfg['symbol'],None)
             await _health_transition(context,f"symbol:{cfg['symbol']}",'MONITOR','OK')
             await _health_transition(context,f"bitunix:{cfg['symbol']}",'BITUNIX','OK')
@@ -620,4 +665,4 @@ async def monitor_job(context):
                 _queue_notify(context,cfg['chat_id'],f'⚠️ TTR {cfg["symbol"]}: error en monitor: {str(exc)[:250]}')
                 errors[cfg['symbol']]=signature
     cycle_elapsed=time.monotonic()-cycle_started
-    log.info('TTR supervisor completado: %d símbolos en %.2fs',len(configs),cycle_elapsed)
+    log.debug('TTR supervisor completado: %d símbolos en %.2fs',len(configs),cycle_elapsed)
