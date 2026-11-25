@@ -22,6 +22,8 @@ from backtest_dual_thrust import run_backtest as run_dual, summarize as summariz
 from backtest_trend_trader_remastered import run_backtest as run_ttr
 from ttr_live import STORE as TTR_LIVE_STORE
 from rsi_live import STORE as RSI_LIVE_STORE
+from ivan_live import STORE as IVAN_LIVE_STORE
+from strategies.ivan_scherman.engine import run_backtest as run_ivan
 
 PORT = int(os.environ.get('PORT', '8000'))
 API_KEY = os.environ.get('BACKTEST_API_KEY', '').strip()
@@ -66,9 +68,10 @@ def equity_curve(trades):
 
 def run(payload):
     strategy = str(payload.get('strategy','keltner')).lower()
-    if strategy not in {'keltner','bollinger','rsi','reversion','squeeze','dual_thrust','trend_trader_remastered'}: raise ValueError('Estrategia no soportada.')
-    symbol=normalize_symbol(payload.get('symbol','BTCUSDT')); interval=str(payload.get('interval','1h'))
+    if strategy not in {'keltner','bollinger','rsi','reversion','squeeze','dual_thrust','trend_trader_remastered','ivan_scherman_3_bearish'}: raise ValueError('Estrategia no soportada.')
+    symbol=normalize_symbol(payload.get('symbol','BTCUSDT')); interval=str(payload.get('interval','1d' if strategy=='ivan_scherman_3_bearish' else '1h'))
     if interval not in VALID_INTERVALS: raise ValueError('Temporalidad no válida.')
+    if strategy=='ivan_scherman_3_bearish' and interval!='1d': raise ValueError('Iván Scherman está definida para velas diarias (1d).')
     candles_count=max(100,min(int(payload.get('candles') or 500),MAX_CANDLES))
     start=payload.get('startDate'); end=payload.get('endDate')
     args=[symbol,interval,(str(start),str(end))] if start and end else [symbol,interval,str(candles_count)]
@@ -76,10 +79,35 @@ def run(payload):
     request=parse_backtest_request(args, normalize_symbol=normalize_symbol, default_interval='1h', max_candles=MAX_CANDLES)
     horizon=payload.get('horizon'); horizon=int(horizon) if horizon not in (None,'',0,'0') else None
     if horizon is not None and not 1 <= horizon <= 10000: raise ValueError('El horizonte debe estar entre 1 y 10000 velas.')
-    klines, signal_start, signal_end = load_backtest_klines(client, request, warmup_candles=100, followup_candles=200)
+    warmup=max(100,int((payload.get('params') or {}).get('sma_long',200))+10) if strategy=='ivan_scherman_3_bearish' else 100
+    klines, signal_start, signal_end = load_backtest_klines(client, request, warmup_candles=warmup, followup_candles=200)
     if len(klines)<40: raise ValueError(f'Solo se encontraron {len(klines)} velas; no hay suficiente histórico.')
     closes=[float(k['close']) for k in klines]; highs=[float(k['high']) for k in klines]; lows=[float(k['low']) for k in klines]; opens=[float(k['open']) for k in klines]; times=[int(k['time']) for k in klines]
     p=payload.get('params') or {}
+    if strategy=='ivan_scherman_3_bearish':
+        result=run_ivan(closes,highs,lows,opens,times,
+            sma_long=int(p.get('sma_long',200)),require_rising=bool(p.get('require_rising',True)),
+            require_above=bool(p.get('require_above',True)),bearish_mode=str(p.get('bearish_mode','decreasing')),
+            bearish_bars=int(p.get('bearish_bars',3)),sma_tp=int(p.get('sma_tp',7)),
+            exit_mode=str(p.get('exit_mode','close')),max_bars=int(p.get('max_bars',0)),
+            stop_type=str(p.get('stop_type','none')),stop_pct=float(p.get('stop_pct',10)),
+            atr_length=int(p.get('atr_length',14)),atr_mult=float(p.get('atr_mult',4)),
+            stop_lookback=int(p.get('stop_lookback',2)),commission_pct=float(p.get('commission_pct',.05)),
+            start_time=int(p.get('start_time',0)))
+        trades=[t for t in result['trades'] if signal_start<=t['entry_time']<=signal_end]
+        closed=[t for t in trades if t.get('pnl_pct') is not None]
+        wins=[t for t in closed if t['pnl_pct']>0]; losses=[t for t in closed if t['pnl_pct']<0]
+        gp=sum(t['pnl_pct'] for t in wins); gl=abs(sum(t['pnl_pct'] for t in losses))
+        eq=1.0
+        for t in sorted(closed,key=lambda x:x.get('exit_time') or 0): eq*=max(0,1+t['pnl_pct']/100)
+        summary={'total':len(trades),'closed':len(closed),'open':len(trades)-len(closed),'wins':len(wins),'losses':len(losses),
+            'win_rate_pct':len(wins)/len(closed)*100 if closed else 0,'net_pnl_pct_compounded':(eq-1)*100,
+            'profit_factor':gp/gl if gl else (None if not gp else float('inf')),
+            'avg_pnl_pct':sum(t['pnl_pct'] for t in closed)/len(closed) if closed else 0}
+        filtered_events=[e for e in result['events'] if signal_start<=e['time']<=signal_end]
+        return clean({'strategy':strategy,'symbol':symbol,'interval':interval,'candles':len(klines),
+            'summary':summary,'trades':trades,'events':filtered_events,
+            'equity':result['equity'],'indicators':result['indicators'],'parameters':result['parameters'],'note':result['note']})
     if strategy=='trend_trader_remastered':
         result=run_ttr(closes,highs,lows,opens,times,
             psar_start=float(p.get('psar_start',0.02)), psar_increment=float(p.get('psar_increment',0.02)), psar_max=float(p.get('psar_max',0.025)),
@@ -148,13 +176,23 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self): self.send_json(204,{})
     def do_GET(self):
         path=urlparse(self.path).path
-        if path=='/api/health': return self.send_json(200,{'ok':True,'service':'backtest-lab-python-api','strategies':['keltner','bollinger','rsi','reversion','squeeze','dual_thrust','trend_trader_remastered','trend_trader_remastered_live','rsi_extreme_live']})
+        if path=='/api/health': return self.send_json(200,{'ok':True,'service':'backtest-lab-python-api','strategies':['keltner','bollinger','rsi','reversion','squeeze','dual_thrust','trend_trader_remastered','trend_trader_remastered_live','rsi_extreme_live','ivan_scherman_3_bearish','ivan_scherman_live']})
         if path=='/api/ttr/live/status':
             rows=[r for r in TTR_LIVE_STORE.status() if r.get('enabled')]
             for r in rows:
                 r['config']=json.loads(r.get('config') or '{}')
                 r['state']=json.loads(r.get('state') or '{}')
             return self.send_json(200,{'subscriptions':rows,'count':len(rows)})
+        if path=='/api/ivan/live/status':
+            rows=IVAN_LIVE_STORE.status()
+            for r in rows:r['config']=json.loads(r.get('config') or '{}')
+            return self.send_json(200,{'subscriptions':rows,'count':sum(bool(r.get('enabled')) for r in rows)})
+        if path=='/api/ivan/live/stats':
+            return self.send_json(200,IVAN_LIVE_STORE.performance())
+        if path.startswith('/api/ivan/live/history'):
+            parts=path.strip('/').split('/'); symbol=parts[4].upper() if len(parts)>4 else None
+            return self.send_json(200,{'trades':IVAN_LIVE_STORE.history(symbol),
+                'events':IVAN_LIVE_STORE.events(symbol) if symbol else []})
         if path=='/api/rsi/live/status':
             rows=RSI_LIVE_STORE.status()
             for r in rows: r['config']=json.loads(r.get('config') or '{}')

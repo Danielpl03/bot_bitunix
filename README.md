@@ -545,3 +545,9 @@ La carpeta `strategies/trend_impulse_channels/` contiene indicador Pine-portado,
 - PostgreSQL/Supabase utiliza un pool compartido y acotado de conexiones (`psycopg_pool`) en lugar de abrir una conexión física por consulta. Variables opcionales: `TTR_DB_POOL_MIN=1` y `TTR_DB_POOL_MAX=4` (máximo permitido por el código: 6).
 - Las cotizaciones rápidas de TTR se mantienen en memoria y se persisten como máximo cada 60 segundos cuando no hay una vela nueva; los cambios de posición, operaciones, eventos y cierres de vela siguen persistiendo inmediatamente. Los mensajes INFO de finalización de cada ciclo TTR pasan a DEBUG para reducir ruido de logs. Los errores y transiciones de salud se conservan.
 - Se mantienen tablas, datos, checkpoints, historial y operaciones existentes; no hay borrados ni migraciones destructivas.
+
+## Nueva estrategia: Iván Scherman (3 velas bajistas)
+
+Se incorpora el motor `strategies/ivan_scherman/` con backtesting y seguimiento paper live diario. Consulta `strategies/ivan_scherman/README.md` para reglas, parámetros, comandos Telegram y endpoints API.
+
+Comandos: `/backtest_ivan BTCUSDT 1d 1000`, `/ivan_live start BTCUSDT`, `/ivan_status`, `/ivan_history BTCUSDT` y `/ivan_stats`. No se envían órdenes reales.

@@ -115,6 +115,11 @@ BOT_COMMANDS = [
     BotCommand("backtest_squeeze", "Backtest Squeeze Bollinger + Keltner"),
     BotCommand("backtest_dual_thrust", "Backtest ruptura de rango Dual Thrust"),
     BotCommand("backtest_ttr", "Backtest TTR Pine v6 con TP parciales y reversiones"),
+    BotCommand("backtest_ivan", "Backtest Iván Scherman 3 velas bajistas (1D)"),
+    BotCommand("ivan_live", "Activar/detener Iván Scherman Live"),
+    BotCommand("ivan_status", "Estado de Iván Scherman Live"),
+    BotCommand("ivan_history", "Historial de operaciones Iván Scherman"),
+    BotCommand("ivan_stats", "Estadísticas Iván Scherman Live"),
     BotCommand("ttr_live", "Paper trading TTR en tiempo real (sin órdenes)"),
     BotCommand("rsi_live", "Paper trading RSI multi-temporalidad (sin órdenes)"),
     BotCommand("rsi_status", "Estado e historial de operaciones RSI"),
@@ -1347,6 +1352,135 @@ async def ttr_health_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text('\n'.join(lines))
 
 
+
+async def backtest_ivan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/backtest_ivan SYMBOL 1d CANDLES [--long 200] [--bearish 3] [--tp 7] ..."""
+    raw=list(context.args)
+    if len(raw)<3:
+        await update.message.reply_text("Uso: /backtest_ivan BTCUSDT 1d 1000 [--long 200] [--bearish 3] [--tp 7] [--mode decreasing|red] [--exit close|limit] [--stop none|percent|atr|lowest_close] [--stop-pct 10] [--atr-mult 4] [--max-bars 0] [--fee 0.05]. Solo velas diarias.")
+        return
+    opts={"--long":"200","--bearish":"3","--tp":"7","--mode":"decreasing","--exit":"close","--stop":"none","--stop-pct":"10","--atr-mult":"4","--max-bars":"0","--fee":"0.05"}
+    positional=[];i=0
+    try:
+        while i<len(raw):
+            if raw[i] in opts:
+                if i+1>=len(raw):raise ValueError(f"Falta valor para {raw[i]}")
+                opts[raw[i]]=raw[i+1];i+=2
+            else:positional.append(raw[i]);i+=1
+        request=parse_backtest_request(positional,normalize_symbol=_normalize_symbol,default_interval="1d",max_candles=BACKTEST_MAX_CANDLES)
+        if request.interval!="1d":raise ValueError("Iván Scherman requiere temporalidad 1d.")
+        params={"sma_long":int(opts["--long"]),"bearish_bars":int(opts["--bearish"]),"sma_tp":int(opts["--tp"]),
+            "bearish_mode":opts["--mode"],"exit_mode":opts["--exit"],"stop_type":opts["--stop"],
+            "stop_pct":float(opts["--stop-pct"]),"atr_mult":float(opts["--atr-mult"]),
+            "max_bars":int(opts["--max-bars"]),"commission_pct":float(opts["--fee"])}
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ {exc}");return
+    await update.message.reply_text(f"Descargando histórico diario de {request.symbol} y ejecutando Iván Scherman…")
+    try:
+        from strategies.ivan_scherman.engine import run_backtest
+        from xlsx_export_ivan import build_ivan_workbook
+        klines,signal_start,signal_end=load_backtest_klines(bitunix,request,warmup_candles=max(params["sma_long"]+10,220),followup_candles=10)
+        if len(klines)<params["sma_long"]+2:raise ValueError(f"Se requieren al menos {params['sma_long']+2} velas diarias.")
+        result=run_backtest([float(k["close"]) for k in klines],[float(k["high"]) for k in klines],
+            [float(k["low"]) for k in klines],[float(k["open"]) for k in klines],[int(k["time"]) for k in klines],**params)
+        trades=[t for t in result["trades"] if signal_start<=t["entry_time"]<=signal_end]
+        closed=[t for t in trades if t.get("pnl_pct") is not None]
+        wins=[t for t in closed if t["pnl_pct"]>0];losses=[t for t in closed if t["pnl_pct"]<0]
+        gp=sum(t["pnl_pct"] for t in wins);gl=abs(sum(t["pnl_pct"] for t in losses))
+        eq=1.0
+        for t in sorted(closed,key=lambda x:x.get("exit_time") or 0):eq*=max(0,1+t["pnl_pct"]/100)
+        result_export={**result,"trades":trades,"events":[e for e in result["events"] if signal_start<=e["time"]<=signal_end],
+            "summary":{"total":len(trades),"closed":len(closed),"open":len(trades)-len(closed),"wins":len(wins),"losses":len(losses),
+                "win_rate_pct":len(wins)/len(closed)*100 if closed else 0,"net_pnl_pct_compounded":(eq-1)*100,
+                "profit_factor":gp/gl if gl else None}}
+        msg=(f"📊 Iván Scherman · {request.symbol} · 1D\nOperaciones: {len(trades)} · Cerradas: {len(closed)} · Abiertas: {len(trades)-len(closed)}\n"
+            f"Acierto: {len(wins)/len(closed)*100 if closed else 0:.2f}% · PF: {gp/gl if gl else 'N/D'}\n"
+            f"PnL compuesto: {(eq-1)*100:+.3f}%\n"
+            f"Parámetros: SMA{params['sma_long']} / racha {params['bearish_bars']} / SMA TP{params['sma_tp']} / stop {params['stop_type']} / salida {params['exit_mode']}")
+        await update.message.reply_text(msg)
+        wb=build_ivan_workbook(request.symbol,"1d",klines,result_export)
+        await update.message.reply_document(document=wb,filename=f"backtest_ivan_{request.symbol}_1d.xlsx",caption="Excel Iván Scherman: operaciones, señales, equity y parámetros.")
+    except Exception as exc:
+        logger.exception("Error backtest Iván Scherman")
+        await update.message.reply_text(f"⚠️ No se pudo ejecutar el backtest Iván Scherman: {exc}")
+
+
+async def ivan_live_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ivan_live start|stop|list SYMBOL"""
+    args=list(context.args)
+    if not args or args[0].lower()=="list":
+        from ivan_live import STORE
+        rows=await asyncio.to_thread(STORE.status)
+        lines=["Iván Scherman Live · velas 1D · paper trading (sin órdenes reales)"]
+        lines += [f"{'🟢' if r['enabled'] else '⏸'} {r['symbol']} · {'activo' if r['enabled'] else 'detenido'}" for r in rows]
+        await update.message.reply_text("\n".join(lines));return
+    if len(args)<2 or args[0].lower() not in ("start","stop"):
+        await update.message.reply_text("Uso: /ivan_live start BTCUSDT [--long 200] [--bearish 3] [--tp 7] [--mode decreasing|red] [--exit close|limit] [--stop none|percent|atr|lowest_close] [--stop-pct 10] [--atr-mult 4] [--max-bars 0] [--fee 0.05]\n/ivan_live stop BTCUSDT | /ivan_live list");return
+    from ivan_live import STORE
+    symbol=_normalize_symbol(args[1])
+    if args[0].lower()=="stop":
+        await asyncio.to_thread(STORE.unsubscribe,symbol)
+        await update.message.reply_text(f"⏹ Iván Live detenido para {symbol}; el historial se conserva.");return
+    opts={"--long":"200","--bearish":"3","--tp":"7","--mode":"decreasing","--exit":"close","--stop":"none","--stop-pct":"10","--atr-mult":"4","--max-bars":"0","--fee":"0.05"}
+    try:
+        i=2
+        while i<len(args):
+            if args[i] not in opts or i+1>=len(args):raise ValueError(f"Parámetro live no válido: {args[i]}")
+            opts[args[i]]=args[i+1];i+=2
+        cfg={"sma_long":int(opts["--long"]),"require_rising":True,"require_above":True,
+             "bearish_mode":opts["--mode"],"bearish_bars":int(opts["--bearish"]),"sma_tp":int(opts["--tp"]),
+             "exit_mode":opts["--exit"],"max_bars":int(opts["--max-bars"]),"stop_type":opts["--stop"],
+             "stop_pct":float(opts["--stop-pct"]),"atr_length":14,"atr_mult":float(opts["--atr-mult"]),
+             "stop_lookback":2,"commission_pct":float(opts["--fee"])}
+        # Validate all options with the same engine used by backtesting.
+        from strategies.ivan_scherman.engine import _validate
+        _validate([1],[1],[1],[1],[1],cfg)
+    except Exception as exc:
+        await update.message.reply_text(f"⚠️ Configuración Iván Live inválida: {exc}");return
+    await asyncio.to_thread(STORE.subscribe,symbol,update.effective_chat.id,cfg)
+    await update.message.reply_text(f"✅ Iván Scherman Live activado para {symbol} en 1D. Paper trading; no se envían órdenes.")
+
+
+async def ivan_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from ivan_live import STORE
+    rows=await asyncio.to_thread(STORE.status)
+    if not rows:
+        await update.message.reply_text("No hay suscripciones Iván Scherman.");return
+    lines=["📡 Iván Scherman Live · 1D"]
+    for cfg in rows:
+        if not cfg.get("enabled"):continue
+        opened=await asyncio.to_thread(STORE.open_rows,cfg["symbol"])
+        lines.append(f"{'🟢' if opened else '⚪'} {cfg['symbol']} · {'LONG abierta' if opened else 'sin posición'}")
+        if opened:
+            t=opened[-1];lines.append(f"  Entrada {float(t['entry_price']):.8g} · {datetime.fromtimestamp(int(t['entry_time'])/1000,timezone.utc):%Y-%m-%d}")
+        lines.append(f"  Última vela procesada: {cfg.get('last_bar_time') or 'N/D'}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def ivan_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from ivan_live import STORE
+    symbol=_normalize_symbol(context.args[0]) if context.args else None
+    rows=await asyncio.to_thread(STORE.history,symbol)
+    if not rows:
+        await update.message.reply_text("Sin operaciones Iván Scherman registradas.");return
+    lines=[f"Historial Iván Scherman · {symbol or 'todos los símbolos'}"]
+    for t in rows[:20]:
+        entry=datetime.fromtimestamp(int(t["entry_time"])/1000,timezone.utc).strftime("%Y-%m-%d")
+        status="ABIERTA" if t["status"]=="OPEN" else f"{t['exit_reason']} {float(t.get('pnl_pct') or 0):+.3f}%"
+        lines.append(f"{t['symbol']} · {entry} · entrada {float(t['entry_price']):.8g} · {status}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def ivan_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    from ivan_live import STORE
+    m=await asyncio.to_thread(STORE.performance)
+    await update.message.reply_text(
+        "📊 Iván Scherman Live · rendimiento paper\n"
+        f"Operaciones: {m['total']} · cerradas: {m['closed']} · abiertas: {m['open']}\n"
+        f"Acierto: {m['win_rate_pct']:.2f}% · PF: {m['profit_factor'] if m['profit_factor'] is not None else 'N/D'}\n"
+        f"PnL realizado: {m['realized_pnl_pct']:+.3f}% · compuesto: {m['compounded_pnl_pct']:+.3f}%")
+
+
 async def backtest_ttr_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Backtest TTR con port de Pine v6, TP parciales contables y reversiones."""
     raw=list(context.args)
@@ -2392,7 +2526,7 @@ async def _post_init(application: Application) -> None:
 
 async def _post_stop(application: Application) -> None:
     """Stop long-lived TTR WebSockets while the asyncio loop is still alive."""
-    for feed_key,label in (('ttr_ws_feed','TTR'),('rsi_ws_feed','RSI')):
+    for feed_key,label in (('ttr_ws_feed','TTR'),('rsi_ws_feed','RSI'),('ivan_ws_feed','Iván Scherman')):
         feed = application.bot_data.get(feed_key)
         if feed is not None:
             try:
@@ -2490,6 +2624,11 @@ def main() -> None:
     application.add_handler(CommandHandler("backtest_squeeze", backtest_squeeze_command))
     application.add_handler(CommandHandler("backtest_dual_thrust", backtest_dual_thrust_command))
     application.add_handler(CommandHandler("backtest_ttr", backtest_ttr_command))
+    application.add_handler(CommandHandler("backtest_ivan", backtest_ivan_command))
+    application.add_handler(CommandHandler("ivan_live", ivan_live_command))
+    application.add_handler(CommandHandler("ivan_status", ivan_status_command))
+    application.add_handler(CommandHandler("ivan_history", ivan_history_command))
+    application.add_handler(CommandHandler("ivan_stats", ivan_stats_command))
     application.add_handler(CommandHandler("rsi_live", rsi_live_command))
     application.add_handler(CommandHandler("rsi_status", rsi_status_command))
     application.add_handler(CommandHandler("ttr_live", ttr_live_command))
@@ -2523,6 +2662,8 @@ def main() -> None:
         application.job_queue.run_repeating(rsi_live_monitor_job, interval=30, first=3, name="rsi_live_monitor", job_kwargs={"max_instances":1,"coalesce":True,"misfire_grace_time":30})
         from strategies.trend_impulse_channels.live import monitor_job as tic_live_monitor_job
         application.job_queue.run_repeating(tic_live_monitor_job, interval=30, first=5, name="tic_live_monitor", job_kwargs={"max_instances":1,"coalesce":True,"misfire_grace_time":30})
+        from ivan_live import monitor_job as ivan_live_monitor_job
+        application.job_queue.run_repeating(ivan_live_monitor_job, interval=60, first=10, name="ivan_live_monitor", job_kwargs={"max_instances":1,"coalesce":True,"misfire_grace_time":60})
         logger.info("Monitor RSI paper trading activo (supervisor cada 30 segundos; sin órdenes reales).")
         logger.info(
             "Monitor TTR paper trading: WebSocket prioritario, REST fallback; "
