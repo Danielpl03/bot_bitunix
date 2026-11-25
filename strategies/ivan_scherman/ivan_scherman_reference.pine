@@ -1,0 +1,174 @@
+//@version=6
+indicator("FT | Iván Scherman - 3 velas bajistas", shorttitle="FT Iván 3V", overlay=true, max_lines_count=500, max_labels_count=500)
+
+// ═════════════════════════════════════════════════════════════════════════
+// INDICADOR, SOLO LARGOS. Regla de Iván Scherman:
+//   SMA(200) subiendo (hoy > ayer) + cierre arriba de la SMA(200) + 3 cierres seguidos a la baja -> COMPRA al cierre.
+//   Sale (take profit) al cierre cuando el precio cierra arriba de la SMA corta.
+// Dibuja: triangulito de compra, punto en la salida, línea punteada entrada -> salida (verde si ganó, roja si perdió),
+// SMA 200, SMA take profit, stop (si se usa) y una tabla con los resultados.
+// Velas DIARIAS. Optimización: estudios/connors_largo_optimizar.py (23/nov/2026).
+//   BTC: 3 velas, SMA TP 7 · ES/S&P: 3 velas, SMA TP 8 · NQ: 3 velas, SMA TP 7. Sin stop (o 4 ATR de seguro).
+// ═════════════════════════════════════════════════════════════════════════
+
+// ─── 1. Ajustes ───
+gT = "Tendencia (filtro)"
+lenT    = input.int(200, "SMA larga", minval=10, group=gT)
+usePend = input.bool(true, "Exigir SMA larga subiendo (hoy vs ayer)", group=gT)
+useLado = input.bool(true, "Exigir cierre arriba de la SMA larga", group=gT)
+
+gE = "Entrada"
+modoC = input.string("Cierres decrecientes", "Tipo de conteo", options=["Cierres decrecientes", "Velas rojas"], group=gE, tooltip="Cierres decrecientes = cada cierre menor al anterior (la regla de Iván). Velas rojas = cierre < apertura (como el IvanScherman.cs de NT8).")
+nVel  = input.int(3, "Velas bajistas seguidas", minval=1, maxval=10, group=gE)
+
+gS = "Take profit / salida"
+lenX    = input.int(7, "SMA take profit", minval=2, maxval=50, group=gS, tooltip="Iván usa 5. Optimizado: BTC 7, ES 8, NQ 7 (lo bueno está entre 6 y 9).")
+modoX   = input.string("Cierre sobre la SMA", "Cómo sale", options=["Cierre sobre la SMA", "Orden límite en la SMA"], group=gS, tooltip="Orden límite = como el NT8: vende apenas el precio toca la SMA de la vela anterior.")
+maxBars = input.int(0, "Salida por tiempo (velas, 0 = apagada)", minval=0, group=gS)
+
+gSL = "Stop loss"
+slTipo   = input.string("Ninguno", "Tipo de stop", options=["Ninguno", "% fijo", "ATR", "Mínimo de N velas (por cierre)"], group=gSL)
+slPct    = input.float(10.0, "Stop %", minval=0.1, step=0.5, group=gSL)
+slAtrLen = input.int(14, "ATR: longitud", minval=1, group=gSL)
+slAtrK   = input.float(4.0, "ATR: multiplicador", minval=0.25, step=0.25, group=gSL)
+slDon    = input.int(2, "N velas (mínimo)", minval=1, group=gSL, tooltip="Se fija al entrar y sale si el CIERRE queda debajo (como el NT8).")
+
+gV = "Vista"
+colT      = input.color(#FF69B4, "Color SMA larga", group=gV)
+colX      = input.color(color.red, "Color SMA take profit", group=gV)
+estiloLn  = input.string("Entrada → salida", "Línea punteada", options=["Entrada → salida", "Horizontal en la entrada"], group=gV)
+anchoLn   = input.int(2, "Grosor de la línea punteada", minval=1, maxval=5, group=gV)
+tamTexto  = input.string("Mediano", "Tamaño del texto (Compra / TP)", options=["Chico", "Mediano", "Grande"], group=gV)
+tamPunto  = input.string("Chico", "Tamaño del punto de salida (TP / Stop)", options=["Muy chico", "Chico", "Mediano", "Grande"], group=gV)
+verEtiq   = input.bool(true, "Texto con el resultado en la salida", group=gV)
+verStop   = input.bool(true, "Mostrar stop", group=gV)
+verTabla  = input.bool(true, "Tabla de resultados", group=gV)
+tamTabla  = input.string("Chica", "Tamaño de la tabla", options=["Chica", "Mediana", "Grande"], group=gV)
+comision  = input.float(0.05, "Comisión por lado (%) para la tabla", minval=0, step=0.01, group=gV)
+desde     = input.time(timestamp("2000-01-01 00:00"), "Contar desde", group=gV)
+
+szTexto = tamTexto == "Chico" ? size.tiny : tamTexto == "Mediano" ? size.small : size.normal
+szPunto = tamPunto == "Muy chico" ? size.tiny : tamPunto == "Chico" ? size.small : tamPunto == "Mediano" ? size.normal : size.large
+szTabla =tamTabla == "Chica" ? size.small : tamTabla == "Mediana" ? size.normal : size.large
+
+// ─── 2. Cálculos ───
+smaT = ta.sma(close, lenT)
+smaX = ta.sma(close, lenX)
+atr  = ta.atr(slAtrLen)
+lowN = ta.lowest(low, slDon)
+
+bajista = modoC == "Cierres decrecientes" ? close < close[1] : close < open
+var int racha = 0
+racha := bajista ? racha + 1 : 0
+
+listo = not na(smaT[1]) and not na(smaX) and time >= desde
+tend  = (not usePend or smaT > smaT[1]) and (not useLado or close > smaT)
+senal = listo and tend and racha >= nVel
+
+stopIntra  = slTipo == "% fijo" or slTipo == "ATR"
+stopCierre = slTipo == "Mínimo de N velas (por cierre)"
+limite     = modoX == "Orden límite en la SMA"
+
+f_stop() =>
+    float s = na
+    if slTipo == "% fijo"
+        s := close * (1 - slPct / 100)
+    else if slTipo == "ATR"
+        s := close - slAtrK * atr
+    else if stopCierre
+        s := lowN
+    s
+
+// ─── 3. Simulación de la operación ───
+var bool  comprado = false
+var float ent      = na
+var int   entBar   = na
+var float stp      = na
+var line  ln       = na
+var int   nTr      = 0
+var int   nWin     = 0
+var float sumG     = 0.0
+var float sumP     = 0.0
+var float eq       = 1.0
+
+float  exitPx = na
+float  rSal   = na
+string motivo = ""
+if comprado
+    if stopIntra and low <= stp
+        exitPx := math.min(open, stp)
+        motivo := "Stop"
+    else if limite and high >= smaX[1]
+        exitPx := math.max(open, smaX[1])
+        motivo := "TP"
+    else if not limite and close > smaX
+        exitPx := close
+        motivo := "TP"
+    else if stopCierre and close < stp
+        exitPx := close
+        motivo := "Stop"
+    else if maxBars > 0 and bar_index - entBar >= maxBars
+        exitPx := close
+        motivo := "Tiempo"
+
+salida = not na(exitPx)
+if salida
+    r = exitPx / ent - 1 - 2 * comision / 100
+    rSal := r
+    colR = r > 0 ? color.new(color.lime, 0) : color.new(color.red, 0)
+    line.set_x2(ln, bar_index)
+    line.set_y2(ln, estiloLn == "Entrada → salida" ? exitPx : ent)
+    line.set_color(ln, colR)
+    // punto en el precio de salida
+    label.new(bar_index, exitPx, "●", style=label.style_label_center, color=color.new(color.black, 100), textcolor=colR, size=szPunto)
+    if verEtiq
+        // solo texto (sin cartel), arriba del punto: verde si ganó, rojo si perdió
+        label.new(bar_index, exitPx, motivo + " " + (r > 0 ? "+" : "") + str.tostring(r * 100, "#.#") + "%",
+             style=label.style_label_down, color=color.new(color.black, 100), textcolor=colR, size=szTexto)
+    nTr += 1
+    nWin += r > 0 ? 1 : 0
+    sumG += r > 0 ? r : 0.0
+    sumP += r < 0 ? -r : 0.0
+    eq *= 1 + r
+    comprado := false
+
+// entrada (no se entra en la misma vela en que salió una operación)
+entra = not comprado and not salida and senal
+if entra
+    comprado := true
+    ent      := close
+    entBar   := bar_index
+    stp      := f_stop()
+    ln       := line.new(bar_index, close, bar_index, close, style=line.style_dotted, width=anchoLn, color=color.new(color.gray, 0))
+    // triangulito con "Compra" debajo
+    label.new(bar_index, low, "Compra", yloc=yloc.belowbar, style=label.style_triangleup, color=color.new(color.lime, 0), textcolor=color.new(color.lime, 0), size=szTexto)
+else if comprado
+    // la línea punteada acompaña al precio mientras la operación sigue abierta
+    line.set_x2(ln, bar_index)
+    line.set_y2(ln, estiloLn == "Entrada → salida" ? close : ent)
+
+// ─── 4. Gráfico ───
+plot(smaT, "SMA larga", color=colT, linewidth=2)
+plot(smaX, "SMA take profit", color=colX, linewidth=1)
+plot(verStop and comprado and not na(stp) ? stp : na, "Stop", color=color.new(color.red, 0), style=plot.style_linebr)
+
+alertcondition(entra, "Iván: compra", "Iván Scherman: señal de COMPRA al cierre")
+alertcondition(salida, "Iván: salida", "Iván Scherman: cerrar la compra")
+
+var table tb = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 20), border_width=1)
+if verTabla and barstate.islast
+    pf = sumP > 0 ? sumG / sumP : na
+    table.cell(tb, 0, 0, "FrancoTrading · Posición", text_color=color.white, text_size=szTabla)
+    table.cell(tb, 1, 0, comprado ? "Comprado" : "Sin operación", text_color=comprado ? color.lime : color.gray, text_size=szTabla)
+    table.cell(tb, 0, 1, "Operaciones", text_color=color.white, text_size=szTabla)
+    table.cell(tb, 1, 1, str.tostring(nTr), text_color=color.white, text_size=szTabla)
+    table.cell(tb, 0, 2, "% ganadoras", text_color=color.white, text_size=szTabla)
+    table.cell(tb, 1, 2, nTr > 0 ? str.tostring(nWin * 100.0 / nTr, "#.#") + " %" : "-", text_color=color.white, text_size=szTabla)
+    table.cell(tb, 0, 3, "Profit factor", text_color=color.white, text_size=szTabla)
+    table.cell(tb, 1, 3, na(pf) ? "-" : str.tostring(pf, "#.##"), text_color=color.white, text_size=szTabla)
+    table.cell(tb, 0, 4, "Acumulado", text_color=color.white, text_size=szTabla)
+    table.cell(tb, 1, 4, str.tostring((eq - 1) * 100, "#.#") + " %", text_color=eq >= 1 ? color.lime : color.red, text_size=szTabla)
+    table.cell(tb, 0, 5, "Velas bajistas seguidas", text_color=color.white, text_size=szTabla)
+    table.cell(tb, 1, 5, str.tostring(racha) + " (pide " + str.tostring(nVel) + ")", text_color=color.white, text_size=szTabla)
+    table.cell(tb, 0, 6, "Take profit", text_color=color.white, text_size=szTabla)
+    table.cell(tb, 1, 6, str.tostring(smaX, format.mintick), text_color=colX, text_size=szTabla)
