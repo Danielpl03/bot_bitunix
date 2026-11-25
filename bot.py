@@ -1383,13 +1383,17 @@ async def backtest_ivan_command(update: Update, context: ContextTypes.DEFAULT_TY
         if len(klines)<params["sma_long"]+2:raise ValueError(f"Se requieren al menos {params['sma_long']+2} velas diarias.")
         result=run_backtest([float(k["close"]) for k in klines],[float(k["high"]) for k in klines],
             [float(k["low"]) for k in klines],[float(k["open"]) for k in klines],[int(k["time"]) for k in klines],**params)
-        trades=[t for t in result["trades"] if signal_start<=t["entry_time"]<=signal_end]
+        # En backtests por número de velas, load_backtest_klines devuelve
+        # signal_start/signal_end=None. Solo filtrar cuando se pidió un rango de fechas.
+        trades=[t for t in result["trades"] if signal_start is None or
+            (signal_start<=t["entry_time"]<=signal_end)]
         closed=[t for t in trades if t.get("pnl_pct") is not None]
         wins=[t for t in closed if t["pnl_pct"]>0];losses=[t for t in closed if t["pnl_pct"]<0]
         gp=sum(t["pnl_pct"] for t in wins);gl=abs(sum(t["pnl_pct"] for t in losses))
         eq=1.0
         for t in sorted(closed,key=lambda x:x.get("exit_time") or 0):eq*=max(0,1+t["pnl_pct"]/100)
-        result_export={**result,"trades":trades,"events":[e for e in result["events"] if signal_start<=e["time"]<=signal_end],
+        result_export={**result,"trades":trades,"events":[e for e in result["events"] if signal_start is None or
+            (signal_start<=e["time"]<=signal_end)],
             "summary":{"total":len(trades),"closed":len(closed),"open":len(trades)-len(closed),"wins":len(wins),"losses":len(losses),
                 "win_rate_pct":len(wins)/len(closed)*100 if closed else 0,"net_pnl_pct_compounded":(eq-1)*100,
                 "profit_factor":gp/gl if gl else None}}
